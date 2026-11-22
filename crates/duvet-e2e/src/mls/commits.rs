@@ -270,6 +270,14 @@ pub(crate) fn join_external(tx: &Tx<'_>, request: JoinExternal) -> Result<Commit
                 rule: super::GROUP_BLOCKED.into(),
             });
         }
+        // A group info of an epoch this device saw pass: every member of that epoch, a removed one
+        // too, could read the group an external commit on it makes. The same epoch stays open, as
+        // a refused join's retry needs.
+        if row.generation == request.generation && info.epoch().as_u64() < row.epoch {
+            return Err(Error::RuleViolation {
+                rule: "stale_group_info".into(),
+            });
+        }
     }
     // This device must be on its user's list as it knows it, as every member checks.
     let listed = tx

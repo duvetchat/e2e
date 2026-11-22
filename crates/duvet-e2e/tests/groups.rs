@@ -648,6 +648,46 @@ fn replayed_welcome_keeps_a_removed_device_out() {
 }
 
 #[test]
+fn removed_device_cannot_rejoin_from_an_old_group_info() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut b1] = new_devices(&mut server, [a, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    let before = joining(&server, conversation);
+
+    // B1 goes quiet: the API proposes its removal (B stays a member), and A1's commit takes it out.
+    server.remove_device(conversation, b1.id);
+    server.deliver(&mut a1);
+    server
+        .commit(
+            &mut a1,
+            conversation,
+            command("commit_pending", conversation),
+        )
+        .unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    assert_eq!(b1.no_group(conversation)["what"], "membership");
+
+    // Handed the group info from before its removal, B1 won't join from it: every member of that
+    // epoch, a removed one too, could read what B1 sends in the group it would make.
+    let refused = error(&mut b1.core, before);
+    assert_eq!(
+        (&refused["code"], &refused["rule"]),
+        (&json!("rule_violation"), &json!("stale_group_info"))
+    );
+
+    // From the group info of now, B1 comes back.
+    let now = joining(&server, conversation);
+    server.commit(&mut b1, conversation, now).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    let state = same_group(&mut [&mut a1, &mut b1], conversation);
+    assert_eq!(state["epoch"], 3);
+}
+
+#[test]
 fn returning_device_rejoins_external() {
     let mut server = FakeServer::new();
     let (a, b) = (new_id(), new_id());
