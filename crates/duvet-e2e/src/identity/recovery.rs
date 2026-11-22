@@ -1,9 +1,9 @@
 //! The recovery key and what it opens: the backup key, which it wraps, and the identity, which the
 //! backup key encrypts. The server keeps both blobs; only the recovery key opens them.
 //!
-//! A recovery key is 32 random bytes in base58, exactly 44 characters, read ignoring spaces and
-//! dashes. Those 44 characters leave no room for a checksum: a mistyped letter often reads as
-//! another key, which the backup key's wrapping then refuses.
+//! A recovery key is 32 random bytes and a 3-byte check, the first bytes of
+//! SHA-256("duvet recovery checksum v1" || the 32 bytes), in base58: exactly 48 characters, read
+//! ignoring spaces and dashes. A mistyped character fails the check, all but once in 16 million.
 
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -18,8 +18,10 @@ use super::{from_cbor, invalid, random, to_cbor};
 use crate::Error;
 
 /// A recovery key's length in base58 characters.
-pub const LENGTH: usize = 44;
+pub const LENGTH: usize = 48;
 
+const CHECKSUM_LABEL: &[u8] = b"duvet recovery checksum v1";
+const CHECK: usize = 3;
 const RECOVERY_INFO: &[u8] = b"duvet recovery v1";
 const BACKUP_KEY_AAD: &[u8] = b"duvet backup key v1";
 const IDENTITY_AAD: &[u8] = b"duvet identity v1";
@@ -57,10 +59,13 @@ struct EncryptedIdentity {
 
 /// A new recovery key, as the person writes it down.
 pub fn generate(rand: &impl OpenMlsRand) -> Result<Zeroizing<String>, Error> {
-    // 32 bytes under 58^43 take fewer characters, about one in 17: those are drawn again.
+    // 35 bytes under 58^47 take fewer characters, about one in 25: those are drawn again.
     for _ in 0..64 {
-        let bytes = random(rand, 32)?;
-        let text = encode(&bytes)?;
+        let key = random(rand, 32)?;
+        let mut checked = Zeroizing::new([0u8; 32 + CHECK]);
+        checked[..32].copy_from_slice(&key);
+        checked[32..].copy_from_slice(&check(&key));
+        let text = encode(&*checked)?;
         if text.len() == LENGTH {
             return Ok(text);
         }
@@ -70,8 +75,9 @@ pub fn generate(rand: &impl OpenMlsRand) -> Result<Zeroizing<String>, Error> {
     ))
 }
 
-/// The key a recovery key's text spells, its spaces and dashes aside. Only a key's own spelling
-/// reads: 44 characters of the alphabet that decode to 32 bytes and encode back the same.
+/// The 32 bytes of key a recovery key's text spells, its spaces and dashes aside. Only a key's own
+/// spelling reads: 48 characters of the alphabet that decode to 35 bytes and encode back the same,
+/// whose last 3 are the first 32's check.
 pub fn parse(text: &str) -> Result<Zeroizing<[u8; 32]>, Error> {
     let mut compact = Zeroizing::new(String::with_capacity(text.len()));
     compact.extend(
@@ -81,14 +87,34 @@ pub fn parse(text: &str) -> Result<Zeroizing<[u8; 32]>, Error> {
     if compact.len() != LENGTH {
         return Err(not_a_key());
     }
-    let mut key = Zeroizing::new([0u8; 32]);
+    let mut checked = Zeroizing::new([0u8; 32 + CHECK]);
     let written = bs58::decode(compact.as_bytes())
-        .onto(&mut *key)
+        .onto(&mut *checked)
         .map_err(|_| not_a_key())?;
-    if written != key.len() || *encode(&*key)? != *compact {
+    if written != checked.len() || *encode(&*checked)? != *compact {
         return Err(not_a_key());
     }
-    Ok(key)
+    let (key, given) = checked.split_at(32);
+    if given != check(key).as_slice() {
+        return Err(invalid(
+            "recovery_key",
+            "the recovery key's check doesn't match",
+        ));
+    }
+    let mut out = Zeroizing::new([0u8; 32]);
+    out.copy_from_slice(key);
+    Ok(out)
+}
+
+/// A key's check: the first 3 bytes of SHA-256("duvet recovery checksum v1" || key).
+fn check(key: &[u8]) -> [u8; CHECK] {
+    let digest = Sha256::new()
+        .chain_update(CHECKSUM_LABEL)
+        .chain_update(key)
+        .finalize();
+    let mut check = [0u8; CHECK];
+    check.copy_from_slice(&digest[..CHECK]);
+    check
 }
 
 /// The backup key, wrapped by the key HKDF derives from the recovery key and the user's ID.
@@ -183,11 +209,11 @@ pub fn key_id(backup_key: &[u8; 32]) -> [u8; 8] {
     id
 }
 
-/// The key in base58, written once into a buffer of its final size.
-fn encode(key: &[u8]) -> Result<Zeroizing<String>, Error> {
-    // 32 bytes take 44 characters at most; bs58 asks for room for 48.
-    let mut buffer = Zeroizing::new([0u8; 48]);
-    let written = bs58::encode(key)
+/// A key and its check in base58, written once into a buffer of its final size.
+fn encode(bytes: &[u8]) -> Result<Zeroizing<String>, Error> {
+    // 35 bytes take 48 characters at most; the buffer has room to spare.
+    let mut buffer = Zeroizing::new([0u8; 64]);
+    let written = bs58::encode(bytes)
         .onto(&mut buffer[..])
         .map_err(|_| Error::Internal("a recovery key couldn't be written".into()))?;
     let text = std::str::from_utf8(&buffer[..written])
@@ -199,7 +225,7 @@ fn not_a_key() -> Error {
     invalid("recovery_key", "the recovery key isn't valid")
 }
 
-/// HKDF-SHA256 of the recovery key, salted with the user's ID.
+/// HKDF-SHA256 of the recovery key's 32 bytes (its check aside), salted with the user's ID.
 fn wrapping_key(recovery_key: &[u8; 32], user: Uuid) -> Result<Zeroizing<[u8; 32]>, Error> {
     let mut key = Zeroizing::new([0u8; 32]);
     Hkdf::<Sha256>::new(Some(user.as_bytes().as_slice()), recovery_key)

@@ -290,9 +290,9 @@ fn create_identity_signs_own_device() {
     assert_eq!(list.version, 1);
     assert_eq!(list.devices, vec![device]);
 
-    // The recovery key: 44 characters of bitcoin's base58 alphabet.
+    // The recovery key: 48 characters of bitcoin's base58 alphabet.
     let recovery_key = identity["recovery_key"].as_str().unwrap();
-    assert_eq!(recovery_key.len(), 44, "{recovery_key}");
+    assert_eq!(recovery_key.len(), 48, "{recovery_key}");
     assert!(
         recovery_key.chars().all(|c| BASE58.contains(c)),
         "{recovery_key}"
@@ -331,14 +331,44 @@ fn create_identity_signs_own_device() {
     .unwrap();
 }
 
+const NOT_A_KEY: &str = "the recovery key isn't valid";
+const CHECK_MISMATCH: &str = "the recovery key's check doesn't match";
+
+/// A recovery key's 35 bytes, as the format has them apart from the core: its 32 bytes, then the
+/// first 3 of SHA-256("duvet recovery checksum v1" || the 32 bytes).
+fn checked(key: &[u8; 32]) -> Vec<u8> {
+    let check = Sha256::new()
+        .chain_update(b"duvet recovery checksum v1")
+        .chain_update(key)
+        .finalize();
+    let mut bytes = key.to_vec();
+    bytes.extend_from_slice(&check[..3]);
+    bytes
+}
+
+/// A recovery key's text: its 35 bytes in bitcoin's base58.
+fn recovery_text(key: &[u8; 32]) -> String {
+    bs58::encode(checked(key)).into_string()
+}
+
+/// How `parse` refuses `text`: `bad_command` on `recovery_key`, with a fixed message, which it returns.
+fn refusal(text: &str) -> String {
+    let reply = recovery::parse(text).unwrap_err().to_reply();
+    assert_eq!(reply["error"]["code"], "bad_command", "{text}");
+    assert_eq!(reply["error"]["field"], "recovery_key", "{text}");
+    reply["error"]["message"].as_str().unwrap().to_owned()
+}
+
 #[test]
 fn recovery_key_round_trip() {
     let rand = RustCrypto::default();
     for _ in 0..50 {
         let key = recovery::generate(&rand).unwrap();
-        assert_eq!(key.len(), 44, "{}", *key);
+        assert_eq!(key.len(), 48, "{}", *key);
         assert!(key.chars().all(|c| BASE58.contains(c)), "{}", *key);
         let bytes = recovery::parse(&key).unwrap();
+        assert_eq!(recovery_text(&bytes), *key);
+        assert_eq!(format_in_groups(&key, " ").split(' ').count(), 12);
         for written in [
             format_in_groups(&key, " "),
             format_in_groups(&key, "-"),
@@ -349,37 +379,51 @@ fn recovery_key_round_trip() {
         }
     }
 
-    // A changed letter never opens what the key wrapped: either it isn't a key at all, or it's
-    // another key, which the backup key's wrapping refuses.
-    let key = recovery::generate(&rand).unwrap();
-    let bytes = recovery::parse(&key).unwrap();
+    // A fixed key, so every run walks the same changes.
+    let bytes: [u8; 32] = std::array::from_fn(|i| 0xa5u8.wrapping_add((i as u8).wrapping_mul(29)));
+    let key = recovery_text(&bytes);
+    assert_eq!(key.len(), 48, "{key}");
+    assert_eq!(*recovery::parse(&key).unwrap(), bytes);
+
+    // Every one-letter change is refused: its check doesn't match, or it isn't 35 bytes in base58.
+    let mut caught_by_the_check = 0;
+    for at in 0..key.len() {
+        for letter in BASE58.chars().filter(|&c| c != key.as_bytes()[at] as char) {
+            let mut changed = key.clone();
+            changed.replace_range(at..=at, &letter.to_string());
+            let message = refusal(&changed);
+            assert!(
+                message == CHECK_MISMATCH || message == NOT_A_KEY,
+                "{message}"
+            );
+            caught_by_the_check += usize::from(message == CHECK_MISMATCH);
+        }
+    }
+    assert!(caught_by_the_check > 0);
+
+    // A check that doesn't match says so.
+    let mut wrong_check = checked(&bytes);
+    *wrong_check.last_mut().unwrap() ^= 1;
+    let wrong_check = bs58::encode(wrong_check).into_string();
+    assert_eq!(wrong_check.len(), 48);
+    assert_eq!(refusal(&wrong_check), CHECK_MISMATCH);
+
+    // Another key, with its own right check, reads, and opens nothing this one wrapped.
     let user = new_id();
     let wrapped = recovery::wrap_backup_key(&rand, &bytes, user, &[9; 32]).unwrap();
     assert_eq!(
         *recovery::unwrap_backup_key(&bytes, user, &wrapped).unwrap(),
         [9; 32]
     );
-    let mut refused = 0;
-    for at in 0..key.len() {
-        for letter in BASE58.chars().filter(|&c| c != key.as_bytes()[at] as char) {
-            let mut changed = key.to_string();
-            changed.replace_range(at..=at, &letter.to_string());
-            match recovery::parse(&changed) {
-                Err(error) => {
-                    assert_eq!(error.code(), "bad_command");
-                    refused += 1;
-                }
-                Ok(other) => {
-                    assert_ne!(*other, *bytes, "{changed}");
-                    let opened = recovery::unwrap_backup_key(&other, user, &wrapped);
-                    assert_eq!(opened.err().map(|e| e.code()), Some("decrypt_failed"));
-                }
-            }
-        }
-    }
-    assert!(refused > 0, "some substitutions leave base58's range");
+    let mut other_bytes = bytes;
+    other_bytes[31] ^= 1;
+    let other = recovery::parse(&recovery_text(&other_bytes)).unwrap();
+    assert_eq!(*other, other_bytes);
+    let opened = recovery::unwrap_backup_key(&other, user, &wrapped);
+    assert_eq!(opened.err().map(|e| e.code()), Some("decrypt_failed"));
 
-    // Characters outside the alphabet, the wrong length, and a key with its digits elsewhere.
+    // Characters outside the alphabet, the wrong lengths (a key from before the check's 44 among
+    // them), and nothing at all.
     for bad in [
         format!("0{}", &key[1..]),
         format!("O{}", &key[1..]),
@@ -388,14 +432,11 @@ fn recovery_key_round_trip() {
         format!("é{}", &key[2..]),
         format!("+{}", &key[1..]),
         key[1..].to_string(),
-        format!("{}2", *key),
+        format!("{key}2"),
+        key[..44].to_string(),
         String::new(),
     ] {
-        let error = recovery::parse(&bad).unwrap_err();
-        assert_eq!(error.code(), "bad_command", "{bad}");
-        // The reply never quotes the key it refused.
-        let reply = format!("{error} {error:?}");
-        assert!(!reply.contains(&key[2..12]), "{reply}");
+        assert_eq!(refusal(&bad), NOT_A_KEY, "{bad}");
     }
 }
 
