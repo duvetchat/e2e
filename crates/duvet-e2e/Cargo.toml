@@ -37,6 +37,11 @@ openmls = { workspace = true, features = ["js"] }
 rusqlite = { workspace = true, features = ["bundled-sqlcipher", "ffi-sqlite-wasm-rs"] }
 web-time.workspace = true
 
+[features]
+# Hooks only tests reach (`Core::fail_next_commit`); the crate's own tests turn it on below.
+test-hooks = []
+
 [dev-dependencies]
+duvet-e2e = { workspace = true, features = ["test-hooks"] }
 duvet-e2e-validator.workspace = true
 tempfile = "3"

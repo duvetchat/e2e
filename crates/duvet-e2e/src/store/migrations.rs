@@ -102,6 +102,7 @@ CREATE TABLE groups (
 );
 
 -- Messages as decrypted, with their edits applied. message_id is the API's, unknown while one is being sent.
+-- envelope is the message as it was sent, text its author's latest; a deleted message keeps neither.
 CREATE TABLE messages (
     id INTEGER PRIMARY KEY,
     message_id BLOB UNIQUE,
@@ -128,6 +129,36 @@ CREATE VIRTUAL TABLE messages_fts USING fts5 (
     content_rowid = 'id',
     tokenize = 'unicode61 remove_diacritics 2'
 );
+-- A deletion takes a text's words out of the index's own storage, not just out of its results.
+INSERT INTO messages_fts (messages_fts, rank) VALUES ('secure-delete', 1);
+CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts (rowid, text) VALUES (new.id, new.text);
+END;
+CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts (messages_fts, rowid, text) VALUES ('delete', old.id, old.text);
+END;
+CREATE TRIGGER messages_fts_update AFTER UPDATE OF text ON messages BEGIN
+    INSERT INTO messages_fts (messages_fts, rowid, text) VALUES ('delete', old.id, old.text);
+    INSERT INTO messages_fts (rowid, text) VALUES (new.id, new.text);
+END;
+
+-- Each edit of a message as it came: a message's text is its author's latest. An edit of a message
+-- this device can't read yet (waiting, or not here at all) waits here for it.
+CREATE TABLE edits (
+    id INTEGER PRIMARY KEY,
+    conversation_id BLOB NOT NULL,
+    message_id BLOB NOT NULL,
+    seq INTEGER,
+    user_id BLOB NOT NULL,
+    device_id BLOB NOT NULL,
+    sent_at INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    -- The SHA-256 of this device's own edit, to know its number when the queue brings it back.
+    echo BLOB,
+    shared_by BLOB
+);
+CREATE INDEX edits_by_message ON edits (message_id);
+CREATE INDEX edits_by_echo ON edits (echo) WHERE echo IS NOT NULL;
 
 CREATE TABLE mentions (
     message INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
@@ -145,12 +176,21 @@ CREATE TABLE outbox (
     created_at INTEGER NOT NULL
 );
 
--- What was sent while a member had no device, for their catch-up.
+-- What was sent while a member had no device, for their catch-up, with the identity this device had
+-- pinned for them then (none when it had none).
 CREATE TABLE deviceless (
     conversation_id BLOB NOT NULL,
     user_id BLOB NOT NULL,
     message INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
+    identity_key BLOB,
     PRIMARY KEY (conversation_id, user_id, message)
+);
+
+-- The members the client says have no device in a conversation now, until one of theirs enters.
+CREATE TABLE deviceless_users (
+    conversation_id BLOB NOT NULL,
+    user_id BLOB NOT NULL,
+    PRIMARY KEY (conversation_id, user_id)
 );
 
 -- The backup's days: which are complete, and which to upload (again).

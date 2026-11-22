@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{Error, KeyStorage, PROTOCOL, Tx, direct, identity, mls, parts};
+use crate::{Error, KeyStorage, PROTOCOL, Tx, direct, identity, messages, mls, parts};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -70,6 +70,15 @@ pub(crate) enum Command {
     ResetGroup(mls::ResetGroup),
     Group(mls::ConversationId),
     Apply(mls::ApplyRequest),
+
+    // Messages.
+    Encrypt(messages::Encrypt),
+    Sent(messages::Sent),
+    Edit(messages::Edit),
+    Delete(messages::Delete),
+    Messages(messages::ListMessages),
+    Search(messages::Search),
+    WithoutDevices(messages::WithoutDevices),
 }
 
 pub(crate) fn parse(command: &str) -> Result<Command, Error> {
@@ -129,6 +138,14 @@ pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error
         Command::ResetGroup(request) => reply(mls::reset_group(tx, request)?),
         Command::Group(request) => reply(mls::group(tx, request)?),
         Command::Apply(request) => reply(mls::apply(tx, request)?),
+
+        Command::Encrypt(request) => reply(messages::encrypt(tx, request)?),
+        Command::Sent(request) => reply(messages::sent(tx, request)?),
+        Command::Edit(request) => reply(messages::edit(tx, request)?),
+        Command::Delete(request) => reply(messages::delete(tx, request)?),
+        Command::Messages(request) => reply(messages::messages(tx, request)?),
+        Command::Search(request) => reply(messages::search(tx, request)?),
+        Command::WithoutDevices(request) => reply(messages::without_devices(tx, request)?),
     }
 }
 

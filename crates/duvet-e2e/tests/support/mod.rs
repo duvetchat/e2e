@@ -160,6 +160,9 @@ pub struct QueueEntry {
     pub statement: Option<Vec<u8>>,
     /// The generation of a welcome, as the server knows it.
     pub generation: Option<u32>,
+    /// The fields the API adds to a message, an edit or a deletion: its `message_id`, who sent it
+    /// and when, whom it mentions.
+    pub meta: serde_json::Map<String, Value>,
 }
 
 impl QueueEntry {
@@ -169,6 +172,9 @@ impl QueueEntry {
         let mut entry = json!({"seq": self.seq, "kind": self.kind, "data": b64(&self.data)});
         if let Some(statement) = &self.statement {
             entry["statement"] = json!(b64(statement));
+        }
+        for (field, value) in &self.meta {
+            entry[field] = value.clone();
         }
         entry
     }
@@ -205,6 +211,7 @@ impl Chat {
             data,
             statement,
             generation: None,
+            meta: serde_json::Map::new(),
         });
         seq
     }
@@ -228,6 +235,8 @@ pub struct FakeServer {
     handed_out: BTreeSet<String>,
     pub chats: BTreeMap<Uuid, Chat>,
     inboxes: BTreeMap<Uuid, Vec<Vec<u8>>>,
+    /// The messages the API took, by their sender's device and nonce: its nonce window.
+    nonces: BTreeMap<(Uuid, String), (Uuid, u64)>,
 }
 
 impl Default for FakeServer {
@@ -248,6 +257,7 @@ impl FakeServer {
             handed_out: BTreeSet::new(),
             chats: BTreeMap::new(),
             inboxes: BTreeMap::new(),
+            nonces: BTreeMap::new(),
         }
     }
 
@@ -911,6 +921,77 @@ impl FakeServer {
         record.devices = taken.devices.clone();
         record.list = signed;
         record.certificates.insert(device, certificate);
+    }
+
+    /// `device` posts a message to `conversation`: its `ciphertext` goes in the queue as the API keeps
+    /// it, with a new message ID, who sent it and when, and whom it mentions. The API knows a message
+    /// by its sender's device and its `nonce`: posted again, it's the message the API has. The
+    /// message's ID and number.
+    pub fn post_message(
+        &mut self,
+        device: &TestDevice,
+        conversation: Uuid,
+        nonce: &str,
+        ciphertext: Vec<u8>,
+        mentions: &[Uuid],
+    ) -> (Uuid, u64) {
+        let key = (device.id, nonce.to_owned());
+        if let Some(&posted) = self.nonces.get(&key) {
+            return posted;
+        }
+        let message_id = new_id();
+        let seq = self.post_entry(
+            device,
+            conversation,
+            "message",
+            message_id,
+            ciphertext,
+            mentions,
+        );
+        self.nonces.insert(key, (message_id, seq));
+        (message_id, seq)
+    }
+
+    /// `device` posts an edit or a deletion (`kind`) of the message `message_id`, which goes in the
+    /// queue under that message's ID. Its number.
+    pub fn post_change(
+        &mut self,
+        device: &TestDevice,
+        conversation: Uuid,
+        kind: &'static str,
+        message_id: Uuid,
+        ciphertext: Vec<u8>,
+    ) -> u64 {
+        self.post_entry(device, conversation, kind, message_id, ciphertext, &[])
+    }
+
+    fn post_entry(
+        &mut self,
+        device: &TestDevice,
+        conversation: Uuid,
+        kind: &'static str,
+        message_id: Uuid,
+        ciphertext: Vec<u8>,
+        mentions: &[Uuid],
+    ) -> u64 {
+        let sent_at = self.clock.now_ms();
+        let chat = self.chats.get_mut(&conversation).unwrap();
+        let seq = chat.push(kind, ciphertext, None);
+        let meta = &mut chat.queue.last_mut().unwrap().meta;
+        meta.insert("message_id".into(), json!(message_id));
+        meta.insert("sender_user".into(), json!(device.user));
+        meta.insert("sender_device".into(), json!(device.id));
+        meta.insert("sent_at".into(), json!(sent_at));
+        if !mentions.is_empty() {
+            meta.insert("mentions".into(), json!(mentions));
+        }
+        seq
+    }
+
+    /// `user` starts over: the server forgets their identity and their devices, and their next
+    /// device makes a new identity.
+    pub fn forget_user(&mut self, user: Uuid) {
+        self.users.remove(&user);
     }
 
     fn identities(&self) -> BTreeMap<Uuid, ByteBuf> {

@@ -49,6 +49,21 @@ pub(crate) struct Entry {
     /// the commit that takes them out.
     #[serde(default, with = "b64::option")]
     pub(crate) statement: Option<Vec<u8>>,
+    /// On a message, an edit or a deletion: the message's ID, as the API gives it (an edit's or a
+    /// deletion's is the ID of the message it changes).
+    #[serde(default)]
+    pub(crate) message_id: Option<Uuid>,
+    /// Who sent it, as the API says: a message this device can't open is shown as theirs.
+    #[serde(default)]
+    pub(crate) sender_user: Option<Uuid>,
+    #[serde(default)]
+    pub(crate) sender_device: Option<Uuid>,
+    /// When the API took it, in Unix milliseconds.
+    #[serde(default)]
+    pub(crate) sent_at: Option<i64>,
+    /// The users a message mentions, as its sender listed them for the API.
+    #[serde(default)]
+    pub(crate) mentions: Vec<Uuid>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,24 +102,30 @@ impl Expected {
 #[derive(Debug, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub(crate) enum Applied {
-    /// It took effect: a commit merged, a welcome joined, a proposal kept for the next commit.
-    /// The group's epoch after it.
+    /// It took effect: a commit merged, a welcome joined, a proposal kept for the next commit, a
+    /// message, an edit or a deletion opened and kept. The group's epoch after it.
     #[serde(rename = "applied")]
     Done { epoch: u64 },
     /// This device's own commit: merged by `commit_result`, or now, when the server took the commit
-    /// it answered as refused.
+    /// it answered as refused. Or its own message, edit or deletion, kept as it was made.
     Own,
+    /// A message, an edit or a deletion this device couldn't open, for the `reason` the client
+    /// reports: `message` (MLS refused it), `envelope` (what it held isn't an envelope) or
+    /// `too_large` (over 32 KiB, unread). A message is kept as waiting, for an import to replace.
+    Undecryptable { reason: &'static str },
     /// A commit that took this device out of the group.
     Removed,
     /// Refused, for the rule it breaks (or `malformed`, `invalid_commit`, `invalid_welcome`,
     /// `invalid_proposal`, `wrong_group` for what isn't a valid message of this group, and
-    /// `stale_welcome` for a welcome to an epoch this device held or saw pass). Another
-    /// device's commit refused for a rule, or one OpenMLS can't process, also blocks the group,
-    /// and nothing goes on it but a reset; a malformed entry, a commit entry that holds no
-    /// commit, and a refused welcome or proposal leave the group as it was.
+    /// `stale_welcome` for a welcome to an epoch this device held or saw pass; `not_author` for an
+    /// edit or a deletion of another user's message). Another device's commit refused for a rule,
+    /// or one OpenMLS can't process, also blocks the group, and nothing goes on it but a reset; a
+    /// malformed entry, a commit entry that holds no commit, and a refused welcome or proposal
+    /// leave the group as it was.
     Rejected { rule: String },
     /// Not for this device, or not now: a welcome for other devices, an entry of another generation
-    /// or epoch, of a group this device isn't in, or after its group was blocked.
+    /// or epoch, of a group this device isn't in, or after its group was blocked; a message this
+    /// device has already, or an edit or a deletion of one deleted.
     Ignored,
 }
 
@@ -146,7 +167,7 @@ fn handler(kind: EntryKind) -> &'static dyn EntryHandler {
         EntryKind::Commit => &Commits,
         EntryKind::Welcome => &Welcomes,
         EntryKind::Proposal => &Proposals,
-        EntryKind::Message | EntryKind::Edit | EntryKind::Delete => &Messages,
+        EntryKind::Message | EntryKind::Edit | EntryKind::Delete => &crate::messages::Messages,
     }
 }
 
@@ -219,7 +240,7 @@ pub(crate) fn apply(tx: &Tx<'_>, request: ApplyRequest) -> Result<ApplyReply, Er
     Ok(ApplyReply {
         applied_through: at.last_seq(),
         results,
-        catch_up_due: Vec::new(),
+        catch_up_due: crate::messages::catch_up_due(tx, at.id, at.row.as_ref())?,
     })
 }
 
@@ -308,6 +329,8 @@ impl EntryHandler for Commits {
         group
             .merge_staged_commit(provider, *staged)
             .map_err(openmls_error)?;
+        // A member without a device whose device it brings is due a catch-up.
+        crate::messages::entered(tx, at.id, &change.added)?;
         row.echo = None;
         row.members = after;
         row.statements.clear();
@@ -551,17 +574,7 @@ fn keep_statement(
     Ok(())
 }
 
-/// Messages, edits and deletes are the messages' handlers' to apply; until those exist here, they
-/// change nothing, and the queue goes on past them.
-struct Messages;
-
-impl EntryHandler for Messages {
-    fn apply(&self, _: &Tx<'_>, _: &mut Conversation, _: &Entry) -> Result<Applied, Error> {
-        Ok(Applied::Ignored)
-    }
-}
-
-fn rejected(rule: &str) -> Applied {
+pub(crate) fn rejected(rule: &str) -> Applied {
     Applied::Rejected { rule: rule.into() }
 }
 
@@ -589,7 +602,7 @@ fn entered_at_start(
     MemberList::new(kind, owner, entries)
 }
 
-fn protocol_message(bytes: &[u8]) -> Option<ProtocolMessage> {
+pub(crate) fn protocol_message(bytes: &[u8]) -> Option<ProtocolMessage> {
     MlsMessageIn::tls_deserialize_exact_bytes(bytes)
         .ok()?
         .try_into_protocol_message()
