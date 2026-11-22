@@ -900,6 +900,8 @@ fn devices_without_key_packages_are_skipped() {
     let mut a2 = server.device(a);
     let mut b1 = server.device(b);
     let mut b2 = server.device(b);
+    // A device of B's whose only key package expires within the hour.
+    let b3 = server.virtual_device(b);
     // B2 never publishes a key package.
     for device in [&mut a1, &mut a2, &mut b1] {
         server.publish(device);
@@ -917,6 +919,14 @@ fn devices_without_key_packages_are_skipped() {
     let last = damaged.len() - 1;
     damaged[last] ^= 1;
     *a2_key_package = json!(b64(&damaged));
+    create["key_packages"][b.to_string().as_str()]
+        .as_array_mut()
+        .unwrap()
+        .push(json!(server.virtual_key_package(b3, 60 * 60)));
+
+    // Two hours on by the core's clock, B3's has expired (the system's clock, which OpenMLS reads,
+    // hasn't moved).
+    server.clock.advance(2 * 60 * 60 * 1000);
 
     // The group is made with the devices that have one, and names those it skipped.
     let created = server.commit(&mut a1, conversation, create).unwrap();
@@ -934,6 +944,7 @@ fn devices_without_key_packages_are_skipped() {
         BTreeSet::from([
             (a.to_string(), a2.id.to_string()),
             (b.to_string(), b2.id.to_string()),
+            (b.to_string(), b3.to_string()),
         ])
     );
     server.deliver_all(&mut [&mut a1, &mut b1]);

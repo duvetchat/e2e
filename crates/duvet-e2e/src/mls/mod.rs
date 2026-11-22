@@ -23,7 +23,7 @@ use duvet_e2e_rules::{
 use openmls::prelude::tls_codec::{DeserializeBytes as _, Serialize as _};
 use openmls::prelude::{
     BasicCredential, ExtensionType, KeyPackage, KeyPackageIn, LeafNodeIndex, LeafNodeParameters,
-    MlsGroup, MlsMessageOut, OpenMlsProvider, Proposal, ProtocolVersion, Sender,
+    Lifetime, MlsGroup, MlsMessageOut, OpenMlsProvider, Proposal, ProtocolVersion, Sender,
 };
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -589,9 +589,10 @@ pub(crate) struct Skipped {
 }
 
 /// The key packages that bring `users`' devices in: for each device on a user's latest signed
-/// list but this one, the first of those `offered` for it that's valid. A device with none is
-/// skipped. A user with key packages offered needs an identity and a list (`needs_identities`); a
-/// user with none and no identity known has no devices this device can add.
+/// list but this one, the first of those `offered` for it that's valid, its lifetime by the core's
+/// clock among the rest. A device with none is skipped. A user with key packages offered needs an
+/// identity and a list (`needs_identities`); a user with none and no identity known has no devices
+/// this device can add.
 pub(crate) fn choose(
     tx: &Tx<'_>,
     own_device: Uuid,
@@ -599,6 +600,9 @@ pub(crate) fn choose(
     offered: &BTreeMap<Uuid, Vec<b64::Bytes>>,
 ) -> Result<(Vec<KeyPackage>, Vec<Skipped>), Error> {
     let crypto = tx.provider().crypto();
+    // OpenMLS's validation reads the system's clock for the lifetime; the core's decides as well.
+    let now = u64::try_from(tx.now() / 1000).unwrap_or(0);
+    let live = |lifetime: &Lifetime| lifetime.not_before() <= now && now < lifetime.not_after();
     let mut chosen = Vec::new();
     let mut skipped = Vec::new();
     let mut missing = Vec::new();
@@ -618,6 +622,7 @@ pub(crate) fn choose(
             let Some(key_package) = KeyPackageIn::tls_deserialize_exact_bytes(&offer.0)
                 .ok()
                 .and_then(|key_package| key_package.validate(crypto, ProtocolVersion::Mls10).ok())
+                .filter(|key_package| live(key_package.life_time()))
             else {
                 continue;
             };
