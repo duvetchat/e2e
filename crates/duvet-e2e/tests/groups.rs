@@ -1221,6 +1221,51 @@ fn holes_are_reported_in_and_out_of_the_group() {
 }
 
 #[test]
+fn refused_entries_out_of_the_group_keep_the_count() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut b1] = new_devices(&mut server, [a, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    // A removes B, and B1 hears it.
+    let remove = json!({"cmd": "remove_members", "conversation_id": conversation, "users": [b]});
+    server.commit(&mut a1, conversation, remove).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    // A adds B again (its commit and B1's welcome), and then the queue holds an entry that isn't an
+    // MLS message.
+    let add = adding(&mut server, conversation, b);
+    server.commit(&mut a1, conversation, add).unwrap();
+    server.deliver(&mut a1);
+    let junk = server.force(conversation, "commit", b"not an MLS message".to_vec());
+    let entries = server.entries(conversation);
+
+    // The junk reaches B1 first. Out of the group, its refusal doesn't move B1's count past what
+    // B1 still needs.
+    let early = ok(&mut b1.core, apply(conversation, &entries[5..6]));
+    assert_eq!(
+        results(std::slice::from_ref(&early)),
+        [json!([junk, "commit", "rejected", "malformed"])]
+    );
+    assert_eq!(early["applied_through"], 3);
+
+    // The backlog brings the welcome, and B1 is back.
+    let backlog = ok(&mut b1.core, apply(conversation, &entries[3..5]));
+    assert_eq!(
+        results(std::slice::from_ref(&backlog)),
+        [
+            json!([4, "commit", "ignored", null]),
+            json!([5, "welcome", "applied", null]),
+        ]
+    );
+    assert_eq!(backlog["applied_through"], 5);
+    same_group(&mut [&mut a1, &mut b1], conversation);
+}
+
+#[test]
 fn devices_without_key_packages_are_skipped() {
     let mut server = FakeServer::new();
     let (a, b) = (new_id(), new_id());

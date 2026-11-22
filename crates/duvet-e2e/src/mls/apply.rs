@@ -153,9 +153,9 @@ fn handler(kind: EntryKind) -> &'static dyn EntryHandler {
 /// a missing one is a `gap` that names the first entry the core still needs (nothing of the call
 /// is kept then). Numbers count while this device holds the conversation's group, from the entry
 /// that anchored it (its own commit's, through `commit_result`, or the welcome that brought it in).
-/// While it isn't in the group it takes entries as they come, and only one that takes effect (the
-/// welcome that brings it back) moves its count: what it passed by stays to come, in its turn.
-/// `applied_through` never passes what the device still needs.
+/// While it isn't in the group it takes entries as they come, and only one that took effect
+/// (`Done`: the welcome that brings it back) moves its count; what it passed by or refused stays
+/// to come, in its turn. `applied_through` never passes what the device still needs.
 pub(crate) fn apply(tx: &Tx<'_>, request: ApplyRequest) -> Result<ApplyReply, Error> {
     let row = GroupRow::read(tx, request.conversation_id)?;
     if row.as_ref().is_some_and(|row| row.pending.is_some()) {
@@ -172,7 +172,7 @@ pub(crate) fn apply(tx: &Tx<'_>, request: ApplyRequest) -> Result<ApplyReply, Er
     };
     let start = at.last_seq();
     let held = at.group.is_some();
-    let mut first_effect = None;
+    let mut first_counted = None;
     let mut results = Vec::new();
     for entry in &request.entries {
         if i64::try_from(entry.seq).is_err() {
@@ -186,22 +186,25 @@ pub(crate) fn apply(tx: &Tx<'_>, request: ApplyRequest) -> Result<ApplyReply, Er
                 // Nothing of this call is kept: the core needs what it needed when the call began.
                 let from = match start {
                     Some(start) if held => start + 1,
-                    _ => first_effect.unwrap_or(last + 1),
+                    _ => first_counted.unwrap_or(last + 1),
                 };
                 return Err(Error::Gap { from });
             }
         }
         let holding = at.group.is_some();
         let applied = handler(entry.kind).apply(tx, &mut at, entry)?;
-        let effect = !matches!(applied, Applied::Ignored);
-        if effect && first_effect.is_none() {
-            first_effect = Some(entry.seq);
-        }
-        // In the group, every entry counts, in order; out of it, only one that takes effect.
+        // In the group, every entry counts, in order; out of it, only one that took effect.
+        let counts = if holding {
+            !matches!(applied, Applied::Ignored)
+                || at.row.as_ref().is_some_and(|row| row.last_seq.is_some())
+        } else {
+            matches!(applied, Applied::Done { .. })
+        };
         if let Some(row) = at.row.as_mut()
-            && (effect || (holding && row.last_seq.is_some()))
+            && counts
         {
             row.last_seq = Some(entry.seq);
+            first_counted.get_or_insert(entry.seq);
         }
         results.push(EntryResult {
             seq: entry.seq,
