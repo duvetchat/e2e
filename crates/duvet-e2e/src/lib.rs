@@ -3,8 +3,11 @@
 //! The core has no network of its own. Clients hand it what the server sent and send what it returns,
 //! through one entry point that takes and returns JSON: [`Core::handle`].
 
+mod direct;
+mod envelope;
 mod error;
 mod identity;
+pub mod parts;
 mod protocol;
 mod provider;
 mod store;
@@ -19,6 +22,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
+pub use direct::{DirectMessage, MAX_DIRECT};
+pub use envelope::{Attachment, Envelope, MAX_ENVELOPE, MAX_THUMBNAIL, ThumbnailRef};
 pub use error::Error;
 pub use identity::{OwnDevice, recovery};
 pub use provider::Provider;

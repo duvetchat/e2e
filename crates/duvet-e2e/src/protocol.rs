@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{Error, KeyStorage, PROTOCOL, Tx, identity};
+use crate::{Error, KeyStorage, PROTOCOL, Tx, identity, parts};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -39,6 +39,11 @@ pub(crate) enum Command {
         qr: Option<Vec<u8>>,
     },
     KeyPackages,
+
+    // Attachments' parts.
+    AttachmentKey,
+    AttachmentEncrypt(parts::AttachmentPart),
+    AttachmentDecrypt(parts::AttachmentPart),
 }
 
 pub(crate) fn parse(command: &str) -> Result<Command, Error> {
@@ -71,6 +76,10 @@ pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error
             reply(identity::verify_user(tx, user_id, qr.as_deref())?)
         }
         Command::KeyPackages => reply(identity::key_packages(tx)?),
+
+        Command::AttachmentKey => reply(parts::attachment_key(tx)?),
+        Command::AttachmentEncrypt(part) => reply(parts::attachment_encrypt(part)?),
+        Command::AttachmentDecrypt(part) => reply(parts::attachment_decrypt(part)?),
     }
 }
 
@@ -124,8 +133,9 @@ fn cmd_status(tx: &mut Tx<'_>) -> Result<Status, Error> {
 }
 
 /// Binary fields in the JSON protocol: standard base64 with its padding. Use with
-/// `#[serde(with = "b64")]` on a `Vec<u8>`, `b64::option` on an `Option<Vec<u8>>`, or
-/// `b64::list` on a `Vec<Vec<u8>>` a command takes.
+/// `#[serde(with = "b64")]` on a `Vec<u8>`, `b64::option` on an `Option<Vec<u8>>`,
+/// `b64::list` on a `Vec<Vec<u8>>` a command takes, or `b64::secret` on a key it takes, a
+/// `Zeroizing<Vec<u8>>`.
 pub(crate) mod b64 {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
@@ -187,6 +197,42 @@ pub(crate) mod b64 {
                         .map_err(|_| D::Error::custom("not padded base64"))
                 })
                 .collect()
+        }
+    }
+
+    /// A secret, decoded into memory that's wiped as it drops. No `String` of its own holds the
+    /// base64 on the way, unless the JSON escaped a character in it and serde_json unescaped it.
+    pub(crate) mod secret {
+        use std::fmt;
+
+        use serde::de::Visitor;
+        use zeroize::Zeroizing;
+
+        use super::*;
+
+        pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Zeroizing<Vec<u8>>, D::Error> {
+            deserializer.deserialize_str(Base64)
+        }
+
+        struct Base64;
+
+        impl Visitor<'_> for Base64 {
+            type Value = Zeroizing<Vec<u8>>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("padded base64")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Self::Value, E> {
+                let mut bytes = Zeroizing::new(vec![0; base64::decoded_len_estimate(text.len())]);
+                let len = STANDARD
+                    .decode_slice(text, &mut bytes)
+                    .map_err(|_| E::custom("not padded base64"))?;
+                bytes.truncate(len);
+                Ok(bytes)
+            }
         }
     }
 }
