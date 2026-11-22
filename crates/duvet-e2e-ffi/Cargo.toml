@@ -20,5 +20,11 @@ serde.workspace = true
 serde_json.workspace = true
 zeroize.workspace = true
 
+# Where the keyring is the Secret Service: to tell one that isn't there at all, the only case for
+# the key file, from one that's locked or failing.
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
+secret-service.workspace = true
+zbus.workspace = true
+
 [dev-dependencies]
 tempfile = "3"

@@ -870,9 +870,11 @@ dependencies = [
  "keyring",
  "keyring-core",
  "rand_core 0.6.4",
+ "secret-service",
  "serde",
  "serde_json",
  "tempfile",
+ "zbus",
  "zeroize",
 ]
 

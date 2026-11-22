@@ -15,7 +15,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use duvet_e2e::{Core, Error, KeyStorage, OpenConfig};
+use duvet_e2e::{Core, Error, OpenConfig};
 use serde::Deserialize;
 use serde_json::json;
 use zeroize::{Zeroize, Zeroizing};
@@ -67,7 +67,7 @@ pub unsafe extern "C" fn duvet_e2e_open(config_json: *const c_char) -> *mut c_ch
         // Safety: as the caller promised.
         let config = unsafe { read(config_json) }?;
         let mut config: Config = serde_json::from_str(config).map_err(Error::bad_command)?;
-        let opened = open_config(&config).and_then(Core::open);
+        let opened = open(&config);
         if let Some(db_key) = &mut config.db_key {
             db_key.zeroize();
         }
@@ -169,15 +169,14 @@ unsafe fn read<'a>(text: *const c_char) -> Result<&'a str, Error> {
         })
 }
 
-fn open_config(config: &Config) -> Result<OpenConfig, Error> {
-    let (key, key_storage) = match (&config.db_key, &config.keyring) {
-        (Some(db_key), None) => (decode_key(db_key)?, KeyStorage::Provided),
-        (None, Some(entry)) => keyring::database_key(&config.path, &entry.service, &entry.account)?,
-        _ => return Err(bad_command("give either db_key or keyring", "db_key")),
-    };
-    let mut open = OpenConfig::new(config.path.clone(), key);
-    open.key_storage = key_storage;
-    Ok(open)
+fn open(config: &Config) -> Result<Core, Error> {
+    match (&config.db_key, &config.keyring) {
+        (Some(db_key), None) => {
+            Core::open(OpenConfig::new(config.path.clone(), decode_key(db_key)?))
+        }
+        (None, Some(entry)) => keyring::open(&config.path, &entry.service, &entry.account),
+        _ => Err(bad_command("give either db_key or keyring", "db_key")),
+    }
 }
 
 fn decode_key(encoded: &str) -> Result<keyring::Key, Error> {
