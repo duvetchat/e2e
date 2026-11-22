@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use openmls_rust_crypto::RustCrypto;
 use serde::Serialize;
 use serde_json::{Value, json};
+use zeroize::Zeroizing;
 
 pub use error::Error;
 pub use provider::Provider;
@@ -99,8 +100,9 @@ impl Clock for FakeClock {
 pub struct OpenConfig {
     /// The database's file. On the web, its name in the VFS.
     pub path: PathBuf,
-    /// The database's raw 256-bit key, used as it is (SQLCipher derives nothing from it).
-    pub db_key: [u8; 32],
+    /// The database's raw 256-bit key, used as it is (SQLCipher derives nothing from it), and
+    /// wiped when the configuration drops.
+    pub db_key: Zeroizing<[u8; 32]>,
     /// Where the key is kept, for `status`.
     pub key_storage: KeyStorage,
     pub clock: Box<dyn Clock>,
@@ -108,10 +110,10 @@ pub struct OpenConfig {
 
 impl OpenConfig {
     /// A database whose key the client provides, on the system's clock.
-    pub fn new(path: impl Into<PathBuf>, db_key: [u8; 32]) -> Self {
+    pub fn new(path: impl Into<PathBuf>, db_key: impl Into<Zeroizing<[u8; 32]>>) -> Self {
         Self {
             path: path.into(),
-            db_key,
+            db_key: db_key.into(),
             key_storage: KeyStorage::Provided,
             clock: Box::new(SystemClock),
         }
@@ -125,6 +127,12 @@ pub struct Core {
     clock: Box<dyn Clock>,
     key_storage: KeyStorage,
 }
+
+// The C ABI and the Flutter plugin keep each `Core` behind a mutex that any thread may take.
+const _: () = {
+    const fn send<T: Send>() {}
+    send::<Core>();
+};
 
 impl Core {
     /// Opens the database, or creates it. Fails with `locked` when another instance has it open,

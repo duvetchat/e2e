@@ -1,0 +1,103 @@
+// The core's C ABI, loaded through bun:ffi as the desktop's Bun loads it.
+// DUVET_E2E_FFI names the built library (`cargo build -p duvet-e2e-ffi --release`).
+import { describe, expect, test } from "bun:test";
+import { CString, dlopen, FFIType } from "bun:ffi";
+import { randomBytes } from "node:crypto";
+import { mkdtempSync, readFileSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const library =
+  process.env.DUVET_E2E_FFI ?? join(import.meta.dir, "../../target/release/libduvet_e2e_ffi.so");
+
+const { symbols: lib } = dlopen(library, {
+  duvet_e2e_open: { args: [FFIType.ptr], returns: FFIType.ptr },
+  duvet_e2e_handle: { args: [FFIType.u64, FFIType.ptr], returns: FFIType.ptr },
+  duvet_e2e_close: { args: [FFIType.u64], returns: FFIType.void },
+  duvet_e2e_free: { args: [FFIType.ptr], returns: FFIType.void },
+  duvet_e2e_version: { args: [], returns: FFIType.cstring },
+});
+
+/** A NUL-terminated UTF-8 string, as the library reads one. */
+const cstring = (text: string) => Buffer.from(`${text}\0`, "utf8");
+
+/** A reply the library allocated: read, handed back to it, parsed. */
+function take(pointer: unknown) {
+  expect(pointer).toBeTruthy();
+  const json = new CString(pointer as never).toString();
+  lib.duvet_e2e_free(pointer as never);
+  return JSON.parse(json);
+}
+
+const open = (config: object | string) =>
+  take(lib.duvet_e2e_open(cstring(typeof config === "string" ? config : JSON.stringify(config))));
+const handle = (core: number, command: string | Buffer) =>
+  take(lib.duvet_e2e_handle(BigInt(core), typeof command === "string" ? cstring(command) : command));
+const close = (core: number) => lib.duvet_e2e_close(BigInt(core));
+
+const database = () => join(mkdtempSync(join(tmpdir(), "duvet-e2e-")), "core.db");
+const dbKey = () => randomBytes(32).toString("base64");
+const status = '{"cmd":"status"}';
+
+describe("the C ABI", () => {
+  test("status replies protocol 1", () => {
+    const core = open({ path: database(), db_key: dbKey() }).ok.handle;
+    const reply = handle(core, status).ok;
+    expect(reply.protocol).toBe(1);
+    expect(reply.key_storage).toBe("provided");
+    expect(reply.version).toBe(lib.duvet_e2e_version().toString());
+    close(core);
+  });
+
+  test("opening the same database twice is locked", () => {
+    const config = { path: database(), db_key: dbKey() };
+    const first = open(config).ok.handle;
+    expect(open(config).error.code).toBe("locked");
+
+    close(first);
+    const again = open(config).ok.handle;
+    expect(handle(again, status).ok.protocol).toBe(1);
+    close(again);
+  });
+
+  test("broken JSON is bad_command, and the process goes on", () => {
+    const path = database();
+    expect(open("{").error.code).toBe("bad_command");
+    expect(open({ path }).error.code).toBe("bad_command");
+    expect(open({ path, db_key: "AAAA" }).error).toMatchObject({ code: "bad_command", field: "db_key" });
+
+    const core = open({ path, db_key: dbKey() }).ok.handle;
+    expect(handle(core, "{").error.code).toBe("bad_command");
+    expect(handle(core, Buffer.from([0x7b, 0xff, 0x00])).error.code).toBe("bad_command");
+    expect(handle(core, status).ok.protocol).toBe(1);
+    close(core);
+  });
+
+  test("a closed or unknown handle is not_found", () => {
+    const core = open({ path: database(), db_key: dbKey() }).ok.handle;
+    close(core);
+    expect(handle(core, status).error).toMatchObject({ code: "not_found", what: "handle" });
+    expect(handle(0, status).error.code).toBe("not_found");
+    close(core);
+  });
+
+  // Where no session bus runs, as in CI's container, there is no Secret Service.
+  test.skipIf(Boolean(process.env.DBUS_SESSION_BUS_ADDRESS))(
+    "without Secret Service the key goes to a file only its user reads",
+    () => {
+      const path = database();
+      const config = { path, keyring: { service: "duvet-e2e-test", account: "core" } };
+      const core = open(config).ok.handle;
+      expect(handle(core, status).ok.key_storage).toBe("file");
+      close(core);
+
+      expect(statSync(`${path}.key`).mode & 0o777).toBe(0o600);
+      expect(readFileSync(`${path}.key`).length).toBe(32);
+      expect(open({ path, db_key: dbKey() }).error.code).toBe("bad_key");
+
+      const again = open(config).ok.handle;
+      expect(handle(again, status).ok.key_storage).toBe("file");
+      close(again);
+    },
+  );
+});

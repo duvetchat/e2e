@@ -1,0 +1,8 @@
+{
+  "name": "duvet-e2e-host-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test"
+  }
+}
