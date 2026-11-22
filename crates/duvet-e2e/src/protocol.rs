@@ -1,7 +1,5 @@
 //! The commands the core takes: `{"cmd": "<name>", ...fields}`.
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -37,9 +35,8 @@ struct Status {
     user_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     device_id: Option<Uuid>,
-    /// Base64.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    identity_key: Option<String>,
+    #[serde(with = "b64::option", skip_serializing_if = "Option::is_none")]
+    identity_key: Option<Vec<u8>>,
     has_identity: bool,
     key_storage: KeyStorage,
 }
@@ -70,7 +67,101 @@ fn cmd_status(tx: &mut Tx<'_>) -> Result<Status, Error> {
             .map(|(_, device)| uuid(device))
             .transpose()?,
         has_identity: identity_key.is_some(),
-        identity_key: identity_key.map(|key| STANDARD.encode(key)),
+        identity_key,
         key_storage: tx.key_storage(),
     })
+}
+
+/// Binary fields in the JSON protocol: standard base64 with its padding. Use with
+/// `#[serde(with = "b64")]` on a `Vec<u8>`, or `b64::option` on an `Option<Vec<u8>>`.
+// Batch 1's commands are its first users; the allow goes with them.
+#[allow(dead_code)]
+pub(crate) mod b64 {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(crate) fn serialize<S: Serializer>(
+        bytes: impl AsRef<[u8]>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<u8>, D::Error> {
+        STANDARD
+            .decode(String::deserialize(deserializer)?)
+            .map_err(|_| D::Error::custom("not padded base64"))
+    }
+
+    pub(crate) mod option {
+        use super::*;
+
+        pub(crate) fn serialize<S: Serializer>(
+            bytes: &Option<impl AsRef<[u8]>>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            match bytes {
+                Some(bytes) => serializer.serialize_some(&STANDARD.encode(bytes)),
+                None => serializer.serialize_none(),
+            }
+        }
+
+        pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<Vec<u8>>, D::Error> {
+            Option::<String>::deserialize(deserializer)?
+                .map(|text| {
+                    STANDARD
+                        .decode(text)
+                        .map_err(|_| D::Error::custom("not padded base64"))
+                })
+                .transpose()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::{Deserialize, Serialize};
+
+    use super::b64;
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Fields {
+        #[serde(with = "b64")]
+        key: Vec<u8>,
+        #[serde(default, with = "b64::option", skip_serializing_if = "Option::is_none")]
+        note: Option<Vec<u8>>,
+    }
+
+    #[test]
+    fn binary_fields_are_padded_base64() {
+        let fields = Fields {
+            key: vec![0xfb, 0xff, 0x01],
+            note: Some(b"a".to_vec()),
+        };
+        let json = serde_json::to_string(&fields).unwrap();
+        assert_eq!(json, r#"{"key":"+/8B","note":"YQ=="}"#);
+        assert_eq!(serde_json::from_str::<Fields>(&json).unwrap(), fields);
+        assert_eq!(
+            serde_json::from_str::<Fields>(r#"{"key":""}"#).unwrap(),
+            Fields {
+                key: vec![],
+                note: None
+            }
+        );
+
+        for bad in [
+            r#"{"key":"YQ"}"#,
+            r#"{"key":"-_8B"}"#,
+            r#"{"key":"+/8B","note":"Y"}"#,
+            r#"{"key":3}"#,
+        ] {
+            assert!(serde_json::from_str::<Fields>(bad).is_err(), "{bad}");
+        }
+    }
 }

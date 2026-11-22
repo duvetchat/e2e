@@ -115,6 +115,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bs58"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -460,15 +469,22 @@ dependencies = [
 name = "duvet-e2e"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "base64",
+ "bs58",
+ "ciborium",
+ "duvet-e2e-rules",
  "getrandom 0.2.17",
+ "hkdf 0.13.0",
  "openmls",
  "openmls_basic_credential",
  "openmls_rust_crypto",
  "openmls_traits",
  "rusqlite",
  "serde",
+ "serde_bytes",
  "serde_json",
+ "sha2 0.11.1",
  "tempfile",
  "thiserror",
  "uuid",
@@ -2045,6 +2061,12 @@ dependencies = [
  "quote",
  "syn 3.0.10",
 ]
+
+[[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tls_codec"
