@@ -17,8 +17,8 @@ use std::fmt::Display;
 
 use duvet_e2e_rules::{
     CommitAad, DeviceCertificate, Entry, Kind, LeaveStatement, MEMBER_LIST_EXTENSION, MemberList,
-    MembershipChange, Place, RuleContext, RuleViolation, SUITE, check_change, extract_change,
-    group_id, leaves, statement_user,
+    MembershipChange, Place, RuleContext, RuleViolation, SUITE, certified, check_change,
+    extract_change, group_id, leaves, signed_for, statement_user,
 };
 use openmls::prelude::tls_codec::{DeserializeBytes as _, Serialize as _};
 use openmls::prelude::{
@@ -386,6 +386,96 @@ fn needed_users(change: &MembershipChange) -> BTreeSet<Uuid> {
         users.extend(change.leaves.values().map(|leaf| leaf.user));
     }
     users
+}
+
+/// Before another device's commit or welcome refused for `violation` counts as refused: when this
+/// device's own knowledge may be what refuses it (`device_not_listed`, `leaf_not_signed`: a member
+/// that hasn't seen a user's newest list or identity yet refuses their new device), the users
+/// among `leaves` (credential, signature key) whose leaves that knowledge refuses are to be
+/// observed anew first, `needs_identities`. Asked once for each state of what this device knows of
+/// them: the same knowledge refusing again is the refusal. `listed` holds the leaves to their
+/// users' lists too, as a commit's are.
+pub(crate) fn observe_first(
+    tx: &Tx<'_>,
+    violation: RuleViolation,
+    leaves: &[(&[u8], &[u8])],
+    listed: bool,
+) -> Result<(), Error> {
+    if !matches!(
+        violation,
+        RuleViolation::DeviceNotListed | RuleViolation::LeafNotSigned
+    ) {
+        return Ok(());
+    }
+    let claimed = |credential: &[u8]| {
+        DeviceCertificate::read_unverified(credential)
+            .ok()
+            .map(|certificate| certificate.user)
+    };
+    let ctx = rule_context(
+        tx,
+        leaves
+            .iter()
+            .filter_map(|(credential, _)| claimed(credential)),
+    )?;
+    let users: BTreeSet<Uuid> = leaves
+        .iter()
+        .filter(|(credential, key)| {
+            if listed {
+                certified(&ctx, credential, key).is_err()
+            } else {
+                signed_for(&ctx, credential, key).is_err()
+            }
+        })
+        .filter_map(|(credential, _)| claimed(credential))
+        .collect();
+    if users.is_empty() || !ask_to_observe(tx, &users)? {
+        return Ok(());
+    }
+    Err(Error::NeedsIdentities {
+        users: users.iter().map(Uuid::to_string).collect(),
+    })
+}
+
+/// Whether what this device knows of `users` (their pinned identity, their list's version) differs
+/// for one of them from when it last asked the client to observe them. It notes what it asks
+/// about now, whatever becomes of the command.
+fn ask_to_observe(tx: &Tx<'_>, users: &BTreeSet<Uuid>) -> Result<bool, Error> {
+    let mut new = Vec::new();
+    for &user in users {
+        let (Some(identity), Some(list)) = (tx.identity_of(user)?, tx.device_list_of(user)?) else {
+            continue;
+        };
+        let version = i64::try_from(list.version)
+            .map_err(|_| Error::Internal("a device list's version is out of range".into()))?;
+        let asked: Option<(Vec<u8>, i64)> = tx
+            .conn()
+            .query_row(
+                "SELECT identity_key, list_version FROM observe_asks WHERE user_id = ?1",
+                [user.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if asked != Some((identity.to_vec(), version)) {
+            new.push((user, identity, version));
+        }
+    }
+    if new.is_empty() {
+        return Ok(false);
+    }
+    tx.keep(move |conn| {
+        let mut written = 0;
+        for (user, identity, version) in &new {
+            written += conn.execute(
+                "INSERT INTO observe_asks (user_id, identity_key, list_version) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT (user_id) DO UPDATE SET identity_key = excluded.identity_key, \
+                 list_version = excluded.list_version",
+                params![user.as_bytes().as_slice(), identity.as_slice(), version],
+            )?;
+        }
+        Ok(written)
+    });
+    Ok(true)
 }
 
 /// What the rules go by for a commit beyond its users' identities and lists.

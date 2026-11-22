@@ -3,6 +3,7 @@
 mod migrations;
 mod openmls_kv;
 
+use std::cell::RefCell;
 use std::path::Path;
 
 use openmls_rust_crypto::RustCrypto;
@@ -36,6 +37,8 @@ impl Db {
         })
     }
 
+    /// Runs `f` in one transaction, committed only when it returns `Ok`. What `f` asked to keep
+    /// ([`Tx::keep`]) is written either way: with the rest, or after the rollback, on its own.
     pub(crate) fn transaction<T>(
         &mut self,
         crypto: &RustCrypto,
@@ -46,16 +49,43 @@ impl Db {
         let txn = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let value = f(&mut Tx {
+        let mut tx = Tx {
             conn: &txn,
             provider: Provider::new(crypto, SqlStorage::new(&txn)),
             now,
             key_storage,
-        })?;
-        txn.commit()?;
-        Ok(value)
+            kept: RefCell::new(Vec::new()),
+        };
+        let result = f(&mut tx);
+        let kept = tx.kept.take();
+        drop(tx);
+        match result {
+            Ok(value) => {
+                for write in kept {
+                    write(&txn)?;
+                }
+                txn.commit()?;
+                Ok(value)
+            }
+            Err(error) => {
+                drop(txn);
+                if !kept.is_empty() {
+                    let txn = self
+                        .conn
+                        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    for write in kept {
+                        write(&txn)?;
+                    }
+                    txn.commit()?;
+                }
+                Err(error)
+            }
+        }
     }
 }
+
+/// A write a command keeps whether it succeeds or fails.
+type KeptWrite = Box<dyn FnOnce(&Connection) -> rusqlite::Result<usize>>;
 
 /// One command's transaction: its connection, OpenMLS's provider over it, and the time the command began.
 pub struct Tx<'a> {
@@ -63,9 +93,20 @@ pub struct Tx<'a> {
     provider: Provider<'a>,
     now: i64,
     key_storage: KeyStorage,
+    kept: RefCell<Vec<KeptWrite>>,
 }
 
 impl<'a> Tx<'a> {
+    /// Writes `write` whether the command succeeds or fails: with the rest of its transaction, or
+    /// in one of its own after the rollback. For what a failure must leave behind, such as having
+    /// asked the client for something once.
+    pub(crate) fn keep(
+        &self,
+        write: impl FnOnce(&Connection) -> rusqlite::Result<usize> + 'static,
+    ) {
+        self.kept.borrow_mut().push(Box::new(write));
+    }
+
     /// OpenMLS's provider, which stores into this transaction.
     pub fn provider(&self) -> &Provider<'a> {
         &self.provider

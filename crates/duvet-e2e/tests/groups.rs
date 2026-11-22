@@ -564,6 +564,56 @@ fn returning_device_rejoins_external() {
 }
 
 #[test]
+fn stale_knowledge_asks_to_observe_before_blocking() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1, mut b1, mut c1] = new_devices(&mut server, [a, b, c]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b, c], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1]);
+    let old_list = server.observed(b);
+
+    // B gets a new device, which joins by external commit. A1 and C1 haven't seen B's new list.
+    let mut b2 = server.device(b);
+    server.introduce(&mut b2);
+    let join = joining(&server, conversation);
+    server.commit(&mut b2, conversation, join).unwrap();
+    let entries = server.entries(conversation);
+    assert_eq!(entries.len(), 3);
+    let asked_for_b = (json!("needs_identities"), json!([b.to_string()]));
+
+    // A1 doesn't block on a commit only its own knowledge refuses: it asks to observe B first, and
+    // keeps nothing of the call.
+    let asked = error(&mut a1.core, apply(conversation, &entries[1..]));
+    assert_eq!((asked["code"].clone(), asked["users"].clone()), asked_for_b);
+    assert_eq!(a1.group(conversation)["epoch"], 1);
+
+    // With B's newer list, A1 takes the commit.
+    ok(&mut a1.core, server.observed(b));
+    let taken = ok(&mut a1.core, apply(conversation, &entries[1..]));
+    assert_eq!(results(&[taken]), [json!([3, "commit", "applied", null])]);
+
+    // C1 is asked the same, but observes B's old list again: the same knowledge refuses the commit
+    // a second time, and C1 blocks.
+    let asked = error(&mut c1.core, apply(conversation, &entries[2..]));
+    assert_eq!((asked["code"].clone(), asked["users"].clone()), asked_for_b);
+    assert_eq!(ok(&mut c1.core, old_list)["state"], "same");
+    let refused = ok(&mut c1.core, apply(conversation, &entries[2..]));
+    assert_eq!(
+        results(&[refused]),
+        [json!([3, "commit", "rejected", "device_not_listed"])]
+    );
+    assert_eq!(c1.group(conversation)["blocked"], true);
+
+    // B1, once it knows its user's new list, takes it too.
+    server.introduce(&mut b1);
+    server.deliver(&mut b1);
+    let state = same_group(&mut [&mut a1, &mut b1, &mut b2], conversation);
+    assert_eq!(state["epoch"], 2);
+}
+
+#[test]
 fn server_proposal_is_committed_by_next_writer() {
     let mut server = FakeServer::new();
     let (a, b) = (new_id(), new_id());
@@ -1046,20 +1096,35 @@ fn welcome_accepts_stale_devices_not_other_identities() {
     assert!(!device_set(&state).contains(&b2.id));
 
     // D pinned another identity for B than the one that certified B1's leaf, as after B started
-    // over: D can't tell that leaf from a forged one, and stays out.
+    // over: D first asks to observe B anew, then, still pinning it, can't tell that leaf from a
+    // forged one, and stays out.
     let add = adding(&mut server, conversation, d);
     server.commit(&mut a1, conversation, add).unwrap();
-    let changed = ok(&mut d1.core, another_identity(b, &[b1.id]));
-    assert_eq!(changed["state"], "changed");
-    let refused = server.deliver(&mut d1);
+    let other = another_identity(b, &[b1.id]);
+    assert_eq!(ok(&mut d1.core, other.clone())["state"], "changed");
+    let welcome = server.entries(conversation).last().unwrap().clone();
+    assert_eq!(welcome["kind"], "welcome");
+    let asked = error(
+        &mut d1.core,
+        apply(conversation, std::slice::from_ref(&welcome)),
+    );
     assert_eq!(
-        results(&refused)[0],
-        json!([
-            results(&refused)[0][0],
+        (&asked["code"], &asked["users"]),
+        (&json!("needs_identities"), &json!([b.to_string()]))
+    );
+    assert_eq!(ok(&mut d1.core, other)["state"], "same");
+    let refused = ok(
+        &mut d1.core,
+        apply(conversation, std::slice::from_ref(&welcome)),
+    );
+    assert_eq!(
+        results(&[refused]),
+        [json!([
+            welcome["seq"],
             "welcome",
             "rejected",
             "leaf_not_signed"
-        ])
+        ])]
     );
     assert_eq!(d1.no_group(conversation)["what"], "group");
 }

@@ -66,6 +66,14 @@ CREATE TABLE contact_identities (
     PRIMARY KEY (user_id, identity_key)
 );
 
+-- What the device knew of a user (their identity, and their list's version) when it last asked the
+-- client to observe them anew: a commit or welcome refused for what it knew of them asks once per state.
+CREATE TABLE observe_asks (
+    user_id BLOB PRIMARY KEY,
+    identity_key BLOB NOT NULL,
+    list_version INTEGER NOT NULL
+);
+
 -- Each conversation's MLS group, at its current generation.
 CREATE TABLE groups (
     conversation_id BLOB PRIMARY KEY,

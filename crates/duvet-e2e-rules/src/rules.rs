@@ -389,8 +389,9 @@ fn well_formed(list: &MemberList, generation: u32, epoch: u64) -> Result<(), Rul
 }
 
 /// A leaf's certificate, verified: signed by its user's pinned identity, for the leaf's own
-/// signature key, and its device on its user's latest list.
-fn certified(
+/// signature key, and its device on its user's latest list. What [`check_change`] holds every leaf
+/// a commit brings to.
+pub fn certified(
     ctx: &RuleContext,
     credential: &[u8],
     signature_key: &[u8],
@@ -407,8 +408,8 @@ fn certified(
 }
 
 /// A leaf's certificate, verified: signed by its user's pinned identity, for the leaf's own
-/// signature key.
-fn signed_for(
+/// signature key. What [`check_joined_state`] holds every leaf to.
+pub fn signed_for(
     ctx: &RuleContext,
     credential: &[u8],
     signature_key: &[u8],
