@@ -16,9 +16,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 
 use duvet_e2e_rules::{
-    CommitAad, DeviceCertificate, Entry, Kind, LeaveStatement, MEMBER_LIST_EXTENSION, MemberList,
-    MembershipChange, Place, RuleContext, RuleViolation, SUITE, certified, check_change,
-    extract_change, group_id, leaves, signed_for, statement_user,
+    CommitAad, Committer, DeviceCertificate, Entry, Kind, LeaveStatement, Leaves,
+    MEMBER_LIST_EXTENSION, MemberList, MembershipChange, Place, RuleContext, RuleViolation, SUITE,
+    certified, check_change, extract_change, group_id, leaves, signed_for, statement_user,
 };
 use openmls::prelude::tls_codec::{DeserializeBytes as _, Serialize as _};
 use openmls::prelude::{
@@ -388,18 +388,45 @@ fn needed_users(change: &MembershipChange) -> BTreeSet<Uuid> {
     users
 }
 
-/// Before another device's commit or welcome refused for `violation` counts as refused: when this
-/// device's own knowledge may be what refuses it (`device_not_listed`, `leaf_not_signed`: a member
-/// that hasn't seen a user's newest list or identity yet refuses their new device), the users
-/// among `leaves` (credential, signature key) whose leaves that knowledge refuses are to be
-/// observed anew first, `needs_identities`. Asked once for each state of what this device knows of
-/// them: the same knowledge refusing again is the refusal. `listed` holds the leaves to their
-/// users' lists too, as a commit's are.
-pub(crate) fn observe_first(
+/// Before another device's commit refused for `violation` counts as refused: when this device's
+/// own knowledge may be what refuses it, the users it refuses for are to be observed anew first,
+/// `needs_identities` ([`ask_first`]). Those are the users of the leaves the commit brings that
+/// this device can't certify (`device_not_listed`, `leaf_not_signed`: a member that hasn't seen a
+/// user's newest list or identity refuses their new device), and the users whose leave statement
+/// is missing or doesn't verify (`leave_without_statement`: a statement signed by a device this
+/// device doesn't know as listed).
+pub(crate) fn commit_asks_first(
     tx: &Tx<'_>,
+    entry: &[u8],
+    change: &MembershipChange,
     violation: RuleViolation,
-    leaves: &[(&[u8], &[u8])],
-    listed: bool,
+) -> Result<(), Error> {
+    let users = match violation {
+        RuleViolation::DeviceNotListed | RuleViolation::LeafNotSigned => {
+            let brought: Vec<(&[u8], &[u8])> = change
+                .added
+                .iter()
+                .chain(change.updated.iter().map(|(_, leaf)| leaf))
+                .map(|leaf| (leaf.credential.as_slice(), leaf.signature_key.as_slice()))
+                .collect();
+            let ctx = rule_context(tx, claimed_users(&brought))?;
+            uncertified(&ctx, &brought, true)
+        }
+        RuleViolation::LeaveWithoutStatement => unconfirmed_leavers(tx, change)?,
+        _ => return Ok(()),
+    };
+    ask_first(tx, entry, users)
+}
+
+/// Before a welcome refused for `violation` counts as refused: the users of its leaves this device
+/// can't certify by their pinned identity (`leaf_not_signed`, a welcome holds leaves to nothing
+/// more) are to be observed anew first, as for a commit.
+pub(crate) fn welcome_asks_first(
+    tx: &Tx<'_>,
+    entry: &[u8],
+    ctx: &RuleContext,
+    leaves: &Leaves,
+    violation: RuleViolation,
 ) -> Result<(), Error> {
     if !matches!(
         violation,
@@ -407,75 +434,132 @@ pub(crate) fn observe_first(
     ) {
         return Ok(());
     }
-    let claimed = |credential: &[u8]| {
-        DeviceCertificate::read_unverified(credential)
-            .ok()
-            .map(|certificate| certificate.user)
-    };
-    let ctx = rule_context(
-        tx,
-        leaves
-            .iter()
-            .filter_map(|(credential, _)| claimed(credential)),
-    )?;
-    let users: BTreeSet<Uuid> = leaves
-        .iter()
-        .filter(|(credential, key)| {
-            if listed {
-                certified(&ctx, credential, key).is_err()
-            } else {
-                signed_for(&ctx, credential, key).is_err()
-            }
-        })
-        .filter_map(|(credential, _)| claimed(credential))
+    let all: Vec<(&[u8], &[u8])> = leaves
+        .values()
+        .map(|leaf| (leaf.certificate.as_slice(), leaf.signature_key.as_slice()))
         .collect();
-    if users.is_empty() || !ask_to_observe(tx, &users)? {
-        return Ok(());
-    }
-    Err(Error::NeedsIdentities {
-        users: users.iter().map(Uuid::to_string).collect(),
-    })
+    ask_first(tx, entry, uncertified(ctx, &all, false))
 }
 
-/// Whether what this device knows of `users` (their pinned identity, their list's version) differs
-/// for one of them from when it last asked the client to observe them. It notes what it asks
-/// about now, whatever becomes of the command.
-fn ask_to_observe(tx: &Tx<'_>, users: &BTreeSet<Uuid>) -> Result<bool, Error> {
-    let mut new = Vec::new();
-    for &user in users {
+/// The users `leaves` (credential, signature key) name.
+fn claimed_users(leaves: &[(&[u8], &[u8])]) -> BTreeSet<Uuid> {
+    leaves
+        .iter()
+        .filter_map(|(credential, _)| DeviceCertificate::read_unverified(credential).ok())
+        .map(|certificate| certificate.user)
+        .collect()
+}
+
+/// The users among `leaves` whose certificate this device's knowledge refuses: not signed by
+/// their pinned identity for the leaf's key, or, when `listed`, for a device off their list.
+fn uncertified(ctx: &RuleContext, leaves: &[(&[u8], &[u8])], listed: bool) -> BTreeSet<Uuid> {
+    let refused: Vec<(&[u8], &[u8])> = leaves
+        .iter()
+        .copied()
+        .filter(|&(credential, key)| {
+            if listed {
+                certified(ctx, credential, key).is_err()
+            } else {
+                signed_for(ctx, credential, key).is_err()
+            }
+        })
+        .collect();
+    claimed_users(&refused)
+}
+
+/// The users `change` takes off the list without a leave statement this device can verify: each
+/// statement's user when it doesn't hold, and each user removed with none (but by the owner).
+fn unconfirmed_leavers(tx: &Tx<'_>, change: &MembershipChange) -> Result<BTreeSet<Uuid>, Error> {
+    let claimed: Vec<Uuid> = change
+        .statements
+        .iter()
+        .filter_map(|signed| LeaveStatement::read_unverified(signed).ok())
+        .map(|statement| statement.user)
+        .filter(|user| change.before.contains(*user))
+        .collect();
+    let ctx = rule_context(tx, claimed)?;
+    let place = Place {
+        conversation: change.conversation,
+        generation: change.generation,
+        epoch: change.epoch,
+    };
+    let mut users = BTreeSet::new();
+    let mut left = BTreeSet::new();
+    for signed in &change.statements {
+        match statement_user(&ctx, &change.before, &change.leaves, place, signed) {
+            Some(user) => {
+                left.insert(user);
+            }
+            None => users.extend(
+                LeaveStatement::read_unverified(signed)
+                    .ok()
+                    .map(|statement| statement.user),
+            ),
+        }
+    }
+    let committer = match &change.committer {
+        Committer::Member { leaf, .. } => Some(leaf.user),
+        Committer::NewMember => None,
+    };
+    let owner = change.before.owner;
+    for entry in &change.before.users {
+        let by_owner = owner.is_some() && owner == committer && owner != Some(entry.user);
+        if !change.after.contains(entry.user) && !left.contains(&entry.user) && !by_owner {
+            users.insert(entry.user);
+        }
+    }
+    Ok(users)
+}
+
+/// `needs_identities` for the users of `users` the client hasn't observed since `entry` (the
+/// refused commit's or welcome's SHA-256) asked about them at what this device knows of them now.
+/// Once it observed each of them since, the same knowledge refusing the same entry again is the
+/// refusal (`Ok`). What it asks is noted, whatever becomes of the command.
+fn ask_first(tx: &Tx<'_>, entry: &[u8], users: BTreeSet<Uuid>) -> Result<(), Error> {
+    let mut ask = Vec::new();
+    for user in users {
         let (Some(identity), Some(list)) = (tx.identity_of(user)?, tx.device_list_of(user)?) else {
             continue;
         };
         let version = i64::try_from(list.version)
             .map_err(|_| Error::Internal("a device list's version is out of range".into()))?;
-        let asked: Option<(Vec<u8>, i64)> = tx
+        let noted: Option<(Vec<u8>, i64, bool)> = tx
             .conn()
             .query_row(
-                "SELECT identity_key, list_version FROM observe_asks WHERE user_id = ?1",
-                [user.as_bytes().as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT identity_key, list_version, observed FROM observe_asks \
+                 WHERE entry = ?1 AND user_id = ?2",
+                params![entry, user.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        if asked != Some((identity.to_vec(), version)) {
-            new.push((user, identity, version));
+        if noted != Some((identity.to_vec(), version, true)) {
+            ask.push((user, identity, version));
         }
     }
-    if new.is_empty() {
-        return Ok(false);
+    if ask.is_empty() {
+        return Ok(());
     }
+    let users = ask.iter().map(|(user, _, _)| user.to_string()).collect();
+    let entry = entry.to_vec();
     tx.keep(move |conn| {
         let mut written = 0;
-        for (user, identity, version) in &new {
+        for (user, identity, version) in &ask {
             written += conn.execute(
-                "INSERT INTO observe_asks (user_id, identity_key, list_version) VALUES (?1, ?2, ?3) \
-                 ON CONFLICT (user_id) DO UPDATE SET identity_key = excluded.identity_key, \
-                 list_version = excluded.list_version",
-                params![user.as_bytes().as_slice(), identity.as_slice(), version],
+                "INSERT INTO observe_asks (entry, user_id, identity_key, list_version, observed) \
+                 VALUES (?1, ?2, ?3, ?4, 0) ON CONFLICT (entry, user_id) DO UPDATE SET \
+                 identity_key = excluded.identity_key, list_version = excluded.list_version, \
+                 observed = 0",
+                params![
+                    entry,
+                    user.as_bytes().as_slice(),
+                    identity.as_slice(),
+                    version
+                ],
             )?;
         }
         Ok(written)
     });
-    Ok(true)
+    Err(Error::NeedsIdentities { users })
 }
 
 /// What the rules go by for a commit beyond its users' identities and lists.

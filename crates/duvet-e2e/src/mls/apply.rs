@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    Extra, GroupRow, check, delete_group, digest, observe_first, openmls_error, own_merged,
-    rule_context, storage_error, stored_group, stored_state,
+    Extra, GroupRow, check, commit_asks_first, delete_group, digest, openmls_error, own_merged,
+    rule_context, storage_error, stored_group, stored_state, welcome_asks_first,
 };
 use crate::identity::{invalid, not_found};
 use crate::protocol::b64;
@@ -227,10 +227,11 @@ impl Conversation {
 
 /// Commits: each one at this device's epoch is held to the rules, then merged. Another device's
 /// commit that breaks them, or that this device can't process, blocks the group, but one refused
-/// only for what this device knows of its leaves' users first asks to observe them anew
-/// (`needs_identities`, once per state of that knowledge). This device's own commit never blocks
-/// it: one the server answered as refused is merged when the queue brings it back, and dropped
-/// when another commit takes its epoch.
+/// for what this device knows of some users (their leaves' certificates, their leave statements)
+/// first asks to observe them anew (`needs_identities`), until the client did and the same
+/// knowledge refuses it again. This device's own commit never blocks it: one the server answered
+/// as refused is merged when the queue brings it back, and dropped once the queue shows it never
+/// entered.
 struct Commits;
 
 impl EntryHandler for Commits {
@@ -294,13 +295,7 @@ impl EntryHandler for Commits {
             Err(violation) => return Ok(block(row, violation.name())),
         };
         if let Err(violation) = check(tx, &change, Extra::default())? {
-            let brought: Vec<(&[u8], &[u8])> = change
-                .added
-                .iter()
-                .chain(change.updated.iter().map(|(_, leaf)| leaf))
-                .map(|leaf| (leaf.credential.as_slice(), leaf.signature_key.as_slice()))
-                .collect();
-            observe_first(tx, violation, &brought, true)?;
+            commit_asks_first(tx, &digest(&entry.data), &change, violation)?;
             return Ok(block(row, violation.name()));
         }
         let after =
@@ -401,11 +396,7 @@ impl EntryHandler for Welcomes {
         let mut ctx = rule_context(tx, leaves.values().map(|leaf| leaf.user))?;
         ctx.expected_initial = expected.or(reset);
         if let Err(violation) = check_joined_state(&ctx, context, &leaves) {
-            let all: Vec<(&[u8], &[u8])> = leaves
-                .values()
-                .map(|leaf| (leaf.certificate.as_slice(), leaf.signature_key.as_slice()))
-                .collect();
-            observe_first(tx, violation, &all, false)?;
+            welcome_asks_first(tx, &digest(&entry.data), &ctx, &leaves, violation)?;
             return Ok(rejected(violation.name()));
         }
         let list = MemberList::from_group_context(context).map_err(|_| stored_state())?;

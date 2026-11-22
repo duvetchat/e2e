@@ -774,6 +774,100 @@ fn stale_knowledge_asks_to_observe_before_blocking() {
     assert_eq!(state["epoch"], 2);
 }
 
+/// `apply`'s `needs_identities`, as its code and users.
+fn asked(device: &mut TestDevice, conversation: Uuid, entries: &[Value]) -> (Value, Value) {
+    let asked = error(&mut device.core, apply(conversation, entries));
+    (asked["code"].clone(), asked["users"].clone())
+}
+
+#[test]
+fn refused_commits_ask_until_the_client_observed() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1, mut b1, mut c1] = new_devices(&mut server, [a, b, c]);
+    let (x, y) = (new_id(), new_id());
+    for conversation in [x, y] {
+        server.conversation(conversation, Kind::Group, Some(a), &[a, b, c], false);
+        start(&mut server, &mut a1, conversation);
+    }
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1]);
+
+    // B's new device joins both conversations, and C1 hasn't seen B's new list.
+    let mut b2 = server.device(b);
+    server.introduce(&mut b2);
+    for conversation in [x, y] {
+        let join = joining(&server, conversation);
+        server.commit(&mut b2, conversation, join).unwrap();
+    }
+    let x_entries = server.entries(x)[2..].to_vec();
+    let y_entries = server.entries(y)[2..].to_vec();
+    let asked_for_b = (json!("needs_identities"), json!([b.to_string()]));
+
+    // C1 is asked about B for X. Before it observes B, Y is refused for B as well: it asks too,
+    // and doesn't block.
+    assert_eq!(asked(&mut c1, x, &x_entries), asked_for_b);
+    assert_eq!(asked(&mut c1, y, &y_entries), asked_for_b);
+    // X again, still without observing: it asks again.
+    assert_eq!(asked(&mut c1, x, &x_entries), asked_for_b);
+
+    // Once C1 observes B's newer list, both apply.
+    ok(&mut c1.core, server.observed(b));
+    for (conversation, entries) in [(x, &x_entries), (y, &y_entries)] {
+        let taken = ok(&mut c1.core, apply(conversation, entries));
+        assert_eq!(results(&[taken]), [json!([3, "commit", "applied", null])]);
+        assert_eq!(c1.group(conversation)["blocked"], false);
+    }
+}
+
+#[test]
+fn leave_signed_by_a_device_unseen_asks_first() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1, mut b1, mut c1] = new_devices(&mut server, [a, b, c]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    // B's new device joins. A1 and B1 see B's new list; C1 doesn't.
+    let mut b2 = server.device(b);
+    for device in [&mut a1, &mut b1, &mut b2] {
+        server.introduce(device);
+    }
+    let join = joining(&server, conversation);
+    server.commit(&mut b2, conversation, join).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
+
+    // A adds C. C1 enters by the welcome: B2's leaf is certified by B's identity, all a welcome
+    // holds it to, so C1 never looked at B's list again.
+    let add = adding(&mut server, conversation, c);
+    server.commit(&mut a1, conversation, add).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2, &mut c1]);
+    assert_eq!(c1.group(conversation)["blocked"], false);
+
+    // B leaves with B2's statement, which A1's commit carries.
+    server.leave(&mut b2, conversation);
+    server.deliver(&mut a1);
+    server
+        .commit(
+            &mut a1,
+            conversation,
+            command("commit_pending", conversation),
+        )
+        .unwrap();
+
+    // C1 can't verify the statement, B2 being off B's list as C1 knows it: it asks about B first.
+    let entries = server.entries(conversation)[5..].to_vec();
+    assert_eq!(
+        asked(&mut c1, conversation, &entries),
+        (json!("needs_identities"), json!([b.to_string()]))
+    );
+    ok(&mut c1.core, server.observed(b));
+    ok(&mut c1.core, apply(conversation, &entries));
+    let state = same_group(&mut [&mut a1, &mut c1], conversation);
+    assert_eq!(members(&state), [a, c]);
+}
+
 #[test]
 fn server_proposal_is_committed_by_next_writer() {
     let mut server = FakeServer::new();

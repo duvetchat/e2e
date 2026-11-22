@@ -66,12 +66,17 @@ CREATE TABLE contact_identities (
     PRIMARY KEY (user_id, identity_key)
 );
 
--- What the device knew of a user (their identity, and their list's version) when it last asked the
--- client to observe them anew: a commit or welcome refused for what it knew of them asks once per state.
+-- The users a refused commit or welcome (by its SHA-256) asked the client to observe anew, with
+-- what the device knew of each then (their identity, and their list's version), and whether
+-- observe_user ran for them since. The same entry refused again at the same knowledge, observed
+-- since, is refused for good; otherwise it asks again.
 CREATE TABLE observe_asks (
-    user_id BLOB PRIMARY KEY,
+    entry BLOB NOT NULL,
+    user_id BLOB NOT NULL,
     identity_key BLOB NOT NULL,
-    list_version INTEGER NOT NULL
+    list_version INTEGER NOT NULL,
+    observed INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (entry, user_id)
 );
 
 -- Each conversation's MLS group, at its current generation.
