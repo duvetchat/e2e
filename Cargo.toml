@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "flutter/duvet_e2e/rust"]
 
 [workspace.package]
 version = "0.1.0"
@@ -34,6 +34,7 @@ sqlite-wasm-vfs = "=0.3.0"
 
 # Formats
 base64 = "0.22"
+bs58 = "0.5.1"
 ciborium = "0.2.2"
 miniz_oxide = "0.9.1"
 serde = { version = "1", features = ["derive"] }
@@ -51,4 +52,9 @@ zeroize = "1.9"
 # Bindings
 flutter_rust_bridge = "=2.13.0"
 keyring = "4.2.0"
+keyring-core = "1.1.0"
+secret-service = { version = "5.2.0", default-features = false }
+zbus = { version = "5.19.0", default-features = false }
 wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "=0.4.80"
+wasm-bindgen-test = "=0.3.80"

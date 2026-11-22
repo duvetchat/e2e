@@ -6,4 +6,25 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
+base64.workspace = true
+duvet-e2e.workspace = true
+# The database's key on the desktop: Windows' Credential Manager, macOS's Keychain, the Secret Service.
+keyring.workspace = true
+keyring-core.workspace = true
+rand_core = { workspace = true, features = ["getrandom"] }
+serde.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+
+# Where the keyring is the Secret Service: to tell one that isn't there at all, the only case for
+# the key file, from one that's locked or failing.
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
+secret-service.workspace = true
+zbus.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

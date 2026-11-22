@@ -1,18 +1,49 @@
 //! The commands the core takes: `{"cmd": "<name>", ...fields}`.
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{Error, KeyStorage, PROTOCOL, Tx};
+use crate::{Error, KeyStorage, PROTOCOL, Tx, identity, parts};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub(crate) enum Command {
     Status,
+
+    // Identity, devices, contacts and key packages.
+    CreateDevice {
+        user_id: Uuid,
+        device_id: Uuid,
+    },
+    CreateIdentity,
+    SignDeviceList {
+        remove: Vec<Uuid>,
+    },
+    ObserveUser {
+        user_id: Uuid,
+        #[serde(with = "b64")]
+        identity_key: Vec<u8>,
+        #[serde(with = "b64")]
+        device_list: Vec<u8>,
+        #[serde(default, with = "b64::list")]
+        certificates: Vec<Vec<u8>>,
+    },
+    SafetyNumber {
+        user_id: Uuid,
+    },
+    VerifyUser {
+        user_id: Uuid,
+        #[serde(default, with = "b64::option")]
+        qr: Option<Vec<u8>>,
+    },
+    KeyPackages,
+
+    // Attachments' parts.
+    AttachmentKey,
+    AttachmentEncrypt(parts::AttachmentPart),
+    AttachmentDecrypt(parts::AttachmentPart),
 }
 
 pub(crate) fn parse(command: &str) -> Result<Command, Error> {
@@ -22,6 +53,33 @@ pub(crate) fn parse(command: &str) -> Result<Command, Error> {
 pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error> {
     match command {
         Command::Status => reply(cmd_status(tx)?),
+
+        Command::CreateDevice { user_id, device_id } => {
+            reply(identity::create_device(tx, user_id, device_id)?)
+        }
+        Command::CreateIdentity => reply(identity::create_identity(tx)?),
+        Command::SignDeviceList { remove } => reply(identity::sign_device_list(tx, &remove)?),
+        Command::ObserveUser {
+            user_id,
+            identity_key,
+            device_list,
+            certificates,
+        } => reply(identity::observe_user(
+            tx,
+            user_id,
+            &identity_key,
+            &device_list,
+            &certificates,
+        )?),
+        Command::SafetyNumber { user_id } => reply(identity::safety_number(tx, user_id)?),
+        Command::VerifyUser { user_id, qr } => {
+            reply(identity::verify_user(tx, user_id, qr.as_deref())?)
+        }
+        Command::KeyPackages => reply(identity::key_packages(tx)?),
+
+        Command::AttachmentKey => reply(parts::attachment_key(tx)?),
+        Command::AttachmentEncrypt(part) => reply(parts::attachment_encrypt(part)?),
+        Command::AttachmentDecrypt(part) => reply(parts::attachment_decrypt(part)?),
     }
 }
 
@@ -37,9 +95,8 @@ struct Status {
     user_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     device_id: Option<Uuid>,
-    /// Base64.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    identity_key: Option<String>,
+    #[serde(with = "b64::option", skip_serializing_if = "Option::is_none")]
+    identity_key: Option<Vec<u8>>,
     has_identity: bool,
     key_storage: KeyStorage,
 }
@@ -70,7 +127,154 @@ fn cmd_status(tx: &mut Tx<'_>) -> Result<Status, Error> {
             .map(|(_, device)| uuid(device))
             .transpose()?,
         has_identity: identity_key.is_some(),
-        identity_key: identity_key.map(|key| STANDARD.encode(key)),
+        identity_key,
         key_storage: tx.key_storage(),
     })
+}
+
+/// Binary fields in the JSON protocol: standard base64 with its padding. Use with
+/// `#[serde(with = "b64")]` on a `Vec<u8>`, `b64::option` on an `Option<Vec<u8>>`,
+/// `b64::list` on a `Vec<Vec<u8>>` a command takes, or `b64::secret` on a key it takes, a
+/// `Zeroizing<Vec<u8>>`.
+pub(crate) mod b64 {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(crate) fn serialize<S: Serializer>(
+        bytes: impl AsRef<[u8]>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<u8>, D::Error> {
+        STANDARD
+            .decode(String::deserialize(deserializer)?)
+            .map_err(|_| D::Error::custom("not padded base64"))
+    }
+
+    pub(crate) mod option {
+        use super::*;
+
+        pub(crate) fn serialize<S: Serializer>(
+            bytes: &Option<impl AsRef<[u8]>>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            match bytes {
+                Some(bytes) => serializer.serialize_some(&STANDARD.encode(bytes)),
+                None => serializer.serialize_none(),
+            }
+        }
+
+        pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<Vec<u8>>, D::Error> {
+            Option::<String>::deserialize(deserializer)?
+                .map(|text| {
+                    STANDARD
+                        .decode(text)
+                        .map_err(|_| D::Error::custom("not padded base64"))
+                })
+                .transpose()
+        }
+    }
+
+    pub(crate) mod list {
+        use super::*;
+
+        pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Vec<Vec<u8>>, D::Error> {
+            Vec::<String>::deserialize(deserializer)?
+                .into_iter()
+                .map(|text| {
+                    STANDARD
+                        .decode(text)
+                        .map_err(|_| D::Error::custom("not padded base64"))
+                })
+                .collect()
+        }
+    }
+
+    /// A secret, decoded into memory that's wiped as it drops. No `String` of its own holds the
+    /// base64 on the way, unless the JSON escaped a character in it and serde_json unescaped it.
+    pub(crate) mod secret {
+        use std::fmt;
+
+        use serde::de::Visitor;
+        use zeroize::Zeroizing;
+
+        use super::*;
+
+        pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Zeroizing<Vec<u8>>, D::Error> {
+            deserializer.deserialize_str(Base64)
+        }
+
+        struct Base64;
+
+        impl Visitor<'_> for Base64 {
+            type Value = Zeroizing<Vec<u8>>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("padded base64")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Self::Value, E> {
+                let mut bytes = Zeroizing::new(vec![0; base64::decoded_len_estimate(text.len())]);
+                let len = STANDARD
+                    .decode_slice(text, &mut bytes)
+                    .map_err(|_| E::custom("not padded base64"))?;
+                bytes.truncate(len);
+                Ok(bytes)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::{Deserialize, Serialize};
+
+    use super::b64;
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Fields {
+        #[serde(with = "b64")]
+        key: Vec<u8>,
+        #[serde(default, with = "b64::option", skip_serializing_if = "Option::is_none")]
+        note: Option<Vec<u8>>,
+    }
+
+    #[test]
+    fn binary_fields_are_padded_base64() {
+        let fields = Fields {
+            key: vec![0xfb, 0xff, 0x01],
+            note: Some(b"a".to_vec()),
+        };
+        let json = serde_json::to_string(&fields).unwrap();
+        assert_eq!(json, r#"{"key":"+/8B","note":"YQ=="}"#);
+        assert_eq!(serde_json::from_str::<Fields>(&json).unwrap(), fields);
+        assert_eq!(
+            serde_json::from_str::<Fields>(r#"{"key":""}"#).unwrap(),
+            Fields {
+                key: vec![],
+                note: None
+            }
+        );
+
+        for bad in [
+            r#"{"key":"YQ"}"#,
+            r#"{"key":"-_8B"}"#,
+            r#"{"key":"+/8B","note":"Y"}"#,
+            r#"{"key":3}"#,
+        ] {
+            assert!(serde_json::from_str::<Fields>(bad).is_err(), "{bad}");
+        }
+    }
 }

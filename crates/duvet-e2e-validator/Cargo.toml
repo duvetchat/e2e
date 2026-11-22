@@ -6,4 +6,23 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[lib]
+# The module the API loads, and the library native tests call.
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
+ciborium.workspace = true
+duvet-e2e-rules.workspace = true
+ed25519-dalek.workspace = true
+openmls.workspace = true
+openmls_memory_storage.workspace = true
+openmls_rust_crypto.workspace = true
+openmls_traits.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+openmls_basic_credential.workspace = true
+serde_json.workspace = true

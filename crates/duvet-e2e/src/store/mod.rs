@@ -108,6 +108,8 @@ fn lock(path: &Path) -> Result<std::fs::File, Error> {
 
 /// Hands SQLCipher the raw key and checks it: SQLCipher reads nothing until the first query.
 fn unlock(conn: &Connection, key: &[u8; 32]) -> Result<(), Error> {
+    // SQLCipher writes its own errors to stderr, a wrong key's included: the core logs nothing.
+    conn.execute_batch("PRAGMA cipher_log_level = NONE;")?;
     set_key(conn, &key_pragma(key))?;
     match conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
         row.get::<_, i64>(0)
