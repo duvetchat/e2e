@@ -426,8 +426,7 @@ impl StorageProvider<CURRENT_VERSION> for SqlStorage<'_> {
         let key = serde_json::to_vec(&hash_ref).unwrap();
         let value = serde_json::to_vec(&key_package).unwrap();
 
-        self.write::<CURRENT_VERSION>(KEY_PACKAGE_LABEL, &key, value)
-            .unwrap();
+        self.write::<CURRENT_VERSION>(KEY_PACKAGE_LABEL, &key, value)?;
 
         Ok(())
     }

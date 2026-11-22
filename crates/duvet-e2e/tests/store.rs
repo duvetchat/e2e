@@ -1,5 +1,7 @@
 //! The local database, the entry point and OpenMLS's storage.
 
+use std::panic::{self, AssertUnwindSafe};
+
 use duvet_e2e::{Core, Error, OpenConfig};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -118,34 +120,85 @@ fn mls_state_survives_reopen() {
     assert_eq!(epoch, 1);
 }
 
+/// A command's writes in both stores: a row of `meta`, and a signer in OpenMLS's.
+fn write_witnesses(tx: &mut duvet_e2e::Tx<'_>) -> Result<(), Error> {
+    tx.conn().execute(
+        "INSERT INTO meta (key, value) VALUES ('witness', x'01')",
+        [],
+    )?;
+    let signer = SignatureKeyPair::new(SUITE.signature_algorithm()).unwrap();
+    signer.store(tx.provider().storage()).unwrap();
+    Ok(())
+}
+
+/// How many of those writes the database holds, in `meta` and in OpenMLS's store.
+fn witnesses(core: &mut Core) -> (i64, i64) {
+    core.transaction(|tx| {
+        let meta: i64 =
+            tx.conn()
+                .query_row("SELECT count(*) FROM meta WHERE key = 'witness'", [], |r| {
+                    r.get(0)
+                })?;
+        let kv: i64 = tx
+            .conn()
+            .query_row("SELECT count(*) FROM openmls_kv", [], |r| r.get(0))?;
+        Ok((meta, kv))
+    })
+    .unwrap()
+}
+
 #[test]
 fn failed_command_rolls_back() {
     let dir = tempfile::tempdir().unwrap();
     let mut core = Core::open(config(&dir, 1)).unwrap();
 
     let failed: Result<(), Error> = core.transaction(|tx| {
-        tx.conn().execute(
-            "INSERT INTO meta (key, value) VALUES ('witness', x'01')",
-            [],
-        )?;
-        let signer = SignatureKeyPair::new(SUITE.signature_algorithm()).unwrap();
-        signer.store(tx.provider().storage()).unwrap();
+        write_witnesses(tx)?;
         Err(Error::Internal("forced".into()))
     });
     assert_eq!(failed.err().map(|e| e.code()), Some("internal"));
+    assert_eq!(witnesses(&mut core), (0, 0));
+}
 
-    let counts = core
-        .transaction(|tx| {
-            let meta: i64 = tx.conn().query_row(
-                "SELECT count(*) FROM meta WHERE key = 'witness'",
-                [],
-                |r| r.get(0),
-            )?;
-            let kv: i64 = tx
-                .conn()
-                .query_row("SELECT count(*) FROM openmls_kv", [], |r| r.get(0))?;
-            Ok((meta, kv))
+#[test]
+fn panicking_command_rolls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut core = Core::open(config(&dir, 1)).unwrap();
+
+    let panicked = panic::catch_unwind(AssertUnwindSafe(|| {
+        core.transaction(|tx| -> Result<(), Error> {
+            write_witnesses(tx)?;
+            panic!("a command's bug");
         })
-        .unwrap();
-    assert_eq!(counts, (0, 0));
+    }));
+    assert!(panicked.is_err());
+
+    // The next command runs, and finds nothing of the one that panicked.
+    assert_eq!(ok(&mut core, r#"{"cmd":"status"}"#)["protocol"], 1);
+    assert_eq!(witnesses(&mut core), (0, 0));
+}
+
+#[test]
+fn storage_failure_while_storing_a_key_package_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut core = Core::open(config(&dir, 1)).unwrap();
+
+    let built = panic::catch_unwind(AssertUnwindSafe(|| {
+        core.transaction(|tx| {
+            // OpenMLS's table gone, its write fails.
+            tx.conn().execute_batch("DROP TABLE openmls_kv")?;
+            let signer = SignatureKeyPair::new(SUITE.signature_algorithm()).unwrap();
+            let credential = CredentialWithKey {
+                credential: BasicCredential::new(b"device".to_vec()).into(),
+                signature_key: signer.public().into(),
+            };
+            KeyPackage::builder()
+                .build(SUITE, tx.provider(), &signer, credential)
+                .map(|_| ())
+                .map_err(|error| Error::Internal(error.to_string()))
+        })
+    }));
+    let built = built.expect("an error, not a panic, which aborts a web worker");
+    assert_eq!(built.err().map(|e| e.code()), Some("internal"));
+    assert_eq!(witnesses(&mut core), (0, 0), "the table is back");
 }

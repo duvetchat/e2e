@@ -473,6 +473,7 @@ dependencies = [
  "thiserror",
  "uuid",
  "web-time",
+ "zeroize",
 ]
 
 [[package]]

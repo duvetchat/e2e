@@ -45,6 +45,9 @@ uuid = { version = "1", default-features = false, features = ["std", "serde"] }
 thiserror = "2"
 web-time = "1.1"
 
+# Secrets wiped from memory once used.
+zeroize = "1.9"
+
 # Bindings
 flutter_rust_bridge = "=2.13.0"
 keyring = "4.2.0"

@@ -7,6 +7,7 @@ use std::path::Path;
 
 use openmls_rust_crypto::RustCrypto;
 use rusqlite::{Connection, ErrorCode, TransactionBehavior};
+use zeroize::{Zeroize, Zeroizing};
 
 pub use openmls_kv::{SqlStorage, SqlStorageError};
 
@@ -107,8 +108,7 @@ fn lock(path: &Path) -> Result<std::fs::File, Error> {
 
 /// Hands SQLCipher the raw key and checks it: SQLCipher reads nothing until the first query.
 fn unlock(conn: &Connection, key: &[u8; 32]) -> Result<(), Error> {
-    let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
-    conn.execute_batch(&format!("PRAGMA key = \"x'{hex}'\";"))?;
+    set_key(conn, &key_pragma(key))?;
     match conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
         row.get::<_, i64>(0)
     }) {
@@ -117,5 +117,61 @@ fn unlock(conn: &Connection, key: &[u8; 32]) -> Result<(), Error> {
             Err(Error::BadKey)
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+/// `PRAGMA key = "x'<hex>'";`, the key's hex written straight into a buffer of the statement's
+/// exact size, so no other copy is made, and wiped as it drops.
+fn key_pragma(key: &[u8; 32]) -> Zeroizing<String> {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    const START: &str = "PRAGMA key = \"x'";
+    const END: &str = "'\";";
+    let mut pragma = Zeroizing::new(String::with_capacity(
+        START.len() + 2 * key.len() + END.len(),
+    ));
+    pragma.push_str(START);
+    for byte in key {
+        pragma.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        pragma.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    pragma.push_str(END);
+    pragma
+}
+
+/// Runs the statement that hands SQLCipher its key. Its error can quote the statement, so it
+/// becomes a fixed message, and the copies it holds are wiped.
+fn set_key(conn: &Connection, pragma: &str) -> Result<(), Error> {
+    conn.execute_batch(pragma).map_err(|mut error| {
+        match &mut error {
+            rusqlite::Error::SqlInputError { msg, sql, .. } => {
+                msg.zeroize();
+                sql.zeroize();
+            }
+            rusqlite::Error::SqliteFailure(_, Some(msg)) => msg.zeroize(),
+            _ => {}
+        }
+        Error::Storage("the database's key couldn't be set".into())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_statement_is_sqlciphers_raw_key() {
+        let key: [u8; 32] = std::array::from_fn(|byte| (byte * 8) as u8);
+        let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(*key_pragma(&key), format!("PRAGMA key = \"x'{hex}'\";"));
+    }
+
+    #[test]
+    fn a_failed_key_statement_keeps_the_key_out() {
+        let conn = Connection::open_in_memory().unwrap();
+        // A statement SQLite can't parse: its error quotes the statement, which holds the key.
+        let error = set_key(&conn, "PRAGMA key = \"x'5ec2e7'\" and more;").unwrap_err();
+        let reply = error.to_reply().to_string();
+        assert!(!reply.contains("5ec2e7"), "{reply}");
+        assert_eq!(error.code(), "storage");
     }
 }
