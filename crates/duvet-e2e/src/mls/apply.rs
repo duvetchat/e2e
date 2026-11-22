@@ -41,7 +41,8 @@ pub(crate) struct Entry {
     pub(crate) data: Vec<u8>,
     /// On the welcome of a conversation from before the cutover: its owner and members as this
     /// device's client showed them then, from the client's own record (the API never gives it),
-    /// which the group must have.
+    /// which the group must have. Only a welcome of generation 0, the conversation's first group,
+    /// is held to it; at a later generation it's ignored.
     #[serde(default)]
     pub(crate) expected: Option<Expected>,
     /// On the server's proposal to remove a leaf of a user who leaves: their signed statement, for
@@ -392,9 +393,12 @@ impl EntryHandler for Welcomes {
         };
         let context = staged.group_context();
         let epoch = context.epoch().as_u64();
+        // A client's record from before the cutover holds the conversation's first group alone; at a
+        // later generation a reset's expectation decides.
         let expected = entry
             .expected
             .as_ref()
+            .filter(|_| generation == 0)
             .map(|expected| expected.list(generation));
         let mut ctx = rule_context(tx, leaves.values().map(|leaf| leaf.user))?;
         ctx.expected_initial = expected.or(reset);

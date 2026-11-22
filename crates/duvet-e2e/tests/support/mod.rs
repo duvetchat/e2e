@@ -158,6 +158,8 @@ pub struct QueueEntry {
     pub data: Vec<u8>,
     /// The leave statement a removal proposal brings.
     pub statement: Option<Vec<u8>>,
+    /// The generation of a welcome, as the server knows it.
+    pub generation: Option<u32>,
 }
 
 impl QueueEntry {
@@ -202,6 +204,7 @@ impl Chat {
             kind,
             data,
             statement,
+            generation: None,
         });
         seq
     }
@@ -701,6 +704,7 @@ impl FakeServer {
         }
         if let Some(welcome) = reply["welcome"].as_str() {
             let welcome_seq = chat.push("welcome", STANDARD.decode(welcome).unwrap(), None);
+            chat.queue.last_mut().unwrap().generation = Some(generation);
             // A device new to the conversation gets the queue from its welcome on; one that had it
             // (a reset brings everyone in again) goes on in order.
             for added in &change.devices_added {
@@ -779,8 +783,8 @@ impl FakeServer {
     }
 
     /// Hands `device` the entries of each of its conversations it hasn't had yet, through `apply`:
-    /// the replies. As its client does, it adds its own record of a conversation from before the
-    /// cutover to the welcomes of that conversation, as their `expected`.
+    /// the replies. It adds the device's own record of a conversation from before the cutover to
+    /// that conversation's welcomes of generation 0, its first group, as their `expected`.
     pub fn deliver(&mut self, device: &mut TestDevice) -> Vec<Value> {
         let mut replies = Vec::new();
         for (conversation, chat) in &mut self.chats {
@@ -794,7 +798,9 @@ impl FakeServer {
                 .filter(|entry| entry.seq >= next)
                 .map(|entry| {
                     let mut json = entry.json();
-                    if let (Some(record), "welcome") = (record, entry.kind) {
+                    if let (Some(record), "welcome", Some(0)) =
+                        (record, entry.kind, entry.generation)
+                    {
                         json["expected"] = record.clone();
                     }
                     json

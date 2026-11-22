@@ -467,6 +467,46 @@ fn legacy_welcome_is_held_to_the_devices_own_record() {
 }
 
 #[test]
+fn reset_welcome_goes_by_the_reset_not_the_record() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1, mut b1, mut c1] = new_devices(&mut server, [a, b, c]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], true);
+    b1.remember(conversation, Some(a), &[a, b]);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    // A adds C, after the cutover.
+    let add = adding(&mut server, conversation, c);
+    server.commit(&mut a1, conversation, add).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1]);
+
+    // A resets the group. B1's welcome to the next generation, even with B1's record from before
+    // the cutover beside it, goes by the reset: the members B1 had, C among them.
+    let reset = json!({
+        "cmd": "reset_group",
+        "conversation_id": conversation,
+        "key_packages": server.claim(&[a, b, c]),
+    });
+    server.commit(&mut a1, conversation, reset).unwrap();
+    let mut entries = server.entries(conversation)[4..].to_vec();
+    assert_eq!(entries[1]["kind"], "welcome");
+    entries[1]["expected"] = json!({"owner": a, "members": [a, b]});
+    let taken = ok(&mut b1.core, apply(conversation, &entries));
+    assert_eq!(
+        results(std::slice::from_ref(&taken)),
+        [
+            json!([5, "commit", "ignored", null]),
+            json!([6, "welcome", "applied", null]),
+        ]
+    );
+    let state = b1.group(conversation);
+    assert_eq!(state["generation"], 1);
+    assert_eq!(members(&state), [a, b, c]);
+}
+
+#[test]
 fn catch_up_after_many_epochs() {
     let mut server = FakeServer::new();
     let (a, b) = (new_id(), new_id());
