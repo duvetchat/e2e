@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{Error, KeyStorage, PROTOCOL, Tx, identity, mls, parts};
+use crate::{Error, KeyStorage, PROTOCOL, Tx, direct, identity, mls, parts};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -44,6 +44,18 @@ pub(crate) enum Command {
     AttachmentKey,
     AttachmentEncrypt(parts::AttachmentPart),
     AttachmentDecrypt(parts::AttachmentPart),
+
+    // New devices, by the recovery key or by another device's approval, and the messages devices
+    // send each other.
+    Recover(identity::Recover),
+    ApprovalBegin,
+    ApprovalOffer(identity::ApprovalOffer),
+    ApprovalReveal(identity::ApprovalReveal),
+    ApprovalCheck(identity::ApprovalCheck),
+    ApprovalConfirm,
+    ApprovalFromQr(identity::ApprovalFromQr),
+    ApprovalReceive(identity::ApprovalReceive),
+    ReceiveDirect(direct::ReceiveDirect),
 
     // Conversations' groups.
     CreateGroup(mls::CreateGroup),
@@ -94,6 +106,16 @@ pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error
         Command::AttachmentKey => reply(parts::attachment_key(tx)?),
         Command::AttachmentEncrypt(part) => reply(parts::attachment_encrypt(part)?),
         Command::AttachmentDecrypt(part) => reply(parts::attachment_decrypt(part)?),
+
+        Command::Recover(request) => reply(identity::recover(tx, request)?),
+        Command::ApprovalBegin => reply(identity::approval_begin(tx)?),
+        Command::ApprovalOffer(request) => reply(identity::approval_offer(tx, request)?),
+        Command::ApprovalReveal(request) => reply(identity::approval_reveal(tx, request)?),
+        Command::ApprovalCheck(request) => reply(identity::approval_check(tx, request)?),
+        Command::ApprovalConfirm => reply(identity::approval_confirm(tx)?),
+        Command::ApprovalFromQr(request) => reply(identity::approval_from_qr(tx, request)?),
+        Command::ApprovalReceive(request) => reply(identity::approval_receive(tx, request)?),
+        Command::ReceiveDirect(request) => reply(direct::receive_direct(tx, request)?),
 
         Command::CreateGroup(request) => reply(mls::create_group(tx, request)?),
         Command::CommitResult(request) => reply(mls::commit_result(tx, request)?),

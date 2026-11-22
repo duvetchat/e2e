@@ -839,6 +839,80 @@ impl FakeServer {
         self.inboxes.remove(&device).unwrap_or_default()
     }
 
+    /// A new installation of `user`: a device with no identity yet and on no list, as it is before
+    /// it's recovered or approved.
+    pub fn bare_device(&mut self, user: Uuid) -> TestDevice {
+        let dir = tempfile::tempdir().unwrap();
+        let mut core = Core::open(OpenConfig {
+            clock: Box::new(self.clock.clone()),
+            ..OpenConfig::new(dir.path().join("core.db"), [1; 32])
+        })
+        .unwrap();
+        let id = new_id();
+        ok(
+            &mut core,
+            json!({"cmd": "create_device", "user_id": user, "device_id": id}),
+        );
+        TestDevice {
+            core,
+            user,
+            id,
+            records: BTreeMap::new(),
+            _dir: dir,
+        }
+    }
+
+    /// `user`'s first device, which makes their identity, with `create_identity`'s reply: the
+    /// recovery key, and the blobs the server keeps for a new device to recover with.
+    pub fn first_device(&mut self, user: Uuid) -> (TestDevice, Value) {
+        assert!(
+            !self.users.contains_key(&user),
+            "a user with no identity yet"
+        );
+        let mut device = self.bare_device(user);
+        let identity = ok(&mut device.core, json!({"cmd": "create_identity"}));
+        let recovery_key = recovery::parse(identity["recovery_key"].as_str().unwrap()).unwrap();
+        let backup_key = recovery::unwrap_backup_key(
+            &recovery_key,
+            user,
+            &bytes(&identity["wrapped_backup_key"]),
+        )
+        .unwrap();
+        let seed =
+            recovery::decrypt_identity(&backup_key, user, &bytes(&identity["encrypted_identity"]))
+                .unwrap();
+        self.users.insert(
+            user,
+            User {
+                seed: *seed,
+                identity_key: bytes(&identity["identity_key"]).try_into().unwrap(),
+                version: 1,
+                devices: vec![device.id],
+                list: bytes(&identity["device_list"]),
+                certificates: BTreeMap::from([(device.id, bytes(&identity["certificate"]))]),
+            },
+        );
+        (device, identity)
+    }
+
+    /// The certificate and the device list a recovered or approved device of `user` brings, which
+    /// the server takes.
+    pub fn take_device(&mut self, user: Uuid, certificate: &Value, list: &Value) {
+        let record = self.users.get_mut(&user).unwrap();
+        let certificate = bytes(certificate);
+        let device = DeviceCertificate::verify(&certificate, &record.identity_key)
+            .unwrap()
+            .device;
+        let signed = bytes(list);
+        let taken = DeviceList::verify(&signed, &record.identity_key).unwrap();
+        assert!(taken.version > record.version, "a newer list");
+        assert!(taken.contains(device), "a list with the new device");
+        record.version = taken.version;
+        record.devices = taken.devices.clone();
+        record.list = signed;
+        record.certificates.insert(device, certificate);
+    }
+
     fn identities(&self) -> BTreeMap<Uuid, ByteBuf> {
         self.users
             .iter()
