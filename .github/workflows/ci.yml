@@ -64,6 +64,114 @@ jobs:
       - run: apt-get update && apt-get install -y --no-install-recommends clang lld llvm
       - run: cargo build --locked --target wasm32-unknown-unknown -p duvet-e2e-rules -p duvet-e2e -p duvet-e2e-wasm
 
+  # The C ABI the desktop loads: its header, and the library under Bun.
+  ffi:
+    runs-on: [self-hosted, linux, x64, duvet]
+    container:
+      image: docker.io/library/rust:1.99.1-bookworm
+      volumes:
+        - /var/cache/duvet-e2e:/cache
+    env:
+      CARGO_TARGET_DIR: /cache/target/ffi
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Bun 1.3.9 is the one Electrobun 1.15.1 ships; its baseline build runs on any x86-64.
+      - name: Install cbindgen 0.29.4 and Bun 1.3.9
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends unzip
+          curl -sSfL -o /tmp/cbindgen https://github.com/mozilla/cbindgen/releases/download/0.29.4/cbindgen-ubuntu22.04
+          echo "27ac237e2ad3ffaffc8ecce0c03e3caa1d1b09e691906c3cb0967367ff6d783d  /tmp/cbindgen" | sha256sum -c -
+          install /tmp/cbindgen /usr/local/bin/
+          curl -sSfL -o /tmp/bun.zip https://github.com/oven-sh/bun/releases/download/bun-v1.3.9/bun-linux-x64-baseline.zip
+          echo "104d4d037f4b35e10215c0507e1779691f39c57bd91ddeefe11cad781e3fc4b9  /tmp/bun.zip" | sha256sum -c -
+          unzip -q /tmp/bun.zip -d /tmp && install /tmp/bun-linux-x64-baseline/bun /usr/local/bin/
+      - run: cargo build --locked --release -p duvet-e2e-ffi
+      # The header in the repository is cbindgen's output for the code as it is.
+      - run: cbindgen --config cbindgen.toml --output include/duvet_e2e.h --verify
+        working-directory: crates/duvet-e2e-ffi
+      # No session bus runs here, so the keyring's test sees the fallback to a file.
+      - run: bun test
+        working-directory: host-tests/bun
+        env:
+          DUVET_E2E_FFI: /cache/target/ffi/release/libduvet_e2e_ffi.so
+
+  # The core in WebAssembly, under Node: SQLCipher encrypts there too.
+  wasm-test:
+    runs-on: [self-hosted, linux, x64, duvet]
+    container:
+      image: docker.io/library/rust:1.99.1-bookworm
+      volumes:
+        - /var/cache/duvet-e2e:/cache
+    env:
+      CARGO_TARGET_DIR: /cache/target/wasm-test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # wasm-bindgen's binaries match the version Cargo.lock holds, so wasm-pack downloads nothing.
+      - name: Install clang, Node 24.22.3, wasm-pack 0.15.1 and wasm-bindgen 0.2.130
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends clang lld llvm xz-utils
+          curl -sSfL -o /tmp/node.tar.xz https://nodejs.org/dist/v24.22.3/node-v24.22.3-linux-x64.tar.xz
+          echo "4f2b175a6d53a5c617a80dba2676238a0688cef28c6da4eba35c7d844e66fcfb  /tmp/node.tar.xz" | sha256sum -c -
+          tar -xJf /tmp/node.tar.xz -C /opt && ln -s /opt/node-v24.22.3-linux-x64/bin/node /usr/local/bin/node
+          curl -sSfL -o /tmp/wasm-pack.tar.gz https://github.com/wasm-bindgen/wasm-pack/releases/download/v0.15.1/wasm-pack-v0.15.1-x86_64-unknown-linux-musl.tar.gz
+          echo "410101009739b9d01c7d5affaaad6e9c9a24b4cba6791a4805db8e89b9bf7af2  /tmp/wasm-pack.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/wasm-pack.tar.gz -C /tmp && install /tmp/wasm-pack-v0.15.1-x86_64-unknown-linux-musl/wasm-pack /usr/local/bin/
+          curl -sSfL -o /tmp/wasm-bindgen.tar.gz https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.130/wasm-bindgen-0.2.130-x86_64-unknown-linux-musl.tar.gz
+          echo "9687f3bb551b9f66f37ed32a40d7913a00f7962db653054e56857bc306c3227f  /tmp/wasm-bindgen.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/wasm-bindgen.tar.gz -C /tmp && install /tmp/wasm-bindgen-0.2.130-x86_64-unknown-linux-musl/wasm-bindgen* /usr/local/bin/
+      # On SQLite's in-memory VFS: OPFS exists only in a browser's dedicated worker. What follows the
+      # path goes to `cargo test` (after a `--` it would go to the tests).
+      - run: wasm-pack test --node crates/duvet-e2e-wasm --locked
+
+  # The Flutter plugin: its tests on the core built for this host, then the example's APK, whose
+  # Android libraries cargokit builds. On the runner itself, for its Android SDK (and NDK 28).
+  flutter:
+    runs-on: [self-hosted, linux, x64, duvet]
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: host
+    steps:
+      # In a folder of its own: the jobs in containers leave the workspace's checkout to root.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: host
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version: 3.47.7
+          channel: stable
+      # rustup and its toolchains in this runner instance's own tool cache: the four instances share
+      # one home, where two jobs installing at once would race.
+      - name: Install Rust 1.99.1
+        env:
+          RUSTUP_HOME: ${{ runner.tool_cache }}/duvet-e2e/rustup
+          CARGO_HOME: ${{ runner.tool_cache }}/duvet-e2e/cargo
+        run: |
+          [ -x "$CARGO_HOME/bin/rustup" ] || curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+          "$CARGO_HOME/bin/rustup" toolchain install 1.99.1 --profile minimal
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+      - name: The plugin's tests
+        env:
+          RUSTUP_HOME: ${{ runner.tool_cache }}/duvet-e2e/rustup
+          CARGO_HOME: ${{ runner.tool_cache }}/duvet-e2e/cargo
+          CARGO_TARGET_DIR: ${{ runner.tool_cache }}/duvet-e2e/target
+        run: |
+          cargo build --locked --release -p duvet_e2e
+          cd flutter/duvet_e2e && DUVET_E2E_LIB="$CARGO_TARGET_DIR/release/libduvet_e2e.so" flutter test
+      # cargokit builds with rustup's stable toolchain, and adds the Android targets it needs.
+      - name: The example's APK
+        working-directory: host/flutter/duvet_e2e/example
+        env:
+          RUSTUP_HOME: ${{ runner.tool_cache }}/duvet-e2e/rustup
+          CARGO_HOME: ${{ runner.tool_cache }}/duvet-e2e/cargo
+        run: |
+          flutter build apk --debug
+          jar tf build/app/outputs/flutter-apk/app-debug.apk | grep -Fx lib/arm64-v8a/libduvet_e2e.so
+
   validator:
     runs-on: [self-hosted, linux, x64, duvet]
     container:

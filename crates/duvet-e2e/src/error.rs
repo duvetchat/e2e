@@ -66,8 +66,9 @@ impl Error {
         }
     }
 
-    /// The reply to a command that failed: `{"error": {"code", "message", ...extra}}`.
-    pub(crate) fn to_reply(&self) -> Value {
+    /// The reply to a command that failed: `{"error": {"code", "message", ...extra}}`. The
+    /// bindings answer a failed `open` with it too.
+    pub fn to_reply(&self) -> Value {
         let mut error = Map::new();
         error.insert("code".into(), self.code().into());
         error.insert("message".into(), self.to_string().into());
@@ -93,8 +94,9 @@ impl Error {
 
     /// A command serde couldn't read. serde's message can quote the value it refused (a key, a
     /// message's text), so the reply says only what kind of failure it was, and the field serde
-    /// names when its message starts with missing field `name` or unknown field `name`.
-    pub(crate) fn bad_command(error: serde_json::Error) -> Error {
+    /// names when its message starts with missing field `name` or unknown field `name`. The
+    /// bindings read their own configuration with it.
+    pub fn bad_command(error: serde_json::Error) -> Error {
         let message = match error.classify() {
             Category::Data => "the command's fields don't match",
             Category::Io | Category::Syntax | Category::Eof => "the command isn't valid JSON",

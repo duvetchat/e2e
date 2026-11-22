@@ -6,4 +6,21 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
-[dependencies]
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Everything is for the browser: natively the crate is empty.
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+duvet-e2e.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# SQLite's host services (randomness, clock) from JavaScript.
+sqlite-wasm-rs = { workspace = true, features = ["wasm-bindgen"] }
+sqlite-wasm-vfs = { workspace = true, features = ["sahpool"] }
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dev-dependencies]
+rusqlite.workspace = true
+wasm-bindgen-test.workspace = true
