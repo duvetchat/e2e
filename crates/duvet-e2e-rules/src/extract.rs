@@ -27,7 +27,8 @@ pub struct Leaf {
 pub type Leaves = BTreeMap<u32, Leaf>;
 
 /// The leaves of a group's members, read from their certificates without verifying them again:
-/// each was verified as its leaf entered.
+/// each was verified as its leaf entered, by a commit's rules or with the group's state by
+/// `check_state`.
 pub fn leaves(members: impl IntoIterator<Item = Member>) -> Result<Leaves, RuleViolation> {
     members
         .into_iter()
@@ -77,6 +78,8 @@ pub struct MembershipChange {
     pub generation: u32,
     /// The epoch the commit starts from.
     pub epoch: u64,
+    /// The group's context before the commit, which `check_state` reads at epoch 0.
+    pub context: GroupContext,
     pub committer: Committer,
     pub before: MemberList,
     pub after: MemberList,
@@ -104,6 +107,13 @@ pub fn extract_change(
     sender: &Sender,
     aad: &[u8],
 ) -> Result<MembershipChange, RuleViolation> {
+    // The commit must start from `before`: from any other context (the one it makes, once merged),
+    // the rules would compare the wrong lists and pass.
+    let next = staged.group_context();
+    let follows = before.epoch().as_u64().checked_add(1) == Some(next.epoch().as_u64());
+    if next.group_id() != before.group_id() || !follows {
+        return Err(RuleViolation::Malformed);
+    }
     let (conversation, generation) = group_id_parts(before.group_id())?;
     let committer = match sender {
         Sender::Member(index) => {
@@ -123,6 +133,7 @@ pub fn extract_change(
         conversation,
         generation,
         epoch: before.epoch().as_u64(),
+        context: before.clone(),
         committer,
         before: MemberList::from_group_context(before)?,
         after: MemberList::from_group_context(staged.group_context())?,

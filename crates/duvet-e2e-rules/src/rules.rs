@@ -1,14 +1,17 @@
 //! The rules every commit must keep, checked by the core as it applies a commit and by the API's
-//! validator as it accepts one.
+//! validator as it accepts one, and those a group's state must keep where it enters through no
+//! commit: its epoch 0, and a welcome.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use openmls::prelude::ProposalType;
+use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _, VLBytes};
+use openmls::prelude::{ExtensionType, ExternalSender, GroupContext, ProposalType};
 use uuid::Uuid;
 
 use crate::{
-    Committer, DeviceCertificate, DeviceList, Kind, LeaveStatement, MAX_MEMBERS, MemberList,
-    MembershipChange, NewLeaf,
+    Committer, DeviceCertificate, DeviceList, Kind, LeaveStatement, Leaves, MAX_MEMBERS,
+    MEMBER_LIST_EXTENSION, MemberList, MembershipChange, SUITE, group_id_parts,
+    required_capabilities,
 };
 
 /// Why a commit is refused: the rule it breaks.
@@ -32,12 +35,12 @@ pub enum RuleViolation {
     ServerProposalNotRemove,
     #[error("more than 20 members")]
     TooManyMembers,
-    #[error("the commit changes the group's context beyond its members")]
+    #[error("the group's context isn't Duvet's, or the commit changes it beyond its members")]
     ContextChanged,
     #[error("a member's commit leaves out a removal the server proposed")]
     PendingRemovalDropped,
     #[error(
-        "the new member list isn't the previous one without the users who left and with the new ones at its end"
+        "the member list isn't well formed or the expected one, or isn't the previous one without the users who left and with the new ones at its end"
     )]
     MemberListMismatch,
     #[error("a leaf goes without its user leaving or being removed, or the server removing it")]
@@ -84,12 +87,21 @@ pub struct RuleContext {
     pub enforce_pending: bool,
     /// The list epoch 0 must have, when any member may make it: a conversation from before the cutover.
     pub expected_initial: Option<MemberList>,
+    /// The API's signature key, the group's one external sender; not compared when unknown.
+    pub external_sender: Option<Vec<u8>>,
 }
 
-/// Whether a commit keeps every rule. Checked in this order, so a commit breaking several gets the first.
+/// Whether a commit keeps every rule. Checked in this order, so a commit breaking several gets the
+/// first; from epoch 0, the state it starts from comes first, with [`check_state`].
 pub fn check_change(ctx: &RuleContext, change: &MembershipChange) -> Result<(), RuleViolation> {
     use RuleViolation::*;
     let (before, after) = (&change.before, &change.after);
+
+    // Epoch 0 entered through no commit: nothing has checked its context, its list or its leaves,
+    // the committer's among them.
+    if change.epoch == 0 {
+        check_state(ctx, &change.context, &change.leaves)?;
+    }
 
     if change.context_changed || after.kind != before.kind {
         return Err(ContextChanged);
@@ -110,10 +122,10 @@ pub fn check_change(ctx: &RuleContext, change: &MembershipChange) -> Result<(), 
     let added = change
         .added
         .iter()
-        .map(|leaf| certified(ctx, leaf))
+        .map(|leaf| certified(ctx, &leaf.credential, &leaf.signature_key))
         .collect::<Result<Vec<_>, _>>()?;
     for (index, leaf) in &change.updated {
-        let certificate = certified(ctx, leaf)?;
+        let certificate = certified(ctx, &leaf.credential, &leaf.signature_key)?;
         let old = change.leaves.get(index).ok_or(Malformed)?;
         if (certificate.user, certificate.device) != (old.user, old.device) {
             return Err(LeafNotSigned);
@@ -148,15 +160,14 @@ pub fn check_change(ctx: &RuleContext, change: &MembershipChange) -> Result<(), 
         }
     };
 
-    if change.epoch == 0 {
-        match &ctx.expected_initial {
-            Some(expected) if !same_members(before, expected) => return Err(MemberListMismatch),
-            Some(_) => {}
-            None if before.kind == Kind::Group && before.owner != Some(committer) => {
-                return Err(MembersChangedByNonOwner);
-            }
-            None => {}
-        }
+    // Epoch 0 is the owner's to make, but in a DM or a conversation from before the cutover, whose
+    // list `check_state` held to the expected one.
+    if change.epoch == 0
+        && ctx.expected_initial.is_none()
+        && before.kind == Kind::Group
+        && before.owner != Some(committer)
+    {
+        return Err(MembersChangedByNonOwner);
     }
 
     if ctx.enforce_pending
@@ -238,18 +249,128 @@ pub fn check_change(ctx: &RuleContext, change: &MembershipChange) -> Result<(), 
     Ok(())
 }
 
-/// A new leaf's certificate, verified: signed by its user's pinned identity, for the leaf's own
+/// Whether a group's state, as a device finds it, is one Duvet makes: Duvet's context, a
+/// well-formed member list (exactly `expected_initial`, when given), and every leaf certified for
+/// its own key, its user a member. Checked in this order. Where a state enters through no commit,
+/// this is what checks it: `check_change` from epoch 0, the validator's `create`, and the core on a
+/// welcome.
+pub fn check_state(
+    ctx: &RuleContext,
+    context: &GroupContext,
+    leaves: &Leaves,
+) -> Result<(), RuleViolation> {
+    use RuleViolation::*;
+    check_context(ctx, context)?;
+
+    let list = MemberList::from_group_context(context)?;
+    let (_, generation) = group_id_parts(context.group_id())?;
+    well_formed(&list, generation, context.epoch().as_u64())?;
+    if let Some(expected) = &ctx.expected_initial {
+        let users = |list: &MemberList| {
+            list.users
+                .iter()
+                .map(|entry| entry.user)
+                .collect::<Vec<_>>()
+        };
+        if (list.kind, list.owner, users(&list)) != (expected.kind, expected.owner, users(expected))
+        {
+            return Err(MemberListMismatch);
+        }
+    }
+
+    for leaf in leaves.values() {
+        let certificate = certified(ctx, &leaf.certificate, &leaf.signature_key)?;
+        // The rules know a leaf by these: they must be its certificate's.
+        if (certificate.user, certificate.device) != (leaf.user, leaf.device) {
+            return Err(LeafNotSigned);
+        }
+        if !list.contains(certificate.user) {
+            return Err(UserNotMember);
+        }
+    }
+    Ok(())
+}
+
+/// The context Duvet's groups have: Duvet's suite, and beside the member list only its
+/// requirement of every leaf and the API as the one external sender.
+fn check_context(ctx: &RuleContext, context: &GroupContext) -> Result<(), RuleViolation> {
+    let extensions = context.extensions();
+    let ours = |kind: ExtensionType| {
+        matches!(
+            kind,
+            ExtensionType::RequiredCapabilities | ExtensionType::ExternalSenders
+        ) || kind == ExtensionType::Unknown(MEMBER_LIST_EXTENSION)
+    };
+    let api = match (
+        extensions.external_senders().map(Vec::as_slice),
+        &ctx.external_sender,
+    ) {
+        (Some([sender]), Some(key)) => sender_key(sender)? == *key,
+        (Some([_]), None) => true,
+        _ => false,
+    };
+    let duvets = context.ciphersuite() == SUITE
+        && extensions.required_capabilities() == Some(&required_capabilities())
+        && api
+        && extensions
+            .iter()
+            .all(|extension| ours(extension.extension_type()));
+    if duvets {
+        Ok(())
+    } else {
+        Err(RuleViolation::ContextChanged)
+    }
+}
+
+/// An external sender's signature key: the first field of its encoding, as OpenMLS keeps the
+/// accessor to itself.
+fn sender_key(sender: &ExternalSender) -> Result<Vec<u8>, RuleViolation> {
+    let encoded = sender
+        .tls_serialize_detached()
+        .map_err(|_| RuleViolation::Malformed)?;
+    let key =
+        VLBytes::tls_deserialize(&mut encoded.as_slice()).map_err(|_| RuleViolation::Malformed)?;
+    Ok(key.as_slice().to_vec())
+}
+
+/// A member list as Duvet keeps it: at most 20 users, each once, entered in this generation and by
+/// `epoch`; a group's owner among them, and a DM's two users without one.
+fn well_formed(list: &MemberList, generation: u32, epoch: u64) -> Result<(), RuleViolation> {
+    if list.users.len() > MAX_MEMBERS {
+        return Err(RuleViolation::TooManyMembers);
+    }
+    let users: BTreeSet<Uuid> = list.users.iter().map(|entry| entry.user).collect();
+    let entered = list
+        .users
+        .iter()
+        .all(|entry| entry.generation == generation && entry.epoch <= epoch);
+    let owned = match list.kind {
+        Kind::Group => list.owner.is_some_and(|owner| users.contains(&owner)),
+        Kind::Dm => list.owner.is_none() && list.users.len() == 2,
+    };
+    if users.len() == list.users.len() && entered && owned {
+        Ok(())
+    } else {
+        Err(RuleViolation::MemberListMismatch)
+    }
+}
+
+/// A leaf's certificate, verified: signed by its user's pinned identity, for the leaf's own
 /// signature key, and its device on its user's latest list.
-fn certified(ctx: &RuleContext, leaf: &NewLeaf) -> Result<DeviceCertificate, RuleViolation> {
-    let claimed = DeviceCertificate::read_unverified(&leaf.credential)
-        .map_err(|_| RuleViolation::LeafNotSigned)?;
+fn certified(
+    ctx: &RuleContext,
+    credential: &[u8],
+    signature_key: &[u8],
+) -> Result<DeviceCertificate, RuleViolation> {
+    let claimed =
+        DeviceCertificate::read_unverified(credential).map_err(|_| RuleViolation::LeafNotSigned)?;
     let identity = ctx
         .identities
         .get(&claimed.user)
         .ok_or(RuleViolation::LeafNotSigned)?;
-    let certificate = DeviceCertificate::verify(&leaf.credential, identity)
+    let certificate = DeviceCertificate::verify(credential, identity)
         .map_err(|_| RuleViolation::LeafNotSigned)?;
-    if certificate.signature_key != leaf.signature_key {
+    if certificate.signature_key != signature_key {
         return Err(RuleViolation::LeafNotSigned);
     }
     if !ctx
@@ -290,19 +411,6 @@ fn check_list(change: &MembershipChange) -> Result<(), RuleViolation> {
     } else {
         Err(RuleViolation::MemberListMismatch)
     }
-}
-
-fn same_members(list: &MemberList, expected: &MemberList) -> bool {
-    let users = |list: &MemberList| {
-        list.users
-            .iter()
-            .map(|entry| entry.user)
-            .collect::<BTreeSet<_>>()
-    };
-    list.kind == expected.kind
-        && list.owner == expected.owner
-        && list.users.len() == expected.users.len()
-        && users(list) == users(expected)
 }
 
 /// The users the commit's leave statements take out. Any statement that doesn't hold refuses the commit.

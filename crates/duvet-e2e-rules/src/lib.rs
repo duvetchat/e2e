@@ -19,7 +19,7 @@ pub use extract::{
 };
 pub use identity::{DeviceCertificate, DeviceList, LeaveStatement};
 pub use members::{CommitAad, Entry, Kind, MAX_MEMBERS, MEMBER_LIST_EXTENSION, MemberList};
-pub use rules::{RuleContext, RuleViolation, check_change};
+pub use rules::{RuleContext, RuleViolation, check_change, check_state};
 pub use signed::{
     DEVICE_CERTIFICATE, DEVICE_LIST, DIRECT_MESSAGE, HISTORY_SHARE, LEAVE, sign, verify,
 };
@@ -63,18 +63,18 @@ pub fn leaf_capabilities() -> Capabilities {
         .build()
 }
 
+/// What a group requires of every leaf: the member list, and nothing else.
+pub(crate) fn required_capabilities() -> RequiredCapabilitiesExtension {
+    RequiredCapabilitiesExtension::new(&[ExtensionType::Unknown(MEMBER_LIST_EXTENSION)], &[], &[])
+}
+
 /// A conversation's new group: Duvet's suite, commits in the clear so the API can check them
 /// (application messages stay encrypted), the member list in the context and required of every
 /// leaf, and the API as the one external sender.
 pub fn group_config(members: &MemberList, external_sender: ExternalSender) -> MlsGroupCreateConfig {
-    let required = RequiredCapabilitiesExtension::new(
-        &[ExtensionType::Unknown(MEMBER_LIST_EXTENSION)],
-        &[],
-        &[],
-    );
     let extensions = Extensions::from_vec(vec![
         members.to_extension(),
-        Extension::RequiredCapabilities(required),
+        Extension::RequiredCapabilities(required_capabilities()),
         Extension::ExternalSenders(vec![external_sender]),
     ])
     .expect("three different extensions, each valid in a group context");

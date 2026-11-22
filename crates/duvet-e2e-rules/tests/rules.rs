@@ -4,9 +4,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use duvet_e2e_rules::{
-    CommitAad, DeviceCertificate, DeviceList, Entry, Kind, LeaveStatement, MemberList,
-    MembershipChange, Removed, RuleContext, RuleViolation, SUITE, check_change, extract_change,
-    group_config, group_id, join_config, leaf_capabilities, leaves,
+    CommitAad, DeviceCertificate, DeviceList, Entry, Kind, LeaveStatement, MEMBER_LIST_EXTENSION,
+    MemberList, MembershipChange, Removed, RuleContext, RuleViolation, SUITE, check_change,
+    check_state, extract_change, group_config, group_id, join_config, leaf_capabilities, leaves,
 };
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
@@ -128,7 +128,8 @@ impl World {
         self.users[user].id
     }
 
-    /// Every user's identity and device list, as the core and the validator would have pinned them.
+    /// Every user's identity and device list, as the core and the validator would have pinned them,
+    /// and the server as the groups' external sender.
     fn context(&self) -> RuleContext {
         RuleContext {
             identities: self
@@ -137,6 +138,7 @@ impl World {
                 .map(|u| (u.id, public(&u.identity)))
                 .collect(),
             device_lists: self.users.iter().map(|u| (u.id, u.list.clone())).collect(),
+            external_sender: Some(self.server.public().to_vec()),
             ..RuleContext::default()
         }
     }
@@ -156,6 +158,26 @@ impl World {
         }
     }
 
+    /// `creator` makes epoch 0 of the conversation's group at `generation`, under `config`, with
+    /// `credential` on its leaf.
+    fn create(
+        &self,
+        creator: (usize, usize),
+        credential: CredentialWithKey,
+        config: &MlsGroupCreateConfig,
+        generation: u32,
+    ) -> MlsGroup {
+        let device = self.device(creator);
+        MlsGroup::new_with_group_id(
+            &device.provider,
+            &device.signer,
+            config,
+            group_id(CONVERSATION, generation),
+            credential,
+        )
+        .unwrap()
+    }
+
     /// `creator` makes epoch 0 with `members` as its list, and stages its first commit, adding `joined`.
     fn first_commit(
         &self,
@@ -163,16 +185,21 @@ impl World {
         members: &MemberList,
         joined: &[(usize, usize)],
     ) -> (MlsGroup, CommitMessageBundle) {
+        self.first_commit_as(creator, self.device(creator).credential(), members, joined)
+    }
+
+    /// As [`World::first_commit`], with `credential` on the creator's leaf: its own, or another
+    /// device's certificate on the creator's key, to pose as that device.
+    fn first_commit_as(
+        &self,
+        creator: (usize, usize),
+        credential: CredentialWithKey,
+        members: &MemberList,
+        joined: &[(usize, usize)],
+    ) -> (MlsGroup, CommitMessageBundle) {
         let device = self.device(creator);
         let config = group_config(members, self.external_sender());
-        let mut group = MlsGroup::new_with_group_id(
-            &device.provider,
-            &device.signer,
-            &config,
-            group_id(CONVERSATION, GENERATION),
-            device.credential(),
-        )
-        .unwrap();
+        let mut group = self.create(creator, credential, &config, GENERATION);
         let key_packages: Vec<KeyPackage> = joined
             .iter()
             .map(|&d| self.device(d).key_package())
@@ -193,6 +220,37 @@ impl World {
             .unwrap();
         (group, bundle)
     }
+
+    /// The group as `joiner` finds it in the welcome of `bundle`.
+    fn welcomed(&self, joiner: (usize, usize), bundle: &CommitMessageBundle) -> StagedWelcome {
+        let provider = &self.device(joiner).provider;
+        let welcome = bundle.welcome().expect("a welcome").clone();
+        StagedWelcome::new_from_welcome(provider, &join_config(), welcome, None).unwrap()
+    }
+}
+
+/// [`check_state`] on a group as a device finds it.
+fn state_of(
+    ctx: &RuleContext,
+    context: &GroupContext,
+    members: impl IntoIterator<Item = Member>,
+) -> Result<(), RuleViolation> {
+    check_state(ctx, context, &leaves(members)?)
+}
+
+/// A config like Duvet's, with another suite, other context extensions or other leaf capabilities.
+fn config_with(
+    suite: Ciphersuite,
+    extensions: Vec<Extension>,
+    capabilities: Capabilities,
+) -> MlsGroupCreateConfig {
+    MlsGroupCreateConfig::builder()
+        .ciphersuite(suite)
+        .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+        .use_ratchet_tree_extension(true)
+        .capabilities(capabilities)
+        .with_group_context_extensions(Extensions::from_vec(extensions).unwrap())
+        .build()
 }
 
 /// The commit `group` staged, as the rules see it from its committer.
@@ -261,14 +319,12 @@ impl Scene {
             .merge_pending_commit(&world.device(creator).provider)
             .unwrap();
         let mut groups = BTreeMap::from([(creator, group)]);
-        let welcome = bundle.welcome().expect("a welcome");
         for &joiner in joined {
             let provider = &world.device(joiner).provider;
-            let group =
-                StagedWelcome::new_from_welcome(provider, &join_config(), welcome.clone(), None)
-                    .unwrap()
-                    .into_group(provider)
-                    .unwrap();
+            let group = world
+                .welcomed(joiner, &bundle)
+                .into_group(provider)
+                .unwrap();
             groups.insert(joiner, group);
         }
         Scene { world, groups }
@@ -910,6 +966,474 @@ fn updated_leaf_keeps_its_device() {
     assert_eq!(
         check_change(&ctx, &change),
         Err(RuleViolation::LeafNotSigned)
+    );
+}
+
+/// The certificate of `device`, public as every leaf's, on the key of `signer`: a credential that
+/// poses as `device`.
+fn posing_as(world: &World, device: (usize, usize), signer: (usize, usize)) -> CredentialWithKey {
+    CredentialWithKey {
+        credential: BasicCredential::new(world.device(device).certificate.clone()).into(),
+        signature_key: world.device(signer).signer.public().into(),
+    }
+}
+
+#[test]
+fn forged_creator_is_rejected() {
+    // A makes epoch 0 posing as the owner's device, so the first commit looks like the owner's.
+    let world = World::new(&[1, 1, 1]);
+    let ctx = world.context();
+    let members = MemberList::new(
+        Kind::Group,
+        Some(world.id(O)),
+        vec![world.entry(O, 0), world.entry(A, 0), world.entry(B, 0)],
+    );
+    let posing = posing_as(&world, (O, 0), (A, 0));
+    let (group, bundle) = world.first_commit_as((A, 0), posing, &members, &[(O, 0), (B, 0)]);
+    assert_eq!(
+        check_change(&ctx, &own_change(&group, &[]).unwrap()),
+        Err(RuleViolation::LeafNotSigned),
+        "the first commit"
+    );
+    let welcome = world.welcomed((B, 0), &bundle);
+    assert_eq!(
+        state_of(&ctx, welcome.group_context(), welcome.members()),
+        Err(RuleViolation::LeafNotSigned),
+        "B's welcome"
+    );
+}
+
+#[test]
+fn forged_creator_of_a_dm_is_rejected() {
+    // C, outside the DM of O and A, makes its epoch 0 posing as O's device.
+    let world = World::new(&[1, 1, 1, 1]);
+    let ctx = world.context();
+    let members = MemberList::new(Kind::Dm, None, vec![world.entry(O, 0), world.entry(A, 0)]);
+    let posing = posing_as(&world, (O, 0), (C, 0));
+    let (group, bundle) = world.first_commit_as((C, 0), posing, &members, &[(A, 0)]);
+    assert_eq!(
+        check_change(&ctx, &own_change(&group, &[]).unwrap()),
+        Err(RuleViolation::LeafNotSigned),
+        "the first commit"
+    );
+    let welcome = world.welcomed((A, 0), &bundle);
+    assert_eq!(
+        state_of(&ctx, welcome.group_context(), welcome.members()),
+        Err(RuleViolation::LeafNotSigned),
+        "A's welcome"
+    );
+}
+
+#[test]
+fn starting_leaves_are_members_listed_devices() {
+    let world = World::new(&[1, 1, 1]);
+    let ctx = world.context();
+
+    // O makes epoch 0 of a group it isn't in.
+    let others = MemberList::new(
+        Kind::Group,
+        Some(world.id(A)),
+        vec![world.entry(A, 0), world.entry(B, 0)],
+    );
+    let (group, _) = world.first_commit((O, 0), &others, &[(A, 0)]);
+    let state = state_of(&ctx, group.public_group().group_context(), group.members());
+    assert_eq!(
+        state,
+        Err(RuleViolation::UserNotMember),
+        "a creator outside"
+    );
+    assert_eq!(
+        check_change(&ctx, &own_change(&group, &[]).unwrap()),
+        Err(RuleViolation::UserNotMember),
+        "a creator outside, by its first commit"
+    );
+
+    // A makes epoch 0 from a device its latest list no longer has.
+    let members = MemberList::new(Kind::Dm, None, vec![world.entry(A, 0), world.entry(B, 0)]);
+    let (group, _) = world.first_commit((A, 0), &members, &[(B, 0)]);
+    let mut ctx = world.context();
+    let a = world.id(A);
+    let without = DeviceList::new(a, public(&world.users[A].identity), 2, vec![]);
+    ctx.device_lists.insert(a, without);
+    let state = state_of(&ctx, group.public_group().group_context(), group.members());
+    assert_eq!(
+        state,
+        Err(RuleViolation::DeviceNotListed),
+        "an unlisted creator"
+    );
+}
+
+/// `check_state` on the epoch 0 O makes in a world of O and A, under Duvet's config but for `suite`,
+/// the context's extensions `extensions` gives (from the member list's and the API's sender), and
+/// leaves that also support `more` extension types.
+fn starting_context(
+    suite: Ciphersuite,
+    more: &[ExtensionType],
+    extensions: impl FnOnce(Extension, ExternalSender) -> Vec<Extension>,
+) -> Result<(), RuleViolation> {
+    let world = World::new(&[1, 1]);
+    let members = MemberList::new(
+        Kind::Group,
+        Some(world.id(O)),
+        vec![world.entry(O, 0), world.entry(A, 0)],
+    );
+    let mut types = vec![
+        ExtensionType::Unknown(MEMBER_LIST_EXTENSION),
+        ExtensionType::LastResort,
+    ];
+    types.extend_from_slice(more);
+    let capabilities = Capabilities::builder()
+        .ciphersuites(vec![suite])
+        .extensions(types)
+        .build();
+    let extensions = extensions(members.to_extension(), world.external_sender());
+    let config = config_with(suite, extensions, capabilities);
+    let credential = world.device((O, 0)).credential();
+    let group = world.create((O, 0), credential, &config, GENERATION);
+    state_of(
+        &world.context(),
+        group.public_group().group_context(),
+        group.members(),
+    )
+}
+
+#[test]
+fn starting_context_must_be_duvets() {
+    // The API's key against the one sender the group names.
+    let world = World::new(&[1, 1]);
+    let members = MemberList::new(
+        Kind::Group,
+        Some(world.id(O)),
+        vec![world.entry(O, 0), world.entry(A, 0)],
+    );
+    let (group, _) = world.first_commit((O, 0), &members, &[(A, 0)]);
+    let change = own_change(&group, &[]).unwrap();
+    let with_key = |key: Option<Vec<u8>>| RuleContext {
+        external_sender: key,
+        ..world.context()
+    };
+    let stranger_key = Some(signer().public().to_vec());
+    let context = group.public_group().group_context();
+    let verdicts = [
+        ("the API's key", check_change(&world.context(), &change)),
+        ("no key to compare", check_change(&with_key(None), &change)),
+        (
+            "another key",
+            check_change(&with_key(stranger_key.clone()), &change),
+        ),
+        (
+            "another key, on the state",
+            state_of(&with_key(stranger_key), context, group.members()),
+        ),
+    ];
+    let expected = [
+        ("the API's key", Ok(())),
+        ("no key to compare", Ok(())),
+        ("another key", Err(RuleViolation::ContextChanged)),
+        (
+            "another key, on the state",
+            Err(RuleViolation::ContextChanged),
+        ),
+    ];
+    assert_eq!(verdicts, expected);
+
+    // Contexts Duvet's clients never make.
+    let list = ExtensionType::Unknown(MEMBER_LIST_EXTENSION);
+    let other = ExtensionType::Unknown(0xF0D2);
+    let required = |types: &[ExtensionType]| {
+        Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(types, &[], &[]))
+    };
+    let stranger = || {
+        ExternalSender::new(
+            signer().public().into(),
+            BasicCredential::new(b"stranger".to_vec()).into(),
+        )
+    };
+    let chacha = Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519;
+    let duvets = |list_ext, api| {
+        vec![
+            list_ext,
+            required(&[list]),
+            Extension::ExternalSenders(vec![api]),
+        ]
+    };
+    assert_eq!(starting_context(SUITE, &[], duvets), Ok(()), "Duvet's");
+    let verdicts = [
+        ("another suite", starting_context(chacha, &[], duvets)),
+        (
+            "no external sender",
+            starting_context(SUITE, &[], |list_ext, _| vec![list_ext, required(&[list])]),
+        ),
+        (
+            "two external senders",
+            starting_context(SUITE, &[], |list_ext, api| {
+                vec![
+                    list_ext,
+                    required(&[list]),
+                    Extension::ExternalSenders(vec![api, stranger()]),
+                ]
+            }),
+        ),
+        (
+            "the member list not required",
+            starting_context(SUITE, &[], |list_ext, api| {
+                vec![
+                    list_ext,
+                    required(&[]),
+                    Extension::ExternalSenders(vec![api]),
+                ]
+            }),
+        ),
+        (
+            "more required",
+            starting_context(SUITE, &[other], |list_ext, api| {
+                vec![
+                    list_ext,
+                    required(&[list, other]),
+                    Extension::ExternalSenders(vec![api]),
+                ]
+            }),
+        ),
+        (
+            "another extension",
+            starting_context(SUITE, &[other], |list_ext, api| {
+                let mut extensions = duvets(list_ext, api);
+                extensions.push(Extension::Unknown(0xF0D2, UnknownExtension(vec![1])));
+                extensions
+            }),
+        ),
+    ];
+    let refused = verdicts.map(|(case, _)| (case, Err(RuleViolation::ContextChanged)));
+    assert_eq!(verdicts, refused);
+}
+
+/// A member list made of a world's users.
+type ListOf = fn(&World) -> MemberList;
+
+/// The verdicts on the epoch 0 `creator` makes, in a world of O, A, B and C with a device each,
+/// with the list `members` gives: `check_state` on it, as the validator's `create` finds it, and
+/// `check_change` on its first commit, which adds `joined`.
+fn starting(
+    creator: (usize, usize),
+    joined: &[(usize, usize)],
+    members: impl FnOnce(&World) -> MemberList,
+) -> (Result<(), RuleViolation>, Result<(), RuleViolation>) {
+    let world = World::new(&[1, 1, 1, 1]);
+    let ctx = world.context();
+    let (group, _) = world.first_commit(creator, &members(&world), joined);
+    (
+        state_of(&ctx, group.public_group().group_context(), group.members()),
+        check_change(&ctx, &own_change(&group, &[]).unwrap()),
+    )
+}
+
+#[test]
+fn starting_list_must_be_well_formed() {
+    let mismatch = (
+        Err(RuleViolation::MemberListMismatch),
+        Err(RuleViolation::MemberListMismatch),
+    );
+    let lists: [(&str, ListOf); 7] = [
+        ("an entry from a later epoch", |w| {
+            let a = Entry {
+                epoch: 5,
+                ..w.entry(A, 0)
+            };
+            MemberList::new(Kind::Group, Some(w.id(O)), vec![w.entry(O, 0), a])
+        }),
+        ("an entry from an earlier generation", |w| {
+            let a = Entry {
+                generation: GENERATION - 1,
+                ..w.entry(A, 0)
+            };
+            MemberList::new(Kind::Group, Some(w.id(O)), vec![w.entry(O, 0), a])
+        }),
+        ("a user twice", |w| {
+            let users = vec![w.entry(O, 0), w.entry(A, 0), w.entry(A, 0)];
+            MemberList::new(Kind::Group, Some(w.id(O)), users)
+        }),
+        ("an owner outside the list", |w| {
+            MemberList::new(
+                Kind::Group,
+                Some(w.id(C)),
+                vec![w.entry(O, 0), w.entry(A, 0)],
+            )
+        }),
+        ("a group without an owner", |w| {
+            MemberList::new(Kind::Group, None, vec![w.entry(O, 0), w.entry(A, 0)])
+        }),
+        ("a DM with a third user", |w| {
+            let users = vec![w.entry(O, 0), w.entry(A, 0), w.entry(B, 0)];
+            MemberList::new(Kind::Dm, None, users)
+        }),
+        ("a DM with an owner", |w| {
+            MemberList::new(Kind::Dm, Some(w.id(O)), vec![w.entry(O, 0), w.entry(A, 0)])
+        }),
+    ];
+    let verdicts = lists.map(|(case, members)| (case, starting((O, 0), &[(A, 0)], members)));
+    let refused = verdicts.map(|(case, _)| (case, mismatch));
+    assert_eq!(verdicts, refused);
+
+    let crowded = starting((O, 0), &[(A, 0)], |w| {
+        let mut users = vec![w.entry(O, 0), w.entry(A, 0)];
+        users.extend((0..19).map(|_| Entry {
+            user: new_id(),
+            generation: GENERATION,
+            epoch: 0,
+        }));
+        MemberList::new(Kind::Group, Some(w.id(O)), users)
+    });
+    assert_eq!(
+        crowded,
+        (
+            Err(RuleViolation::TooManyMembers),
+            Err(RuleViolation::TooManyMembers)
+        ),
+        "21 users"
+    );
+
+    // A welcome brings its list as it is at its epoch: B's entry from later on traps B as well.
+    let world = World::new(&[1, 1, 1]);
+    let b = Entry {
+        epoch: 5,
+        ..world.entry(B, 0)
+    };
+    let members = MemberList::new(
+        Kind::Group,
+        Some(world.id(O)),
+        vec![world.entry(O, 0), world.entry(A, 0), b],
+    );
+    let (_, bundle) = world.first_commit((O, 0), &members, &[(A, 0), (B, 0)]);
+    let welcome = world.welcomed((B, 0), &bundle);
+    assert_eq!(
+        state_of(&world.context(), welcome.group_context(), welcome.members()),
+        Err(RuleViolation::MemberListMismatch),
+        "B's welcome"
+    );
+}
+
+#[test]
+fn legacy_creator_moving_itself_first_is_rejected() {
+    // B would own the conversation once O left: the owner's successor is the list's first user.
+    let world = World::new(&[1, 1, 1]);
+    let expected = MemberList::new(
+        Kind::Group,
+        Some(world.id(O)),
+        vec![world.entry(O, 0), world.entry(A, 0), world.entry(B, 0)],
+    );
+    let mut ctx = world.context();
+    ctx.expected_initial = Some(expected);
+    let reordered = MemberList::new(
+        Kind::Group,
+        Some(world.id(O)),
+        vec![world.entry(B, 0), world.entry(O, 0), world.entry(A, 0)],
+    );
+    let (group, _) = world.first_commit((B, 0), &reordered, &[(O, 0), (A, 0)]);
+    assert_eq!(
+        check_change(&ctx, &own_change(&group, &[]).unwrap()),
+        Err(RuleViolation::MemberListMismatch)
+    );
+}
+
+#[test]
+fn member_list_rewrites_are_rejected() {
+    let mut s = Scene::group();
+    let ctx = s.world.context();
+    let list = s.list();
+
+    let mut reordered = list.clone();
+    reordered.users.swap(0, 1);
+    let mut moved = list.clone();
+    moved.users[2].epoch = u64::MAX;
+    let commits = [
+        (
+            "A puts itself first",
+            (A, 0),
+            Commit {
+                members: Some(reordered),
+                ..Commit::default()
+            },
+        ),
+        (
+            "A moves B's entry out of any statement's reach",
+            (A, 0),
+            Commit {
+                members: Some(moved),
+                ..Commit::default()
+            },
+        ),
+        (
+            // C enters at the epoch the commit makes, not the one it starts from.
+            "the owner adds C at the wrong epoch",
+            (O, 0),
+            Commit {
+                adds: vec![s.world.device((C, 0)).key_package()],
+                members: Some(adding(&list, s.id(C), s.epoch())),
+                ..Commit::default()
+            },
+        ),
+    ];
+    let verdicts = commits.map(|(case, by, commit)| (case, s.verdict(by, commit, &ctx)));
+    let refused = verdicts.map(|(case, _)| (case, Err(RuleViolation::MemberListMismatch)));
+    assert_eq!(verdicts, refused);
+}
+
+#[test]
+fn leaf_removed_without_reason_is_rejected() {
+    // A stays in the list, and the server proposed nothing.
+    let mut s = Scene::group();
+    let ctx = s.world.context();
+    let commit = Commit {
+        removes: vec![(A, 0)],
+        ..Commit::default()
+    };
+    assert_eq!(
+        s.verdict((O, 0), commit, &ctx),
+        Err(RuleViolation::LeafRemovedWithoutReason)
+    );
+}
+
+#[test]
+fn leave_with_statement_at_entry_epoch_passes() {
+    let mut s = Scene::group();
+    let ctx = s.world.context();
+    let entry = *s.list().entry(s.id(B)).unwrap();
+    let commit = Commit {
+        removes: vec![(B, 0)],
+        members: Some(removing(&s.list(), s.id(B))),
+        statements: vec![s.statement((B, 0), entry.generation, entry.epoch)],
+        ..Commit::default()
+    };
+    assert_eq!(s.verdict((A, 0), commit, &ctx), Ok(()));
+}
+
+#[test]
+fn extract_change_needs_the_context_the_commit_starts_from() {
+    let world = World::new(&[1, 1]);
+    let members = MemberList::new(
+        Kind::Group,
+        Some(world.id(O)),
+        vec![world.entry(O, 0), world.entry(A, 0)],
+    );
+    let (group, _) = world.first_commit((O, 0), &members, &[(A, 0)]);
+    let staged = group.pending_commit().unwrap();
+    let leaves = leaves(group.members()).unwrap();
+    let sender = Sender::Member(group.own_leaf_index());
+    let read =
+        |before: &GroupContext| extract_change(before, &leaves, staged, &sender, &[]).map(|_| ());
+    assert_eq!(read(group.public_group().group_context()), Ok(()));
+    assert_eq!(
+        read(staged.group_context()),
+        Err(RuleViolation::Malformed),
+        "the context once the commit is merged"
+    );
+    let config = group_config(&members, world.external_sender());
+    let credential = world.device((O, 0)).credential();
+    let other = world.create((O, 0), credential, &config, GENERATION + 1);
+    assert_eq!(
+        read(other.public_group().group_context()),
+        Err(RuleViolation::Malformed),
+        "another generation's group at the same epoch"
     );
 }
 
