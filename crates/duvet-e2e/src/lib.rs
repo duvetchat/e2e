@@ -4,6 +4,7 @@
 //! through one entry point that takes and returns JSON: [`Core::handle`].
 
 mod error;
+mod identity;
 mod protocol;
 mod provider;
 mod store;
@@ -18,6 +19,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 pub use error::Error;
+pub use identity::{OwnDevice, recovery};
 pub use provider::Provider;
 pub use store::{SqlStorage, SqlStorageError, Tx};
 

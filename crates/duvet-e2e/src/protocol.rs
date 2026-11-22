@@ -5,12 +5,40 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{Error, KeyStorage, PROTOCOL, Tx};
+use crate::{Error, KeyStorage, PROTOCOL, Tx, identity};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub(crate) enum Command {
     Status,
+
+    // Identity, devices, contacts and key packages.
+    CreateDevice {
+        user_id: Uuid,
+        device_id: Uuid,
+    },
+    CreateIdentity,
+    SignDeviceList {
+        remove: Vec<Uuid>,
+    },
+    ObserveUser {
+        user_id: Uuid,
+        #[serde(with = "b64")]
+        identity_key: Vec<u8>,
+        #[serde(with = "b64")]
+        device_list: Vec<u8>,
+        #[serde(default, with = "b64::list")]
+        certificates: Vec<Vec<u8>>,
+    },
+    SafetyNumber {
+        user_id: Uuid,
+    },
+    VerifyUser {
+        user_id: Uuid,
+        #[serde(default, with = "b64::option")]
+        qr: Option<Vec<u8>>,
+    },
+    KeyPackages,
 }
 
 pub(crate) fn parse(command: &str) -> Result<Command, Error> {
@@ -20,6 +48,29 @@ pub(crate) fn parse(command: &str) -> Result<Command, Error> {
 pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error> {
     match command {
         Command::Status => reply(cmd_status(tx)?),
+
+        Command::CreateDevice { user_id, device_id } => {
+            reply(identity::create_device(tx, user_id, device_id)?)
+        }
+        Command::CreateIdentity => reply(identity::create_identity(tx)?),
+        Command::SignDeviceList { remove } => reply(identity::sign_device_list(tx, &remove)?),
+        Command::ObserveUser {
+            user_id,
+            identity_key,
+            device_list,
+            certificates,
+        } => reply(identity::observe_user(
+            tx,
+            user_id,
+            &identity_key,
+            &device_list,
+            &certificates,
+        )?),
+        Command::SafetyNumber { user_id } => reply(identity::safety_number(tx, user_id)?),
+        Command::VerifyUser { user_id, qr } => {
+            reply(identity::verify_user(tx, user_id, qr.as_deref())?)
+        }
+        Command::KeyPackages => reply(identity::key_packages(tx)?),
     }
 }
 
@@ -73,9 +124,8 @@ fn cmd_status(tx: &mut Tx<'_>) -> Result<Status, Error> {
 }
 
 /// Binary fields in the JSON protocol: standard base64 with its padding. Use with
-/// `#[serde(with = "b64")]` on a `Vec<u8>`, or `b64::option` on an `Option<Vec<u8>>`.
-// Batch 1's commands are its first users; the allow goes with them.
-#[allow(dead_code)]
+/// `#[serde(with = "b64")]` on a `Vec<u8>`, `b64::option` on an `Option<Vec<u8>>`, or
+/// `b64::list` on a `Vec<Vec<u8>>` a command takes.
 pub(crate) mod b64 {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
@@ -120,6 +170,23 @@ pub(crate) mod b64 {
                         .map_err(|_| D::Error::custom("not padded base64"))
                 })
                 .transpose()
+        }
+    }
+
+    pub(crate) mod list {
+        use super::*;
+
+        pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Vec<Vec<u8>>, D::Error> {
+            Vec::<String>::deserialize(deserializer)?
+                .into_iter()
+                .map(|text| {
+                    STANDARD
+                        .decode(text)
+                        .map_err(|_| D::Error::custom("not padded base64"))
+                })
+                .collect()
         }
     }
 }

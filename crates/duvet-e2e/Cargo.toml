@@ -12,8 +12,10 @@ base64.workspace = true
 bs58.workspace = true
 ciborium.workspace = true
 duvet-e2e-rules.workspace = true
+ed25519-dalek.workspace = true
 hkdf.workspace = true
 openmls.workspace = true
+openmls_basic_credential.workspace = true
 openmls_rust_crypto.workspace = true
 openmls_traits.workspace = true
 rusqlite = { workspace = true, features = ["cache"] }
@@ -36,5 +38,4 @@ rusqlite = { workspace = true, features = ["bundled-sqlcipher", "ffi-sqlite-wasm
 web-time.workspace = true
 
 [dev-dependencies]
-openmls_basic_credential.workspace = true
 tempfile = "3"
