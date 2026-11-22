@@ -81,7 +81,9 @@ fn database_key(
     path: &Path,
     entry: keyring_core::Result<impl KeyStore>,
 ) -> Result<(Key, KeyStorage), Error> {
-    let fresh = !path.exists();
+    // A database that can't be looked for isn't new: that's where a new key would hide the right one.
+    let fresh = !std::fs::exists(path)
+        .map_err(|error| Error::Storage(format!("the database: {}", error.kind())))?;
     #[cfg(secret_service)]
     if let Some(key) = file::read(path)? {
         return Ok((key, KeyStorage::File));
@@ -226,6 +228,51 @@ mod tests {
 
         let reused = key_in(&entry_in(&store), true).unwrap();
         assert_eq!(*reused, *created);
+    }
+
+    fn no_entry(store: &Arc<CredentialStore>) -> bool {
+        matches!(
+            entry_in(store).get_secret(),
+            Err(keyring_core::Error::NoEntry)
+        )
+    }
+
+    #[test]
+    fn an_existing_database_gets_no_new_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.db");
+        std::fs::write(&path, b"a database whose key is gone").unwrap();
+
+        // The keyring has no key for it: no key opens it, and none is stored.
+        let store = mock_store();
+        let error = database_key(&path, Ok(entry_in(&store))).unwrap_err();
+        assert_eq!(error.code(), "bad_key");
+        assert!(no_entry(&store));
+
+        // No keyring at all, and no key file: no file is made either.
+        #[cfg(secret_service)]
+        {
+            let none: keyring_core::Result<Entry> = Err(keyring_core::Error::NoDefaultStore);
+            assert_eq!(database_key(&path, none).unwrap_err().code(), "storage");
+            assert!(!dir.path().join("core.db.key").exists());
+        }
+    }
+
+    #[test]
+    fn a_database_that_cant_be_looked_for_gets_no_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a-file"), b"").unwrap();
+        // Whether it exists can't be known: its folder is a file.
+        let path = dir.path().join("a-file").join("core.db");
+
+        let store = mock_store();
+        assert_eq!(
+            database_key(&path, Ok(entry_in(&store)))
+                .unwrap_err()
+                .code(),
+            "storage"
+        );
+        assert!(no_entry(&store));
     }
 
     #[test]
