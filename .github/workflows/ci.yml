@@ -119,16 +119,23 @@ jobs:
           curl -sSfL -o /tmp/wasm-bindgen.tar.gz https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.130/wasm-bindgen-0.2.130-x86_64-unknown-linux-musl.tar.gz
           echo "9687f3bb551b9f66f37ed32a40d7913a00f7962db653054e56857bc306c3227f  /tmp/wasm-bindgen.tar.gz" | sha256sum -c -
           tar -xzf /tmp/wasm-bindgen.tar.gz -C /tmp && install /tmp/wasm-bindgen-0.2.130-x86_64-unknown-linux-musl/wasm-bindgen* /usr/local/bin/
-      # On SQLite's in-memory VFS: OPFS exists only in a browser's dedicated worker.
-      - run: wasm-pack test --node crates/duvet-e2e-wasm -- --locked
+      # On SQLite's in-memory VFS: OPFS exists only in a browser's dedicated worker. What follows the
+      # path goes to `cargo test` (after a `--` it would go to the tests).
+      - run: wasm-pack test --node crates/duvet-e2e-wasm --locked
 
   # The Flutter plugin: its tests on the core built for this host, then the example's APK, whose
   # Android libraries cargokit builds. On the runner itself, for its Android SDK (and NDK 28).
   flutter:
     runs-on: [self-hosted, linux, x64, duvet]
     timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: host
     steps:
+      # In a folder of its own: the jobs in containers leave the workspace's checkout to root.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: host
       - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
@@ -157,7 +164,7 @@ jobs:
           cd flutter/duvet_e2e && DUVET_E2E_LIB="$CARGO_TARGET_DIR/release/libduvet_e2e.so" flutter test
       # cargokit builds with rustup's stable toolchain, and adds the Android targets it needs.
       - name: The example's APK
-        working-directory: flutter/duvet_e2e/example
+        working-directory: host/flutter/duvet_e2e/example
         env:
           RUSTUP_HOME: ${{ runner.tool_cache }}/duvet-e2e/rustup
           CARGO_HOME: ${{ runner.tool_cache }}/duvet-e2e/cargo
