@@ -270,6 +270,127 @@ fn own_commit_answered_refused_settles_from_the_queue() {
     server.commit(&mut b1, conversation, refresh).unwrap();
 }
 
+/// A conversation of A, with A1 and A2, and of B, with B1, every device in the group; then the API
+/// proposes A2's removal, which no device has applied yet.
+fn removal_on_its_way(server: &mut FakeServer) -> (Uuid, Uuid, [TestDevice; 3]) {
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut a2, mut b1] = new_devices(server, [a, a, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+    start(server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut a2, &mut b1]);
+    server.remove_device(conversation, a2.id);
+    (conversation, b, [a1, a2, b1])
+}
+
+#[test]
+fn own_commit_the_validator_refused_is_dropped() {
+    let mut server = FakeServer::new();
+    let (conversation, _, [mut a1, _, mut b1]) = removal_on_its_way(&mut server);
+
+    // B1 refreshes before it hears of the removal, and the validator refuses a commit that leaves
+    // a pending removal out.
+    let made = ok(&mut b1.core, command("refresh", conversation));
+    // (An answer that takes a commit says where in the queue it is: one without is refused.)
+    let unnumbered = error(
+        &mut b1.core,
+        json!({"cmd": "commit_result", "conversation_id": conversation, "accepted": true}),
+    );
+    assert_eq!(
+        (&unnumbered["code"], &unnumbered["field"]),
+        (&json!("bad_command"), &json!("seq"))
+    );
+    assert_eq!(
+        server.submit(&mut b1, conversation, &made),
+        Err(Refusal::Invalid("pending_removal_dropped".into()))
+    );
+
+    // The answer says it never entered: B1 drops it at once, and may send and commit again.
+    assert_eq!(ready(&mut b1, conversation), Ok(()));
+    server.deliver(&mut b1);
+    assert_eq!(
+        ready(&mut b1, conversation).unwrap_err()["code"],
+        "pending_proposals"
+    );
+    server
+        .commit(
+            &mut b1,
+            conversation,
+            command("commit_pending", conversation),
+        )
+        .unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    assert_eq!(ready(&mut b1, conversation), Ok(()));
+    let state = same_group(&mut [&mut a1, &mut b1], conversation);
+    assert_eq!(state["epoch"], 2);
+}
+
+#[test]
+fn own_commit_a_proposal_shows_left_out_is_dropped() {
+    let mut server = FakeServer::new();
+    let (conversation, _, [mut a1, _, mut b1]) = removal_on_its_way(&mut server);
+
+    // The same refresh, but B1 doesn't get the answer: it can't tell whether the commit entered.
+    let made = ok(&mut b1.core, command("refresh", conversation));
+    assert!(matches!(
+        server.answer_lost(&mut b1, conversation, &made),
+        Err(Refusal::Invalid(_))
+    ));
+    assert_eq!(
+        ready(&mut b1, conversation).unwrap_err()["code"],
+        "pending_commit"
+    );
+
+    // The queue brings the API's proposal at the commit's epoch, which the commit doesn't carry:
+    // the validator would have refused it, so it never entered, and B1 drops it.
+    let replies = server.deliver(&mut b1);
+    assert_eq!(results(&replies), [json!([3, "proposal", "applied", null])]);
+    assert_eq!(
+        ready(&mut b1, conversation).unwrap_err()["code"],
+        "pending_proposals"
+    );
+    server
+        .commit(
+            &mut b1,
+            conversation,
+            command("commit_pending", conversation),
+        )
+        .unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    let state = same_group(&mut [&mut a1, &mut b1], conversation);
+    assert_eq!(state["epoch"], 2);
+}
+
+#[test]
+fn own_commit_in_other_bytes_is_still_known() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut b1] = new_devices(&mut server, [a, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    // B1's refresh is taken but heard as refused; and its echo can't know it, as when the queue
+    // carries the commit in other bytes than those B1 made.
+    let made = ok(&mut b1.core, command("refresh", conversation));
+    let seq = server.take_unheard(&mut b1, conversation, &made);
+    b1.core
+        .transaction(|tx| {
+            tx.conn().execute("UPDATE groups SET echo = NULL", [])?;
+            Ok(())
+        })
+        .unwrap();
+
+    // OpenMLS still knows it as B1's waiting commit: B1 merges it.
+    let replies = server.deliver(&mut b1);
+    assert_eq!(results(&replies), [json!([seq, "commit", "own", null])]);
+    server.deliver(&mut a1);
+    let state = same_group(&mut [&mut a1, &mut b1], conversation);
+    assert_eq!(state["epoch"], 2);
+    assert_eq!(state["blocked"], false);
+}
+
 #[test]
 fn concurrent_epoch_zero_converges() {
     let mut server = FakeServer::new();

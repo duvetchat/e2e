@@ -26,12 +26,16 @@ use crate::{Error, Tx};
 #[derive(Debug, Deserialize)]
 pub(crate) struct CommitResult {
     conversation_id: Uuid,
-    /// Whether the server took the commit; refused, it's a 409 or the validator's refusal.
+    /// Whether the server took the commit.
     accepted: bool,
-    /// The commit's number in the queue, which the server's answer gives when it takes it: a
-    /// device that counted none yet (a new group's, an external join's) counts from there.
+    /// The commit's own number in the queue, which the server's answer gives when it takes it:
+    /// required then. A new group's creator and an external joiner count the queue from there.
     #[serde(default)]
     seq: Option<u64>,
+    /// The validator refused the commit: it never entered. A refusal without it (a 409, or an
+    /// answer the client lost) may have entered after all.
+    #[serde(default)]
+    invalid: bool,
 }
 
 #[derive(Serialize)]
@@ -85,14 +89,22 @@ struct Device {
 
 /// The server's word on this device's waiting commit. Taken, it's merged (an external commit, merged
 /// as it was made, stays). Refused, epoch 0 goes whole with its group, for the winner's welcome to
-/// come through `apply`, and so does a refused external commit or reset. A member's commit refused
-/// stays staged: the server may have taken it after all (a lost answer, then a retry's 409), so
-/// `apply` settles it from the queue, merging it when the queue brings it back and dropping it when
-/// another commit takes its epoch. Until then this device makes no other commit (`pending_commit`).
+/// come through `apply`, and so does a refused external commit or reset. A member's commit the
+/// validator refused (`invalid`) is dropped. One refused otherwise stays staged: the server may
+/// have taken it after all (a lost answer, then a retry's 409), so `apply` settles it from the
+/// queue. It merges it when the queue brings it back, and drops it when another commit takes its
+/// epoch, or a server proposal at its epoch shows it can't have entered. Until then this device
+/// makes no other commit (`pending_commit`).
 pub(crate) fn commit_result(tx: &Tx<'_>, request: CommitResult) -> Result<Epoch, Error> {
     let conversation = request.conversation_id;
-    if request.seq.is_some_and(|seq| i64::try_from(seq).is_err()) {
-        return Err(invalid("seq", "the commit's number is out of range"));
+    match request.seq {
+        None if request.accepted => {
+            return Err(invalid("seq", "an accepted commit comes with its number"));
+        }
+        Some(seq) if i64::try_from(seq).is_err() => {
+            return Err(invalid("seq", "the commit's number is out of range"));
+        }
+        _ => {}
     }
     let mut row = GroupRow::read(tx, conversation)?.ok_or_else(|| not_found("group"))?;
     let pending = row.pending.take().ok_or_else(|| not_found("commit"))?;
@@ -110,7 +122,13 @@ pub(crate) fn commit_result(tx: &Tx<'_>, request: CommitResult) -> Result<Epoch,
 
     if !request.accepted {
         if pending == Pending::Commit {
-            // OpenMLS keeps the commit staged, and the row its echo, for `apply`.
+            if request.invalid {
+                row.echo = None;
+                group
+                    .clear_pending_commit(provider.storage())
+                    .map_err(storage_error)?;
+            }
+            // Otherwise OpenMLS keeps the commit staged, and the row its echo, for `apply`.
             row.write(tx)?;
             return Ok(Epoch {
                 epoch: Some(group.epoch().as_u64()),
@@ -137,9 +155,9 @@ pub(crate) fn commit_result(tx: &Tx<'_>, request: CommitResult) -> Result<Epoch,
         row.blocked = false;
     }
     own_merged(tx, &mut row, &group)?;
-    // A device that counts the queue already takes the commit there, in order, after what comes
-    // before it; one that counted none yet counts from it.
-    if row.last_seq.is_none() {
+    // A new group's creator and an external joiner count the queue from their commit. A device that
+    // counts it already takes the commit there, in order, after what comes before it.
+    if matches!(pending, Pending::Create | Pending::External) {
         row.last_seq = request.seq;
     }
     row.write(tx)?;

@@ -538,7 +538,8 @@ impl FakeServer {
 
     /// The server's side of a commit `device` made (`reply`, the command's): the compare-and-set
     /// of the generation and epoch, then the validator. The device hears the answer through
-    /// `commit_result`, with the commit's number when it's taken.
+    /// `commit_result`: the commit's number when it's taken, and `invalid` when the validator
+    /// refused it.
     pub fn submit(
         &mut self,
         device: &mut TestDevice,
@@ -551,8 +552,10 @@ impl FakeServer {
             "conversation_id": conversation,
             "accepted": taken.is_ok(),
         });
-        if let Ok(seq) = &taken {
-            answer["seq"] = json!(seq);
+        match &taken {
+            Ok(seq) => answer["seq"] = json!(seq),
+            Err(Refusal::Invalid(_)) => answer["invalid"] = json!(true),
+            Err(Refusal::Conflict) => {}
         }
         let result = ok(&mut device.core, answer);
         if taken.is_ok() {
@@ -565,6 +568,22 @@ impl FakeServer {
         taken.map(|_| ())
     }
 
+    /// The server's side of a commit `device` made, whose answer the device doesn't get: it hears
+    /// only that the commit wasn't accepted, as from a retry's 409, and can't tell whether it entered.
+    pub fn answer_lost(
+        &mut self,
+        device: &mut TestDevice,
+        conversation: Uuid,
+        reply: &Value,
+    ) -> Result<u64, Refusal> {
+        let taken = self.take(device, conversation, reply);
+        ok(
+            &mut device.core,
+            json!({"cmd": "commit_result", "conversation_id": conversation, "accepted": false}),
+        );
+        taken
+    }
+
     /// The server takes the commit `device` made (`reply`), but the device hears it refused: the
     /// answer was lost, and the retry got the 409 the first try caused. The commit's number.
     pub fn take_unheard(
@@ -573,14 +592,8 @@ impl FakeServer {
         conversation: Uuid,
         reply: &Value,
     ) -> u64 {
-        let seq = self
-            .take(device, conversation, reply)
-            .expect("the server takes it");
-        ok(
-            &mut device.core,
-            json!({"cmd": "commit_result", "conversation_id": conversation, "accepted": false}),
-        );
-        seq
+        self.answer_lost(device, conversation, reply)
+            .expect("the server takes it")
     }
 
     /// The validator's word on a commit, without keeping it.

@@ -461,7 +461,9 @@ impl EntryHandler for Welcomes {
 }
 
 /// Proposals: the server's removals of leaves, kept for the next commit, with the statement of a
-/// user who leaves. The rules take nothing else from the server, and members propose nothing.
+/// user who leaves. The rules take nothing else from the server, and members propose nothing. A
+/// removal this device's waiting commit leaves out shows that commit never entered (the validator
+/// holds every member's commit to the removals pending at its epoch), and drops it.
 struct Proposals;
 
 impl EntryHandler for Proposals {
@@ -491,10 +493,20 @@ impl EntryHandler for Proposals {
         let ProcessedMessageContent::ProposalMessage(proposal) = processed.into_content() else {
             return Ok(rejected("invalid_proposal"));
         };
-        let removal = matches!(proposal.sender(), Sender::External(_))
-            && matches!(proposal.proposal(), Proposal::Remove(_));
-        if !removal {
-            return Ok(rejected(RuleViolation::ServerProposalNotRemove.name()));
+        let removed = match (proposal.sender(), proposal.proposal()) {
+            (Sender::External(_), Proposal::Remove(remove)) => remove.removed(),
+            _ => return Ok(rejected(RuleViolation::ServerProposalNotRemove.name())),
+        };
+        let left_out = group.pending_commit().is_some_and(|waiting| {
+            !waiting
+                .remove_proposals()
+                .any(|carried| carried.remove_proposal().removed() == removed)
+        });
+        if left_out {
+            group
+                .clear_pending_commit(provider.storage())
+                .map_err(storage_error)?;
+            row.echo = None;
         }
         group
             .store_pending_proposal(provider.storage(), *proposal)
