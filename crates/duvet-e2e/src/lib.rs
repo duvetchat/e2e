@@ -157,7 +157,9 @@ impl Core {
 
     /// Runs one JSON command, and answers `{"ok": {...}}` or `{"error": {"code", "message", ...}}`.
     ///
-    /// Each command is one transaction: whatever fails, a panic included, leaves the database as it was.
+    /// Each command is one transaction: whatever fails, a panic included, leaves the database as
+    /// it was, but for what `apply` notes as it answers `needs_identities` (which users it asked
+    /// about, at what it knew of them), kept so it doesn't ask the same twice.
     pub fn handle(&mut self, command: &str) -> String {
         let reply = match panic::catch_unwind(AssertUnwindSafe(|| self.run(command))) {
             Ok(Ok(value)) => json!({ "ok": value }),
@@ -170,7 +172,9 @@ impl Core {
     /// Closes the database and lets another instance open it.
     pub fn close(self) {}
 
-    /// Runs `f` in one `BEGIN IMMEDIATE` transaction, committed only when it returns `Ok`.
+    /// Runs `f` in one `BEGIN IMMEDIATE` transaction, committed only when it returns `Ok`; what
+    /// `f` keeps whatever happens ([`Tx`]'s `keep`, as `apply`'s note of a `needs_identities`)
+    /// is written either way.
     pub fn transaction<T>(
         &mut self,
         f: impl FnOnce(&mut Tx<'_>) -> Result<T, Error>,

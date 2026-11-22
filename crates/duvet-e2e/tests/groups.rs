@@ -217,7 +217,8 @@ fn losing_commit_retries() {
     let waiting = error(&mut b1.core, apply(conversation, &[]));
     assert_eq!(waiting["code"], "pending_commit");
 
-    // A1's comes first; B1's gets the 409, and B1 drops it.
+    // A1's comes first; B1's gets the 409. B1 keeps it until the queue shows which commit took
+    // the epoch: A1's, which B1 merges in its place.
     server.submit(&mut a1, conversation, &from_a).unwrap();
     assert_eq!(
         server.submit(&mut b1, conversation, &from_b),
@@ -1552,7 +1553,7 @@ fn corrupted_proposal_queue_is_an_error() {
         })
         .unwrap();
 
-    // Loading the group fails as a storage failure, not with a panic, which aborts the web's worker.
+    // Loading the group fails as a storage failure, not a panic, which aborts the web's worker.
     let refused = b1.no_group(conversation);
     assert_eq!(refused["code"], "storage", "{refused}");
 }

@@ -87,14 +87,14 @@ struct Device {
     leaf: u32,
 }
 
-/// The server's word on this device's waiting commit. Taken, it's merged (an external commit, merged
-/// as it was made, stays). Refused, epoch 0 goes whole with its group, for the winner's welcome to
-/// come through `apply`, and so does a refused external commit or reset. A member's commit the
-/// validator refused (`invalid`) is dropped. One refused otherwise stays staged: the server may
-/// have taken it after all (a lost answer, then a retry's 409), so `apply` settles it from the
-/// queue. It merges it when the queue brings it back, and drops it when another commit takes its
-/// epoch, or a server proposal at its epoch shows it can't have entered. Until then this device
-/// makes no other commit (`pending_commit`).
+/// The server's word on this device's waiting commit. Taken, it's merged (an external commit,
+/// merged as it was made, stays). Refused, epoch 0 goes whole with its group, for the winner's
+/// welcome to come through `apply`, and so does a refused external commit or reset. A member's
+/// commit the validator refused (`invalid`) is dropped. One refused otherwise stays staged: the
+/// server may have taken it after all (a lost answer, then a retry's 409), so `apply` settles
+/// it from the queue. It merges it when the queue brings it back, and drops it when another
+/// commit takes its epoch, or a server proposal at its epoch shows it can't have entered. Until
+/// then this device makes no other commit (`pending_commit`).
 pub(crate) fn commit_result(tx: &Tx<'_>, request: CommitResult) -> Result<Epoch, Error> {
     let conversation = request.conversation_id;
     match request.seq {

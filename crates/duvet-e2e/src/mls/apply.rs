@@ -99,9 +99,9 @@ pub(crate) enum Applied {
     /// Refused, for the rule it breaks (or `malformed`, `invalid_commit`, `invalid_welcome`,
     /// `invalid_proposal`, `wrong_group` for what isn't a valid message of this group, and
     /// `stale_welcome` for a welcome to an epoch this device held or saw pass). Another
-    /// device's commit refused for a rule, or one OpenMLS can't process, also blocks the group, and
-    /// nothing goes on it but a reset; a malformed entry, a commit entry that holds no commit, and a
-    /// refused welcome or proposal leave the group as it was.
+    /// device's commit refused for a rule, or one OpenMLS can't process, also blocks the group,
+    /// and nothing goes on it but a reset; a malformed entry, a commit entry that holds no
+    /// commit, and a refused welcome or proposal leave the group as it was.
     Rejected { rule: String },
     /// Not for this device, or not now: a welcome for other devices, an entry of another generation
     /// or epoch, of a group this device isn't in, or after its group was blocked.
@@ -304,7 +304,7 @@ impl EntryHandler for Commits {
         }
         let after =
             MemberList::from_group_context(staged.group_context()).map_err(|_| stored_state())?;
-        // Merging another device's commit drops this device's waiting one, if any: its epoch is taken.
+        // Merging another device's commit drops this device's waiting one: its epoch is taken.
         group
             .merge_staged_commit(provider, *staged)
             .map_err(openmls_error)?;
@@ -393,8 +393,8 @@ impl EntryHandler for Welcomes {
         };
         let context = staged.group_context();
         let epoch = context.epoch().as_u64();
-        // A client's record from before the cutover holds the conversation's first group alone; at a
-        // later generation a reset's expectation decides.
+        // A client's record from before the cutover holds the conversation's first group alone;
+        // at a later generation a reset's expectation decides.
         let expected = entry
             .expected
             .as_ref()

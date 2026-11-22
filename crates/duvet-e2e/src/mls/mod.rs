@@ -261,10 +261,10 @@ pub fn load_group(tx: &Tx<'_>, conversation: Uuid) -> Result<(MlsGroup, GroupRow
 
 /// Whether this device may send a message in `conversation` now, which `encrypt` asks before it
 /// encrypts. What stops it from committing stops it from sending: its own commit waiting for
-/// `commit_result` or the queue (`pending_commit`), a blocked group (`rule_violation`, `group_blocked`), and its
-/// own removal proposed (`not_found`, `membership`). Beyond those, a removal the server proposed
-/// waits for its commit first, `pending_proposals`: then `commit_pending` makes it, so no message
-/// reaches a device on its way out.
+/// `commit_result` or the queue (`pending_commit`), a blocked group (`rule_violation`,
+/// `group_blocked`), and its own removal proposed (`not_found`, `membership`). Beyond those, a
+/// removal the server proposed waits for its commit first, `pending_proposals`: then
+/// `commit_pending` makes it, so no message reaches a device on its way out.
 pub fn ready_to_send(tx: &Tx<'_>, conversation: Uuid) -> Result<(), Error> {
     let (group, row) = load_group(tx, conversation)?;
     can_commit(&group, &row)?;

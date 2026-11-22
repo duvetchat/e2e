@@ -1,7 +1,7 @@
 //! A fake of the API for the core's tests: each conversation's queue in order, the compare-and-set
-//! of its generation and epoch, the key packages devices publish, each device's inbox, and the API's
-//! commit validator on every commit, as the API runs it. Devices are cores, each in a database of
-//! its own, driven by JSON as a client drives them.
+//! of its generation and epoch, the key packages devices publish, each device's inbox, and the
+//! API's commit validator on every commit, as the API runs it. Devices are cores, each in a
+//! database of its own, driven by JSON as a client drives them.
 
 // Each test file uses its share of these.
 #![allow(dead_code)]
@@ -383,7 +383,8 @@ impl FakeServer {
         b64(&openmls::prelude::tls_codec::Serialize::tls_serialize_detached(&key_package).unwrap())
     }
 
-    /// `user`'s identity, latest list and the certificates of its devices, as `observe_user` takes them.
+    /// `user`'s identity, latest list and the certificates of its devices, as `observe_user`
+    /// takes them.
     pub fn observed(&self, user: Uuid) -> Value {
         let record = &self.users[&user];
         let certificates: Vec<String> = record
@@ -572,7 +573,8 @@ impl FakeServer {
     }
 
     /// The server's side of a commit `device` made, whose answer the device doesn't get: it hears
-    /// only that the commit wasn't accepted, as from a retry's 409, and can't tell whether it entered.
+    /// only that the commit wasn't accepted, as from a retry's 409, and can't tell whether it
+    /// entered.
     pub fn answer_lost(
         &mut self,
         device: &mut TestDevice,
@@ -729,7 +731,8 @@ impl FakeServer {
     }
 
     /// The API proposes removing `device`'s leaf from `conversation`'s group (a logout, a device
-    /// removed from its list, a device inactive for 45 days), and again in each epoch until it's out.
+    /// removed from its list, a device inactive for 45 days), and again in each epoch until it's
+    /// out.
     pub fn remove_device(&mut self, conversation: Uuid, device: Uuid) {
         let chat = self.chats.get_mut(&conversation).unwrap();
         chat.removals.insert(device, None);
