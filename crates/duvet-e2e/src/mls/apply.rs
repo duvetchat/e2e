@@ -116,7 +116,8 @@ struct EntryResult {
 
 #[derive(Serialize)]
 pub(crate) struct ApplyReply {
-    /// Every entry up to this one is applied, or was skipped.
+    /// Every entry this device needs up to this one is applied: the next it needs comes after it.
+    /// None while nothing anchored the device's count.
     applied_through: Option<u64>,
     /// What each entry this call applied did; those applied before aren't in it.
     results: Vec<EntryResult>,
@@ -149,9 +150,11 @@ fn handler(kind: EntryKind) -> &'static dyn EntryHandler {
 
 /// Applies `entries` to the conversation, in order: one already applied is skipped, and one after
 /// a missing one is a `gap` that names the first entry the core still needs (nothing of the call
-/// is kept then). Numbers count while this device holds the conversation's group; until its first
-/// entry takes effect (its own first commit, or the welcome that brings it in), and while it isn't
-/// in the group, it takes entries as they come.
+/// is kept then). Numbers count while this device holds the conversation's group, from the entry
+/// that anchored it (its own commit's, through `commit_result`, or the welcome that brought it in).
+/// While it isn't in the group it takes entries as they come, and only one that takes effect (the
+/// welcome that brings it back) moves its count: what it passed by stays to come, in its turn.
+/// `applied_through` never passes what the device still needs.
 pub(crate) fn apply(tx: &Tx<'_>, request: ApplyRequest) -> Result<ApplyReply, Error> {
     let row = GroupRow::read(tx, request.conversation_id)?;
     if row.as_ref().is_some_and(|row| row.pending.is_some()) {
@@ -169,7 +172,6 @@ pub(crate) fn apply(tx: &Tx<'_>, request: ApplyRequest) -> Result<ApplyReply, Er
     let start = at.last_seq();
     let held = at.group.is_some();
     let mut first_effect = None;
-    let mut seen = None;
     let mut results = Vec::new();
     for entry in &request.entries {
         if i64::try_from(entry.seq).is_err() {
@@ -188,17 +190,18 @@ pub(crate) fn apply(tx: &Tx<'_>, request: ApplyRequest) -> Result<ApplyReply, Er
                 return Err(Error::Gap { from });
             }
         }
+        let holding = at.group.is_some();
         let applied = handler(entry.kind).apply(tx, &mut at, entry)?;
         let effect = !matches!(applied, Applied::Ignored);
         if effect && first_effect.is_none() {
             first_effect = Some(entry.seq);
         }
+        // In the group, every entry counts, in order; out of it, only one that takes effect.
         if let Some(row) = at.row.as_mut()
-            && (effect || row.last_seq.is_some())
+            && (effect || (holding && row.last_seq.is_some()))
         {
             row.last_seq = Some(entry.seq);
         }
-        seen = Some(seen.map_or(entry.seq, |seen: u64| seen.max(entry.seq)));
         results.push(EntryResult {
             seq: entry.seq,
             kind: entry.kind,
@@ -209,7 +212,7 @@ pub(crate) fn apply(tx: &Tx<'_>, request: ApplyRequest) -> Result<ApplyReply, Er
         row.write(tx)?;
     }
     Ok(ApplyReply {
-        applied_through: at.last_seq().or(seen).or(start),
+        applied_through: at.last_seq(),
         results,
         catch_up_due: Vec::new(),
     })

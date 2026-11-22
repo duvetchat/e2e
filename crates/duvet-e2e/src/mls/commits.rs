@@ -28,6 +28,10 @@ pub(crate) struct CommitResult {
     conversation_id: Uuid,
     /// Whether the server took the commit; refused, it's a 409 or the validator's refusal.
     accepted: bool,
+    /// The commit's number in the queue, which the server's answer gives when it takes it: a
+    /// device that counted none yet (a new group's, an external join's) counts from there.
+    #[serde(default)]
+    seq: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -87,6 +91,9 @@ struct Device {
 /// another commit takes its epoch. Until then this device makes no other commit (`pending_commit`).
 pub(crate) fn commit_result(tx: &Tx<'_>, request: CommitResult) -> Result<Epoch, Error> {
     let conversation = request.conversation_id;
+    if request.seq.is_some_and(|seq| i64::try_from(seq).is_err()) {
+        return Err(invalid("seq", "the commit's number is out of range"));
+    }
     let mut row = GroupRow::read(tx, conversation)?.ok_or_else(|| not_found("group"))?;
     let pending = row.pending.take().ok_or_else(|| not_found("commit"))?;
     let generation = match pending {
@@ -130,6 +137,11 @@ pub(crate) fn commit_result(tx: &Tx<'_>, request: CommitResult) -> Result<Epoch,
         row.blocked = false;
     }
     own_merged(tx, &mut row, &group)?;
+    // A device that counts the queue already takes the commit there, in order, after what comes
+    // before it; one that counted none yet counts from it.
+    if row.last_seq.is_none() {
+        row.last_seq = request.seq;
+    }
     row.write(tx)?;
     Ok(Epoch {
         epoch: Some(group.epoch().as_u64()),

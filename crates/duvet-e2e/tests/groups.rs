@@ -819,6 +819,80 @@ fn apply_skips_replayed_entries_and_reports_gaps() {
 }
 
 #[test]
+fn holes_are_reported_in_and_out_of_the_group() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut b1] = new_devices(&mut server, [a, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+    start(&mut server, &mut a1, conversation);
+
+    // B1 hasn't anchored: nothing it takes before its welcome counts as applied.
+    let entries = server.entries(conversation);
+    let first = ok(&mut b1.core, apply(conversation, &entries[..1]));
+    assert_eq!(
+        results(&[first.clone()]),
+        [json!([1, "commit", "ignored", null])]
+    );
+    assert_eq!(first["applied_through"], Value::Null);
+    server.deliver(&mut b1);
+
+    // B1 commits twice before A1 hears anything. A1 counts from its own commit, by the number the
+    // server gave it: the second commit alone is a gap.
+    for _ in 0..2 {
+        server
+            .commit(&mut b1, conversation, command("refresh", conversation))
+            .unwrap();
+        server.deliver(&mut b1);
+    }
+    let entries = server.entries(conversation);
+    let gap = error(&mut a1.core, apply(conversation, &entries[3..4]));
+    assert_eq!((&gap["code"], &gap["from"]), (&json!("gap"), &json!(2)));
+    server.deliver(&mut a1);
+    same_group(&mut [&mut a1, &mut b1], conversation);
+
+    // A removes B, and B1 hears it.
+    let remove = json!({"cmd": "remove_members", "conversation_id": conversation, "users": [b]});
+    server.commit(&mut a1, conversation, remove).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    assert_eq!(b1.no_group(conversation)["what"], "membership");
+
+    // A adds B again (its commit and B1's welcome), then refreshes.
+    let add = adding(&mut server, conversation, b);
+    server.commit(&mut a1, conversation, add).unwrap();
+    server.deliver(&mut a1);
+    server
+        .commit(&mut a1, conversation, command("refresh", conversation))
+        .unwrap();
+    server.deliver(&mut a1);
+    let entries = server.entries(conversation);
+    assert_eq!(entries[6]["kind"], "welcome");
+
+    // The refresh reaches B1 first, pushed live ahead of the backlog. Out of the group, B1 takes
+    // nothing from it, and its cursor doesn't pass the hole.
+    let early = ok(&mut b1.core, apply(conversation, &entries[7..8]));
+    assert_eq!(
+        results(&[early.clone()]),
+        [json!([8, "commit", "ignored", null])]
+    );
+    assert_eq!(early["applied_through"], 5);
+
+    // The backlog brings the welcome: B1 is back, and takes the refresh after it.
+    let backlog = ok(&mut b1.core, apply(conversation, &entries[5..]));
+    assert_eq!(
+        results(&[backlog.clone()]),
+        [
+            json!([6, "commit", "ignored", null]),
+            json!([7, "welcome", "applied", null]),
+            json!([8, "commit", "applied", null]),
+        ]
+    );
+    assert_eq!(backlog["applied_through"], 8);
+    let state = same_group(&mut [&mut a1, &mut b1], conversation);
+    assert_eq!(state["epoch"], 6);
+}
+
+#[test]
 fn devices_without_key_packages_are_skipped() {
     let mut server = FakeServer::new();
     let (a, b) = (new_id(), new_id());

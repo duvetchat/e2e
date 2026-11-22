@@ -532,7 +532,7 @@ impl FakeServer {
 
     /// The server's side of a commit `device` made (`reply`, the command's): the compare-and-set
     /// of the generation and epoch, then the validator. The device hears the answer through
-    /// `commit_result`.
+    /// `commit_result`, with the commit's number when it's taken.
     pub fn submit(
         &mut self,
         device: &mut TestDevice,
@@ -540,10 +540,15 @@ impl FakeServer {
         reply: &Value,
     ) -> Result<(), Refusal> {
         let taken = self.take(device, conversation, reply);
-        let result = ok(
-            &mut device.core,
-            json!({"cmd": "commit_result", "conversation_id": conversation, "accepted": taken.is_ok()}),
-        );
+        let mut answer = json!({
+            "cmd": "commit_result",
+            "conversation_id": conversation,
+            "accepted": taken.is_ok(),
+        });
+        if let Ok(seq) = &taken {
+            answer["seq"] = json!(seq);
+        }
+        let result = ok(&mut device.core, answer);
         if taken.is_ok() {
             assert_eq!(
                 result["epoch"],
