@@ -27,19 +27,65 @@ impl KeyStore for keyring_core::Entry {
     }
 }
 
-/// Why a key couldn't be had from the keyring.
+/// Why there's no keyring entry to keep the key in.
 #[derive(Debug)]
-enum Failure {
-    Keyring(keyring_core::Error),
-    Core(Error),
+pub(crate) enum NoKeyring {
+    /// No Secret Service at all: no session bus, or nothing on it providing the service. Only
+    /// then does a new database's key go to `<path>.key`.
+    #[cfg_attr(not(secret_service), allow(dead_code))]
+    Absent,
+    /// The keyring couldn't be reached for another reason.
+    Failed(keyring_core::Error),
 }
 
 /// Opens the database at `path` with the key the system's keyring keeps for it, made on its
 /// first open.
 pub(crate) fn open(path: &Path, service: &str, account: &str) -> Result<Core, Error> {
-    open_with(
-        path,
-        keyring::Entry::new(service, account).map(|entry| entry.inner),
+    open_with(path, system_entry(service, account))
+}
+
+/// The system keyring's entry for the key, or why there is none.
+fn system_entry(service: &str, account: &str) -> Result<keyring_core::Entry, NoKeyring> {
+    keyring::Entry::new(service, account)
+        .map(|entry| entry.inner)
+        .map_err(|error| {
+            if absent(keyring::Entry::store_status()) {
+                NoKeyring::Absent
+            } else {
+                NoKeyring::Failed(error)
+            }
+        })
+}
+
+/// Whether the keyring couldn't be made because no Secret Service is there at all: secret-service
+/// found no session bus or no provider on it. One that's locked or failing is there.
+#[cfg(secret_service)]
+fn absent(store: &keyring_core::Result<()>) -> bool {
+    match store {
+        Err(keyring_core::Error::PlatformFailure(cause)) => matches!(
+            cause.downcast_ref::<secret_service::Error>(),
+            Some(secret_service::Error::Unavailable)
+        ),
+        _ => false,
+    }
+}
+
+#[cfg(not(secret_service))]
+fn absent(_: &keyring_core::Result<()>) -> bool {
+    false
+}
+
+/// A keyring that's there but failed, which never sends the key to a file. Its text can name the
+/// entry, so the message is fixed.
+fn keyring_failed(error: &keyring_core::Error) -> Error {
+    Error::Storage(
+        match error {
+            keyring_core::Error::NoStorageAccess(_) => {
+                "the system keyring is locked or refused access: unlock it and try again"
+            }
+            _ => "the system keyring failed",
+        }
+        .into(),
     )
 }
 
@@ -48,7 +94,7 @@ pub(crate) fn open(path: &Path, service: &str, account: &str) -> Result<Core, Er
 /// From looking for the database to opening it, everything runs under `<path>.key.lock`, which
 /// another open waits for: two first opens can't each store a key of their own, and the one that
 /// comes second finds the database and its key, then `locked` while the first keeps it open.
-fn open_with(path: &Path, entry: keyring_core::Result<impl KeyStore>) -> Result<Core, Error> {
+fn open_with(path: &Path, entry: Result<impl KeyStore, NoKeyring>) -> Result<Core, Error> {
     let _choosing = lock_key(path)?;
     let (key, key_storage) = database_key(path, entry)?;
     let mut config = OpenConfig::new(path, key);
@@ -76,10 +122,11 @@ fn lock_key(path: &Path) -> Result<File, Error> {
 /// The key of the database at `path`, and where it's kept.
 ///
 /// A key is made only for a database that doesn't exist yet: for one that does, a missing key
-/// can't open it, and a new one would only hide the key that might come back.
+/// can't open it, and a new one would only hide the key that might come back. The plaintext
+/// `<path>.key` only where there's no Secret Service at all.
 fn database_key(
     path: &Path,
-    entry: keyring_core::Result<impl KeyStore>,
+    entry: Result<impl KeyStore, NoKeyring>,
 ) -> Result<(Key, KeyStorage), Error> {
     // A database that can't be looked for isn't new: that's where a new key would hide the right one.
     let fresh = !std::fs::exists(path)
@@ -88,39 +135,26 @@ fn database_key(
     if let Some(key) = file::read(path)? {
         return Ok((key, KeyStorage::File));
     }
-    let failure = match entry {
-        Ok(entry) => match key_in(&entry, fresh) {
-            Ok(key) => return Ok((key, KeyStorage::Keyring)),
-            Err(failure) => failure,
-        },
-        Err(error) => Failure::Keyring(error),
-    };
-    match failure {
-        Failure::Core(error) => Err(error),
+    match entry {
+        Ok(entry) => key_in(&entry, fresh).map(|key| (key, KeyStorage::Keyring)),
         #[cfg(secret_service)]
-        Failure::Keyring(error) if unreachable(&error) => {
-            if fresh {
-                file::create(path).map(|key| (key, KeyStorage::File))
-            } else {
-                Err(Error::Storage("the system keyring isn't available".into()))
-            }
-        }
-        // Its text can name the entry: the message stays fixed.
-        Failure::Keyring(_) => Err(Error::Storage("the system keyring failed".into())),
+        Err(NoKeyring::Absent) if fresh => file::create(path).map(|key| (key, KeyStorage::File)),
+        Err(NoKeyring::Absent) => Err(Error::Storage("the system keyring isn't available".into())),
+        Err(NoKeyring::Failed(error)) => Err(keyring_failed(&error)),
     }
 }
 
 /// The key `entry` holds, or a new random one it stores when the database is `fresh`.
-fn key_in(entry: &impl KeyStore, fresh: bool) -> Result<Key, Failure> {
+fn key_in(entry: &impl KeyStore, fresh: bool) -> Result<Key, Error> {
     match entry.get() {
-        Ok(secret) => key_from(&Zeroizing::new(secret)).map_err(Failure::Core),
+        Ok(secret) => key_from(&Zeroizing::new(secret)),
         Err(keyring_core::Error::NoEntry) if fresh => {
-            let key = random_key().map_err(Failure::Core)?;
-            entry.set(&*key).map_err(Failure::Keyring)?;
+            let key = random_key()?;
+            entry.set(&*key).map_err(|error| keyring_failed(&error))?;
             Ok(key)
         }
-        Err(keyring_core::Error::NoEntry) => Err(Failure::Core(Error::BadKey)),
-        Err(error) => Err(Failure::Keyring(error)),
+        Err(keyring_core::Error::NoEntry) => Err(Error::BadKey),
+        Err(error) => Err(keyring_failed(&error)),
     }
 }
 
@@ -139,17 +173,6 @@ fn random_key() -> Result<Key, Error> {
         .try_fill_bytes(&mut *key)
         .map_err(|_| Error::Internal("no randomness for the key".into()))?;
     Ok(key)
-}
-
-/// The Secret Service isn't there: no session bus, or nothing answering on it.
-#[cfg(secret_service)]
-fn unreachable(error: &keyring_core::Error) -> bool {
-    matches!(
-        error,
-        keyring_core::Error::NoDefaultStore
-            | keyring_core::Error::PlatformFailure(_)
-            | keyring_core::Error::NoStorageAccess(_)
-    )
 }
 
 #[cfg(secret_service)]
@@ -249,12 +272,48 @@ mod tests {
         assert_eq!(error.code(), "bad_key");
         assert!(no_entry(&store));
 
-        // No keyring at all, and no key file: no file is made either.
-        #[cfg(secret_service)]
-        {
-            let none: keyring_core::Result<Entry> = Err(keyring_core::Error::NoDefaultStore);
-            assert_eq!(database_key(&path, none).unwrap_err().code(), "storage");
-            assert!(!dir.path().join("core.db.key").exists());
+        // No Secret Service at all, and no key file: no file is made either.
+        let none: Result<Entry, NoKeyring> = Err(NoKeyring::Absent);
+        assert_eq!(database_key(&path, none).unwrap_err().code(), "storage");
+        assert!(!dir.path().join("core.db.key").exists());
+    }
+
+    #[cfg(secret_service)]
+    #[test]
+    fn without_a_secret_service_a_new_database_gets_a_file_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.db");
+
+        let none: Result<Entry, NoKeyring> = Err(NoKeyring::Absent);
+        let (key, storage) = database_key(&path, none).unwrap();
+        assert_eq!(storage, KeyStorage::File);
+        assert_eq!(
+            std::fs::read(dir.path().join("core.db.key")).unwrap(),
+            key.to_vec()
+        );
+    }
+
+    #[cfg(secret_service)]
+    #[test]
+    fn only_a_missing_secret_service_counts_as_none() {
+        let failure = |cause: secret_service::Error| -> keyring_core::Result<()> {
+            Err(keyring_core::Error::PlatformFailure(Box::new(cause)))
+        };
+        assert!(absent(&failure(secret_service::Error::Unavailable)));
+
+        for there in [
+            failure(secret_service::Error::Locked),
+            failure(secret_service::Error::Prompt),
+            Err(keyring_core::Error::NoStorageAccess(Box::new(
+                secret_service::Error::Unavailable,
+            ))),
+            Err(keyring_core::Error::PlatformFailure(
+                "another failure".into(),
+            )),
+            Err(keyring_core::Error::NoDefaultStore),
+            Ok(()),
+        ] {
+            assert!(!absent(&there), "{there:?}");
         }
     }
 
@@ -276,15 +335,39 @@ mod tests {
     }
 
     #[test]
+    fn a_locked_or_failing_keyring_writes_no_file() {
+        for (refusal, message) in [
+            (
+                keyring_core::Error::NoStorageAccess("locked".into()),
+                "the system keyring is locked or refused access: unlock it and try again",
+            ),
+            (
+                keyring_core::Error::PlatformFailure("a running service failed".into()),
+                "the system keyring failed",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("core.db");
+            let store = mock_store();
+            let entry = entry_in(&store);
+            let mock: &mock::Cred = entry.as_any().downcast_ref().unwrap();
+            mock.set_error(refusal);
+
+            let error = database_key(&path, Ok(entry)).unwrap_err();
+            assert_eq!(error.code(), "storage");
+            assert_eq!(error.to_string(), format!("storage: {message}"));
+            assert!(!dir.path().join("core.db.key").exists(), "{message}");
+            assert!(no_entry(&store));
+        }
+    }
+
+    #[test]
     fn keyring_makes_no_key_for_a_database_that_exists() {
         let store = mock_store();
         let entry = entry_in(&store);
 
         let failure = key_in(&entry, false).unwrap_err();
-        assert!(
-            matches!(failure, Failure::Core(Error::BadKey)),
-            "{failure:?}"
-        );
+        assert!(matches!(failure, Error::BadKey), "{failure:?}");
         assert!(matches!(
             entry.get_secret(),
             Err(keyring_core::Error::NoEntry)
