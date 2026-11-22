@@ -6,7 +6,12 @@ all-features = true
 [advisories]
 # Every RustSec advisory (vulnerable, unmaintained, unsound) fails the check, and so does a yanked crate.
 yanked = "deny"
-ignore = []
+ignore = [
+    # crypto-bigint 0.5 comes only through p256 and p384 (elliptic-curve 0.13), which openmls_rust_crypto 0.6.0
+    # builds in for the P-256 and P-384 suites. The core uses suite 0x0001 alone (X25519, Ed25519), so none of
+    # its secrets goes through it. Drop this once openmls_rust_crypto takes crypto-bigint 0.7.6 or later.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 only backs the P-256 and P-384 suites, which the core never uses" },
+]
 
 [licenses]
 # Permissive licenses only: nothing under the GPL or the AGPL.
@@ -22,6 +27,8 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.9
+# SQLCipher's sources bundle SQLite (its public-domain blessing) and LibTomCrypt (WTFPL), both permissive.
+exceptions = [{ crate = "sqlcipher-src", allow = ["blessing", "WTFPL"] }]
 
 [licenses.private]
 # The workspace's own crates aren't published.

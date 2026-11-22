@@ -7,3 +7,26 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64.workspace = true
+openmls.workspace = true
+openmls_rust_crypto.workspace = true
+openmls_traits.workspace = true
+rusqlite = { workspace = true, features = ["cache"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+rusqlite = { workspace = true, features = ["bundled-sqlcipher-vendored-openssl"] }
+
+# The browser: SQLCipher through sqlite-wasm-rs, randomness and time from the JS host.
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+openmls = { workspace = true, features = ["js"] }
+rusqlite = { workspace = true, features = ["bundled-sqlcipher", "ffi-sqlite-wasm-rs"] }
+web-time.workspace = true
+
+[dev-dependencies]
+openmls_basic_credential.workspace = true
+tempfile = "3"
