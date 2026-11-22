@@ -166,6 +166,14 @@ mod tests {
     }
 
     #[test]
+    fn key_statement_is_built_at_its_final_length() {
+        // A buffer that grew left the key's first digits in the block it moved out of, which
+        // `Zeroizing` never wipes: only one built at its final length holds the only copy.
+        let pragma = key_pragma(&[0xa5; 32]);
+        assert_eq!(pragma.capacity(), pragma.len());
+    }
+
+    #[test]
     fn a_failed_key_statement_keeps_the_key_out() {
         let conn = Connection::open_in_memory().unwrap();
         // A statement SQLite can't parse: its error quotes the statement, which holds the key.
