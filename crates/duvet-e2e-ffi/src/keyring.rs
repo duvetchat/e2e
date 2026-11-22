@@ -2,13 +2,30 @@
 //! Keychain, the Secret Service), made on the database's first open. Where Linux has no Secret
 //! Service, it goes to `<path>.key`, which only its user reads, and `status` says `file`.
 
+use std::fs::{File, OpenOptions};
 use std::path::Path;
 
-use duvet_e2e::{Error, KeyStorage};
+use duvet_e2e::{Core, Error, KeyStorage, OpenConfig};
 use rand_core::{OsRng, RngCore};
 use zeroize::Zeroizing;
 
 pub(crate) type Key = Zeroizing<[u8; 32]>;
+
+/// What keeps a database's key: the system keyring's entry, or keyring-core's mock in tests.
+pub(crate) trait KeyStore {
+    fn get(&self) -> keyring_core::Result<Vec<u8>>;
+    fn set(&self, key: &[u8]) -> keyring_core::Result<()>;
+}
+
+impl KeyStore for keyring_core::Entry {
+    fn get(&self) -> keyring_core::Result<Vec<u8>> {
+        self.get_secret()
+    }
+
+    fn set(&self, key: &[u8]) -> keyring_core::Result<()> {
+        self.set_secret(key)
+    }
+}
 
 /// Why a key couldn't be had from the keyring.
 #[derive(Debug)]
@@ -17,22 +34,60 @@ enum Failure {
     Core(Error),
 }
 
+/// Opens the database at `path` with the key the system's keyring keeps for it, made on its
+/// first open.
+pub(crate) fn open(path: &Path, service: &str, account: &str) -> Result<Core, Error> {
+    open_with(
+        path,
+        keyring::Entry::new(service, account).map(|entry| entry.inner),
+    )
+}
+
+/// Opens the database at `path` with the key `entry` keeps.
+///
+/// From looking for the database to opening it, everything runs under `<path>.key.lock`, which
+/// another open waits for: two first opens can't each store a key of their own, and the one that
+/// comes second finds the database and its key, then `locked` while the first keeps it open.
+fn open_with(path: &Path, entry: keyring_core::Result<impl KeyStore>) -> Result<Core, Error> {
+    let _choosing = lock_key(path)?;
+    let (key, key_storage) = database_key(path, entry)?;
+    let mut config = OpenConfig::new(path, key);
+    config.key_storage = key_storage;
+    Core::open(config)
+}
+
+/// Takes `<path>.key.lock`, waiting for any other open of the database that holds it. It isn't
+/// the core's `<path>.lock`, which the core only tries on a handle of its own.
+fn lock_key(path: &Path) -> Result<File, Error> {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".key.lock");
+    let failed =
+        |error: std::io::Error| Error::Storage(format!("the key's lock: {}", error.kind()));
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(name)
+        .map_err(failed)?;
+    file.lock().map_err(failed)?;
+    Ok(file)
+}
+
 /// The key of the database at `path`, and where it's kept.
 ///
 /// A key is made only for a database that doesn't exist yet: for one that does, a missing key
 /// can't open it, and a new one would only hide the key that might come back.
-pub(crate) fn database_key(
+fn database_key(
     path: &Path,
-    service: &str,
-    account: &str,
+    entry: keyring_core::Result<impl KeyStore>,
 ) -> Result<(Key, KeyStorage), Error> {
     let fresh = !path.exists();
     #[cfg(secret_service)]
     if let Some(key) = file::read(path)? {
         return Ok((key, KeyStorage::File));
     }
-    let failure = match keyring::Entry::new(service, account) {
-        Ok(entry) => match key_in(&entry.inner, fresh) {
+    let failure = match entry {
+        Ok(entry) => match key_in(&entry, fresh) {
             Ok(key) => return Ok((key, KeyStorage::Keyring)),
             Err(failure) => failure,
         },
@@ -54,12 +109,12 @@ pub(crate) fn database_key(
 }
 
 /// The key `entry` holds, or a new random one it stores when the database is `fresh`.
-fn key_in(entry: &keyring_core::Entry, fresh: bool) -> Result<Key, Failure> {
-    match entry.get_secret() {
+fn key_in(entry: &impl KeyStore, fresh: bool) -> Result<Key, Failure> {
+    match entry.get() {
         Ok(secret) => key_from(&Zeroizing::new(secret)).map_err(Failure::Core),
         Err(keyring_core::Error::NoEntry) if fresh => {
-            let key = random_key()?;
-            entry.set_secret(&*key).map_err(Failure::Keyring)?;
+            let key = random_key().map_err(Failure::Core)?;
+            entry.set(&*key).map_err(Failure::Keyring)?;
             Ok(key)
         }
         Err(keyring_core::Error::NoEntry) => Err(Failure::Core(Error::BadKey)),
@@ -76,11 +131,11 @@ fn key_from(bytes: &[u8]) -> Result<Key, Error> {
     Ok(key)
 }
 
-fn random_key() -> Result<Key, Failure> {
+fn random_key() -> Result<Key, Error> {
     let mut key = Zeroizing::new([0; 32]);
     OsRng
         .try_fill_bytes(&mut *key)
-        .map_err(|_| Failure::Core(Error::Internal("no randomness for the key".into())))?;
+        .map_err(|_| Error::Internal("no randomness for the key".into()))?;
     Ok(key)
 }
 
@@ -128,8 +183,7 @@ mod file {
 
     /// A new random key in `<path>.key`, made readable and writable by its user alone.
     pub(super) fn create(path: &Path) -> Result<Key, Error> {
-        let key =
-            super::random_key().map_err(|_| Error::Internal("no randomness for the key".into()))?;
+        let key = super::random_key()?;
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -146,28 +200,38 @@ mod file {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Duration;
 
     use keyring_core::{CredentialStore, Entry, mock};
 
     use super::*;
 
+    fn mock_store() -> Arc<CredentialStore> {
+        mock::Store::new().unwrap()
+    }
+
+    fn entry_in(store: &Arc<CredentialStore>) -> Entry {
+        Entry::new_in_store(store, "duvet-e2e-test", "core").unwrap()
+    }
+
     #[test]
     fn keyring_creates_then_reuses_the_key() {
-        let store: Arc<CredentialStore> = mock::Store::new().unwrap();
-        let entry = || Entry::new_in_store(&store, "duvet-e2e-test", "core").unwrap();
+        let store = mock_store();
 
-        let created = key_in(&entry(), true).unwrap();
+        let created = key_in(&entry_in(&store), true).unwrap();
         assert_ne!(*created, [0; 32]);
-        assert_eq!(entry().get_secret().unwrap(), created.to_vec());
+        assert_eq!(entry_in(&store).get_secret().unwrap(), created.to_vec());
 
-        let reused = key_in(&entry(), true).unwrap();
+        let reused = key_in(&entry_in(&store), true).unwrap();
         assert_eq!(*reused, *created);
     }
 
     #[test]
     fn keyring_makes_no_key_for_a_database_that_exists() {
-        let store: Arc<CredentialStore> = mock::Store::new().unwrap();
-        let entry = Entry::new_in_store(&store, "duvet-e2e-test", "core").unwrap();
+        let store = mock_store();
+        let entry = entry_in(&store);
 
         let failure = key_in(&entry, false).unwrap_err();
         assert!(
@@ -178,6 +242,63 @@ mod tests {
             entry.get_secret(),
             Err(keyring_core::Error::NoEntry)
         ));
+    }
+
+    /// A mock entry whose first read, of all the opens sharing `first`, pauses: another open
+    /// meanwhile runs to its end.
+    struct FirstReadPauses<'a> {
+        entry: Entry,
+        first: &'a AtomicBool,
+    }
+
+    impl KeyStore for FirstReadPauses<'_> {
+        fn get(&self) -> keyring_core::Result<Vec<u8>> {
+            let secret = self.entry.get_secret();
+            if self.first.swap(false, Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(500));
+            }
+            secret
+        }
+
+        fn set(&self, key: &[u8]) -> keyring_core::Result<()> {
+            self.entry.set_secret(key)
+        }
+    }
+
+    #[test]
+    fn racing_first_opens_agree_on_one_key() {
+        let store = mock_store();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.db");
+        let first = AtomicBool::new(true);
+        let open = || {
+            open_with(
+                &path,
+                Ok(FirstReadPauses {
+                    entry: entry_in(&store),
+                    first: &first,
+                }),
+            )
+        };
+
+        let (a, b) = thread::scope(|scope| {
+            let a = scope.spawn(open);
+            let b = scope.spawn(open);
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        let (core, loser) = match (a, b) {
+            (Ok(core), Err(error)) | (Err(error), Ok(core)) => (core, error),
+            (a, b) => panic!("one open wins: {:?} {:?}", a.err(), b.err()),
+        };
+        assert_eq!(loser.code(), "locked");
+        core.close();
+
+        // What the keyring holds opens the database, and so does the next open through it.
+        let stored = key_from(&entry_in(&store).get_secret().unwrap()).unwrap();
+        Core::open(OpenConfig::new(&path, stored))
+            .expect("the stored key opens the database")
+            .close();
+        open_with(&path, Ok(entry_in(&store))).unwrap().close();
     }
 
     #[cfg(secret_service)]
