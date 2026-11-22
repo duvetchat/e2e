@@ -75,3 +75,21 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: cargo build --locked --release --target wasm32-wasip1 -p duvet-e2e-rules -p duvet-e2e-validator
+      # The module's exports exist on wasm32 alone, where the rust job's clippy doesn't look.
+      - run: cargo clippy --locked --target wasm32-wasip1 -p duvet-e2e-validator -- -D warnings
+      # The vectors expire with their key packages, so each run writes them anew.
+      - run: cargo test --locked -p duvet-e2e-validator write_vectors -- --ignored
+      - name: Install Go 1.27.4
+        run: |
+          curl -sSfL -o /tmp/go.tar.gz https://go.dev/dl/go1.27.4.linux-amd64.tar.gz
+          echo "7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840  /tmp/go.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/go.tar.gz -C /usr/local
+      - name: Run the module under wazero, as the API does
+        working-directory: host-tests/go
+        env:
+          DUVET_VALIDATOR_WASM: /cache/target/validator/wasm32-wasip1/release/duvet_e2e_validator.wasm
+          GOCACHE: /cache/go/build
+          GOMODCACHE: /cache/go/mod
+          GOFLAGS: -mod=readonly
+          GOTOOLCHAIN: local
+        run: /usr/local/go/bin/go test -count=1 ./...
