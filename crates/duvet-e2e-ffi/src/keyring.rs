@@ -57,17 +57,46 @@ fn system_entry(service: &str, account: &str) -> Result<keyring_core::Entry, NoK
         })
 }
 
-/// Whether the keyring couldn't be made because no Secret Service is there at all: secret-service
-/// found no session bus or no provider on it. One that's locked or failing is there.
+/// Whether the keyring couldn't be made because no Secret Service is there at all: no session bus,
+/// or nothing on it providing the service. One that's locked or failing is there.
 #[cfg(secret_service)]
 fn absent(store: &keyring_core::Result<()>) -> bool {
-    match store {
-        Err(keyring_core::Error::PlatformFailure(cause)) => matches!(
-            cause.downcast_ref::<secret_service::Error>(),
-            Some(secret_service::Error::Unavailable)
-        ),
-        _ => false,
+    let Err(keyring_core::Error::PlatformFailure(cause)) = store else {
+        return false;
+    };
+    let mut error: Option<&(dyn std::error::Error + 'static)> = Some(cause.as_ref());
+    while let Some(current) = error {
+        if no_bus_or_service(current) {
+            return true;
+        }
+        error = current.source();
     }
+    false
+}
+
+/// One link of the store's error: secret-service's own "no provider or session bus", the bus's
+/// socket missing or refusing, or the bus answering that no one provides the service.
+#[cfg(secret_service)]
+fn no_bus_or_service(error: &(dyn std::error::Error + 'static)) -> bool {
+    use std::io::ErrorKind::{ConnectionRefused, NotFound};
+
+    const SERVICE_UNKNOWN: &str = "org.freedesktop.DBus.Error.ServiceUnknown";
+    if let Some(error) = error.downcast_ref::<secret_service::Error>() {
+        return matches!(error, secret_service::Error::Unavailable);
+    }
+    if let Some(error) = error.downcast_ref::<zbus::Error>() {
+        return match error {
+            zbus::Error::MethodError(name, _, _) => name.as_str() == SERVICE_UNKNOWN,
+            zbus::Error::FDO(error) => matches!(**error, zbus::fdo::Error::ServiceUnknown(_)),
+            _ => false,
+        };
+    }
+    // zbus keeps its I/O errors in an `Arc`.
+    let io = error
+        .downcast_ref::<std::sync::Arc<std::io::Error>>()
+        .map(|error| &**error)
+        .or_else(|| error.downcast_ref::<std::io::Error>());
+    io.is_some_and(|error| matches!(error.kind(), NotFound | ConnectionRefused))
 }
 
 #[cfg(not(secret_service))]
@@ -296,14 +325,33 @@ mod tests {
     #[cfg(secret_service)]
     #[test]
     fn only_a_missing_secret_service_counts_as_none() {
+        use std::io::{self, ErrorKind};
+
         let failure = |cause: secret_service::Error| -> keyring_core::Result<()> {
             Err(keyring_core::Error::PlatformFailure(Box::new(cause)))
         };
-        assert!(absent(&failure(secret_service::Error::Unavailable)));
+        let bus = |kind: ErrorKind| {
+            failure(secret_service::Error::Zbus(zbus::Error::InputOutput(
+                Arc::new(io::Error::from(kind)),
+            )))
+        };
+        for none in [
+            failure(secret_service::Error::Unavailable),
+            // No socket where the session bus would be, or nothing listening on it.
+            bus(ErrorKind::NotFound),
+            bus(ErrorKind::ConnectionRefused),
+            // A bus, but nothing on it provides the Secret Service.
+            failure(secret_service::Error::Zbus(zbus::Error::FDO(Box::new(
+                zbus::fdo::Error::ServiceUnknown("no provider".into()),
+            )))),
+        ] {
+            assert!(absent(&none), "{none:?}");
+        }
 
         for there in [
             failure(secret_service::Error::Locked),
             failure(secret_service::Error::Prompt),
+            bus(ErrorKind::PermissionDenied),
             Err(keyring_core::Error::NoStorageAccess(Box::new(
                 secret_service::Error::Unavailable,
             ))),
