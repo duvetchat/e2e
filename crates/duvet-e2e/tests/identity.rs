@@ -1,6 +1,6 @@
 //! Identity, devices, contacts and key packages, through `Core::handle` as a client drives them.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine;
@@ -200,6 +200,7 @@ impl Contact {
 
 struct Published {
     id: Vec<u8>,
+    data: Vec<u8>,
     key_package: KeyPackage,
     expires_at: i64,
     last_resort: bool,
@@ -214,12 +215,14 @@ fn key_packages(core: &mut Core) -> Vec<Published> {
         .expect("a list")
         .iter()
         .map(|published| {
-            let key_package = KeyPackageIn::tls_deserialize_exact_bytes(&bytes(&published["data"]))
+            let data = bytes(&published["data"]);
+            let key_package = KeyPackageIn::tls_deserialize_exact_bytes(&data)
                 .expect("a key package")
                 .validate(&crypto, ProtocolVersion::Mls10)
                 .expect("a key package that validates");
             Published {
                 id: bytes(&published["id"]),
+                data,
                 key_package,
                 expires_at: published["expires_at"].as_i64().expect("Unix ms"),
                 last_resort: published["last_resort"].as_bool().expect("a flag"),
@@ -230,6 +233,29 @@ fn key_packages(core: &mut Core) -> Vec<Published> {
 
 fn last_resorts(published: &[Published]) -> usize {
     published.iter().filter(|kp| kp.last_resort).count()
+}
+
+/// The key packages of a reply, by ID: what the API keeps of each.
+fn by_id(published: &[Published]) -> BTreeMap<&[u8], (&[u8], i64, bool)> {
+    published
+        .iter()
+        .map(|kp| {
+            (
+                kp.id.as_slice(),
+                (kp.data.as_slice(), kp.expires_at, kp.last_resort),
+            )
+        })
+        .collect()
+}
+
+/// The key packages the device keeps a row of.
+fn key_package_rows(core: &mut Core) -> i64 {
+    core.transaction(|tx| {
+        Ok(tx
+            .conn()
+            .query_row("SELECT count(*) FROM key_packages", [], |row| row.get(0))?)
+    })
+    .unwrap()
 }
 
 /// Whether OpenMLS's storage still holds the key package, with its private keys.
@@ -631,16 +657,19 @@ fn key_packages_top_up_to_100_plus_last_resort() {
         assert!((left - 84 * DAY_MS).abs() < 60_000, "{left}");
     }
 
-    // Nothing is due: none more.
-    assert!(key_packages(&mut core).is_empty());
+    // Nothing is due: none made, and the same 101 again, so a reply the client lost costs nothing.
+    let again = key_packages(&mut core);
+    assert_eq!(by_id(&again), by_id(&first));
+    assert_eq!(key_package_rows(&mut core), 101);
 
-    // 71 days on, every one has 13 days left, the last resort's included: a whole new set.
+    // 71 days on, every one has 13 days left, the last resort's included: a whole new set, and only
+    // that one.
     clock.advance(71 * DAY_MS);
     let renewed = key_packages(&mut core);
     assert_eq!(renewed.len(), 101);
     assert_eq!(last_resorts(&renewed), 1);
     assert!(renewed.iter().all(|kp| !ids.contains(kp.id.as_slice())));
-    // The old ones stay meanwhile: a welcome to one of them may be on its way.
+    // The old ones stay meanwhile, not handed out: a welcome to one of them may be on its way.
     assert!(first.iter().all(|kp| stored(&mut core, &kp.key_package)));
 }
 
@@ -652,17 +681,26 @@ fn welcomes_use_up_single_use_key_packages_only() {
     let single = published.iter().find(|kp| !kp.last_resort).unwrap();
     let last_resort = published.iter().find(|kp| kp.last_resort).unwrap();
 
-    // Someone adds this device with a single-use key package, which its welcome uses up.
+    // Someone adds this device with a single-use key package, which its welcome uses up: one new
+    // one takes its place, and it's no longer handed out.
     join(&mut alice.core, welcome_to(single.key_package.clone()));
     assert!(!stored(&mut alice.core, &single.key_package));
     let topped_up = key_packages(&mut alice.core);
-    assert_eq!(topped_up.len(), 1);
-    assert_eq!(last_resorts(&topped_up), 0);
+    assert_eq!(topped_up.len(), 101);
+    assert_eq!(last_resorts(&topped_up), 1);
+    let before = by_id(&published);
+    let made: Vec<&Published> = topped_up
+        .iter()
+        .filter(|kp| !before.contains_key(kp.id.as_slice()))
+        .collect();
+    assert_eq!(made.len(), 1);
+    assert!(!made[0].last_resort);
+    assert!(topped_up.iter().all(|kp| kp.id != single.id));
 
-    // The last resort stays for the next one.
+    // The last resort stays for the next one: none made.
     join(&mut alice.core, welcome_to(last_resort.key_package.clone()));
     assert!(stored(&mut alice.core, &last_resort.key_package));
-    assert!(key_packages(&mut alice.core).is_empty());
+    assert_eq!(by_id(&key_packages(&mut alice.core)), by_id(&topped_up));
 }
 
 /// A welcome from a group someone else creates and adds `key_package` to.
@@ -733,15 +771,7 @@ fn key_packages_are_deleted_once_no_welcome_can_use_them() {
             .iter()
             .all(|kp| stored(&mut alice.core, &kp.key_package))
     );
-    let rows: i64 = alice
-        .core
-        .transaction(|tx| {
-            Ok(tx
-                .conn()
-                .query_row("SELECT count(*) FROM key_packages", [], |row| row.get(0))?)
-        })
-        .unwrap();
-    assert_eq!(rows, 101);
+    assert_eq!(key_package_rows(&mut alice.core), 101);
 }
 
 #[test]

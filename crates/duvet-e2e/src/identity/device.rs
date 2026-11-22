@@ -18,8 +18,8 @@ use crate::{Error, SqlStorageError, Tx};
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 /// The single-use key packages a device keeps published, besides its one of last resort.
 const SINGLE_USE: usize = 100;
-/// A key package with less than this left is replaced.
-const RENEW_BEFORE_MS: i64 = 14 * DAY_MS;
+/// A key package is live, handed out and counted, while it has more than this left.
+const LIVE_FOR_MS: i64 = 14 * DAY_MS;
 /// The server's queue keeps a welcome this long, so a key package's private keys stay this long
 /// after its end, for a welcome sent just before it.
 const QUEUE_KEEPS_MS: i64 = 45 * DAY_MS;
@@ -91,9 +91,11 @@ struct Published {
     last_resort: bool,
 }
 
-/// The key packages to publish: enough new ones that 100 single-use ones and one of last resort
-/// have 14 days or more left. A welcome uses up a single-use key package, and OpenMLS deletes it,
-/// so only those still in its storage count. Their lifetime is OpenMLS's default, 84 days.
+/// Every live key package of the device, after making enough new ones that 100 single-use ones and
+/// one of last resort are live. A key package is live while OpenMLS's storage holds it (a welcome
+/// uses up a single-use one, and OpenMLS deletes it), with more than 14 days left, and with the
+/// device's current certificate. The client uploads the whole set each time, so a reply it loses
+/// costs nothing. Their lifetime is OpenMLS's default, 84 days.
 pub(crate) fn key_packages(tx: &mut Tx<'_>) -> Result<KeyPackages, Error> {
     let own = tx.own_device()?;
     let credential = own.credential()?;
@@ -103,12 +105,12 @@ pub(crate) fn key_packages(tx: &mut Tx<'_>) -> Result<KeyPackages, Error> {
     let mut stored: Vec<Vec<u8>> = Vec::new();
     for hash_ref in tx
         .conn()
-        .prepare("SELECT hash_ref FROM key_packages")?
+        .prepare("SELECT hash_ref FROM key_packages ORDER BY rowid")?
         .query_map([], |row| row.get(0))?
     {
         stored.push(hash_ref?);
     }
-    let (mut single_use, mut last_resorts) = (0, 0);
+    let mut published = Vec::new();
     for hash_ref in stored {
         let key_ref = key_package_ref(&hash_ref)?;
         let bundle: Option<KeyPackageBundle> =
@@ -126,20 +128,17 @@ pub(crate) fn key_packages(tx: &mut Tx<'_>) -> Result<KeyPackages, Error> {
                 .delete_key_package(&key_ref)
                 .map_err(storage)?;
             forget(tx, &hash_ref)?;
-        } else if expires_at.saturating_sub(now) >= RENEW_BEFORE_MS
+        } else if expires_at.saturating_sub(now) > LIVE_FOR_MS
             && key_package.leaf_node().credential() == &credential.credential
         {
-            if key_package.last_resort() {
-                last_resorts += 1;
-            } else {
-                single_use += 1;
-            }
+            published.push(publish(hash_ref, key_package, expires_at)?);
         }
     }
 
+    let single_use = published.iter().filter(|kp| !kp.last_resort).count();
+    let last_resorts = published.len() - single_use;
     let wanted = std::iter::repeat_n(false, SINGLE_USE.saturating_sub(single_use))
         .chain(std::iter::repeat_n(true, usize::from(last_resorts == 0)));
-    let mut published = Vec::new();
     for last_resort in wanted {
         let mut builder = KeyPackage::builder().leaf_node_capabilities(leaf_capabilities());
         if last_resort {
@@ -160,18 +159,24 @@ pub(crate) fn key_packages(tx: &mut Tx<'_>) -> Result<KeyPackages, Error> {
              VALUES (?1, ?2, ?3, ?4)",
             params![id, expires_at, last_resort, now],
         )?;
-        let data = key_package
-            .tls_serialize_detached()
-            .map_err(|_| Error::Internal("a key package couldn't be encoded".into()))?;
-        published.push(Published {
-            id,
-            data,
-            expires_at,
-            last_resort,
-        });
+        // Handed out as made: on one clock it has 84 days left, and a test's clock ahead of
+        // OpenMLS's (R2) mustn't hide it.
+        published.push(publish(id, key_package, expires_at)?);
     }
     Ok(KeyPackages {
         key_packages: published,
+    })
+}
+
+fn publish(id: Vec<u8>, key_package: &KeyPackage, expires_at: i64) -> Result<Published, Error> {
+    let data = key_package
+        .tls_serialize_detached()
+        .map_err(|_| Error::Internal("a key package couldn't be encoded".into()))?;
+    Ok(Published {
+        id,
+        data,
+        expires_at,
+        last_resort: key_package.last_resort(),
     })
 }
 
