@@ -3,8 +3,9 @@
 //!
 //! No group stays in memory between commands: each command loads the one it needs, and what it
 //! changes goes into its transaction. A commit this device makes waits for `commit_result`, the
-//! server's word on it: taken, it's merged; refused, it's dropped. Every commit, this device's and
-//! the others', is held to the group rules before it's merged.
+//! server's word on it: taken, it's merged; refused, a new group's goes, and a member's commit
+//! waits for the queue to say which commit took its epoch. Every commit, this device's and the
+//! others', is held to the group rules before it's merged.
 
 pub(crate) mod apply;
 mod commits;
@@ -251,7 +252,7 @@ pub fn load_group(tx: &Tx<'_>, conversation: Uuid) -> Result<(MlsGroup, GroupRow
 
 /// Whether this device may send a message in `conversation` now, which `encrypt` asks before it
 /// encrypts. What stops it from committing stops it from sending: its own commit waiting for
-/// `commit_result` (`pending_commit`), a blocked group (`rule_violation`, `group_blocked`), and its
+/// `commit_result` or the queue (`pending_commit`), a blocked group (`rule_violation`, `group_blocked`), and its
 /// own removal proposed (`not_found`, `membership`). Beyond those, a removal the server proposed
 /// waits for its commit first, `pending_proposals`: then `commit_pending` makes it, so no message
 /// reaches a device on its way out.
@@ -265,12 +266,13 @@ pub fn ready_to_send(tx: &Tx<'_>, conversation: Uuid) -> Result<(), Error> {
 }
 
 /// Whether this device can commit in its group now: not while its own commit waits for
-/// `commit_result` (`pending_commit`), nor in a blocked group (`rule_violation`, `group_blocked`),
-/// nor once the server proposed removing this device's own leaf (`not_found`, `membership`). That
-/// device is on its way out: OpenMLS refuses a commit that removes its own committer, and the
-/// validator a member's commit that leaves a pending removal out, so it waits for another member's.
+/// `commit_result`, or for the queue once the server answered it as refused (`pending_commit`), nor
+/// in a blocked group (`rule_violation`, `group_blocked`), nor once the server proposed removing
+/// this device's own leaf (`not_found`, `membership`). That device is on its way out: OpenMLS
+/// refuses a commit that removes its own committer, and the validator a member's commit that leaves
+/// a pending removal out, so it waits for another member's.
 pub(crate) fn can_commit(group: &MlsGroup, row: &GroupRow) -> Result<(), Error> {
-    if row.pending.is_some() {
+    if row.pending.is_some() || group.pending_commit().is_some() {
         return Err(Error::PendingCommit);
     }
     if row.blocked {
@@ -285,6 +287,16 @@ pub(crate) fn can_commit(group: &MlsGroup, row: &GroupRow) -> Result<(), Error> 
     if leaving {
         return Err(not_found("membership"));
     }
+    Ok(())
+}
+
+/// The row once this device's own commit is merged: the members its group has now, no statement
+/// left to carry, and its leaf new, as every commit of this device's renews it.
+pub(crate) fn own_merged(tx: &Tx<'_>, row: &mut GroupRow, group: &MlsGroup) -> Result<(), Error> {
+    row.members = MemberList::from_group_context(group.public_group().group_context())
+        .map_err(|_| stored_state())?;
+    row.statements.clear();
+    row.leaf_updated_at = tx.now();
     Ok(())
 }
 

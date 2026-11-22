@@ -16,8 +16,8 @@ use uuid::Uuid;
 use super::members::Committed;
 use super::{
     ConversationId, Extra, GroupRow, Pending, REFRESH_AFTER_MS, can_commit, delete_group, digest,
-    draft, load_group, openmls_error, rule_context, stage, storage_error, stored_state, tls,
-    violation,
+    draft, load_group, openmls_error, own_merged, rule_context, stage, storage_error, stored_state,
+    tls, violation,
 };
 use crate::identity::{invalid, not_found, stored_uuid};
 use crate::protocol::b64;
@@ -80,8 +80,11 @@ struct Device {
 }
 
 /// The server's word on this device's waiting commit. Taken, it's merged (an external commit, merged
-/// as it was made, stays). Refused, a member's commit is dropped; epoch 0 goes whole with its group,
-/// for the winner's welcome to come through `apply`, and so does a refused external commit.
+/// as it was made, stays). Refused, epoch 0 goes whole with its group, for the winner's welcome to
+/// come through `apply`, and so does a refused external commit or reset. A member's commit refused
+/// stays staged: the server may have taken it after all (a lost answer, then a retry's 409), so
+/// `apply` settles it from the queue, merging it when the queue brings it back and dropping it when
+/// another commit takes its epoch. Until then this device makes no other commit (`pending_commit`).
 pub(crate) fn commit_result(tx: &Tx<'_>, request: CommitResult) -> Result<Epoch, Error> {
     let conversation = request.conversation_id;
     let mut row = GroupRow::read(tx, conversation)?.ok_or_else(|| not_found("group"))?;
@@ -99,16 +102,14 @@ pub(crate) fn commit_result(tx: &Tx<'_>, request: CommitResult) -> Result<Epoch,
         .ok_or_else(|| Error::Internal("the waiting commit's group isn't stored".into()))?;
 
     if !request.accepted {
-        row.echo = None;
         if pending == Pending::Commit {
-            group
-                .clear_pending_commit(provider.storage())
-                .map_err(storage_error)?;
+            // OpenMLS keeps the commit staged, and the row its echo, for `apply`.
             row.write(tx)?;
             return Ok(Epoch {
                 epoch: Some(group.epoch().as_u64()),
             });
         }
+        row.echo = None;
         group.delete(provider.storage()).map_err(storage_error)?;
         if pending == Pending::Create {
             GroupRow::delete(tx, conversation)?;
@@ -128,11 +129,7 @@ pub(crate) fn commit_result(tx: &Tx<'_>, request: CommitResult) -> Result<Epoch,
         row.generation = generation;
         row.blocked = false;
     }
-    row.members = MemberList::from_group_context(group.public_group().group_context())
-        .map_err(|_| stored_state())?;
-    row.statements.clear();
-    // Every commit of this device's renews its leaf.
-    row.leaf_updated_at = tx.now();
+    own_merged(tx, &mut row, &group)?;
     row.write(tx)?;
     Ok(Epoch {
         epoch: Some(group.epoch().as_u64()),

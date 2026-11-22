@@ -541,7 +541,25 @@ impl FakeServer {
                 "the device's epoch is the server's"
             );
         }
-        taken
+        taken.map(|_| ())
+    }
+
+    /// The server takes the commit `device` made (`reply`), but the device hears it refused: the
+    /// answer was lost, and the retry got the 409 the first try caused. The commit's number.
+    pub fn take_unheard(
+        &mut self,
+        device: &mut TestDevice,
+        conversation: Uuid,
+        reply: &Value,
+    ) -> u64 {
+        let seq = self
+            .take(device, conversation, reply)
+            .expect("the server takes it");
+        ok(
+            &mut device.core,
+            json!({"cmd": "commit_result", "conversation_id": conversation, "accepted": false}),
+        );
+        seq
     }
 
     /// The validator's word on a commit, without keeping it.
@@ -558,12 +576,13 @@ impl FakeServer {
         validate(&request)
     }
 
+    /// The server's side of a commit: the commit's number once it's taken.
     fn take(
         &mut self,
         device: &mut TestDevice,
         conversation: Uuid,
         reply: &Value,
-    ) -> Result<(), Refusal> {
+    ) -> Result<u64, Refusal> {
         let commit = bytes(&reply["commit"]);
         let new_group_info = bytes(&reply["group_info"]);
         let message = MlsMessageIn::tls_deserialize_exact_bytes(&commit)
@@ -674,7 +693,7 @@ impl FakeServer {
         for device in again {
             self.propose_removal(conversation, device);
         }
-        Ok(())
+        Ok(seq)
     }
 
     /// The API proposes removing `device`'s leaf from `conversation`'s group (a logout, a device

@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    Extra, GroupRow, check, delete_group, digest, openmls_error, rule_context, storage_error,
-    stored_group, stored_state,
+    Extra, GroupRow, check, delete_group, digest, openmls_error, own_merged, rule_context,
+    storage_error, stored_group, stored_state,
 };
 use crate::identity::{invalid, not_found};
 use crate::protocol::b64;
@@ -89,13 +89,16 @@ pub(crate) enum Applied {
     /// The group's epoch after it.
     #[serde(rename = "applied")]
     Done { epoch: u64 },
-    /// This device's own commit, merged already by `commit_result`.
+    /// This device's own commit: merged by `commit_result`, or now, when the server took the commit
+    /// it answered as refused.
     Own,
     /// A commit that took this device out of the group.
     Removed,
     /// Refused, for the rule it breaks (or `malformed`, `invalid_commit`, `invalid_welcome`,
-    /// `invalid_proposal`, `wrong_group` for what isn't a valid message of this group). A refused
-    /// commit blocks the group: nothing goes on it but a reset.
+    /// `invalid_proposal`, `wrong_group` for what isn't a valid message of this group). Another
+    /// device's commit refused for a rule, or one OpenMLS can't process, also blocks the group, and
+    /// nothing goes on it but a reset; a malformed entry, a commit entry that holds no commit, and a
+    /// refused welcome or proposal leave the group as it was.
     Rejected { rule: String },
     /// Not for this device, or not now: a welcome for other devices, an entry of another generation
     /// or epoch, of a group this device isn't in, or after its group was blocked.
@@ -217,8 +220,10 @@ impl Conversation {
     }
 }
 
-/// Commits: each one at this device's epoch is held to the rules, then merged. One that breaks
-/// them, or that this device can't process, blocks the group.
+/// Commits: each one at this device's epoch is held to the rules, then merged. Another device's
+/// commit that breaks them, or that this device can't process, blocks the group. This device's own
+/// commit never does: one the server answered as refused is merged when the queue brings it back,
+/// and dropped when another commit takes its epoch.
 struct Commits;
 
 impl EntryHandler for Commits {
@@ -232,8 +237,19 @@ impl EntryHandler for Commits {
         if !in_group(&message, at.id, row.generation) || row.blocked {
             return Ok(Applied::Ignored);
         }
+        let provider = tx.provider();
         if row.echo.as_deref() == Some(digest(&entry.data).as_slice()) {
             row.echo = None;
+            // Taken after all: merged now, as `commit_result` would have.
+            if let Some(group) = at.group.as_mut()
+                && group.pending_commit().is_some()
+                && message.epoch() == group.epoch()
+            {
+                group
+                    .merge_pending_commit(provider)
+                    .map_err(openmls_error)?;
+                own_merged(tx, row, group)?;
+            }
             return Ok(Applied::Own);
         }
         let Some(group) = at.group.as_mut() else {
@@ -243,7 +259,6 @@ impl EntryHandler for Commits {
         if message.epoch() != group.epoch() {
             return Ok(Applied::Ignored);
         }
-        let provider = tx.provider();
         let context = group.public_group().group_context().clone();
         let leaves = leaves(group.members()).map_err(|_| stored_state())?;
         let processed = match group.process_message(provider, message) {
@@ -253,8 +268,18 @@ impl EntryHandler for Commits {
         };
         let sender = processed.sender().clone();
         let aad = processed.aad().to_vec();
-        let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
-            return Ok(rejected("invalid_commit"));
+        let staged = match processed.into_content() {
+            ProcessedMessageContent::StagedCommitMessage(staged) => staged,
+            // This device's waiting commit, in bytes other than those it made.
+            ProcessedMessageContent::OwnPendingCommit => {
+                row.echo = None;
+                group
+                    .merge_pending_commit(provider)
+                    .map_err(openmls_error)?;
+                own_merged(tx, row, group)?;
+                return Ok(Applied::Own);
+            }
+            _ => return Ok(rejected("invalid_commit")),
         };
         let change = match extract_change(&context, &leaves, &staged, &sender, &aad) {
             Ok(change) => change,
@@ -265,9 +290,11 @@ impl EntryHandler for Commits {
         }
         let after =
             MemberList::from_group_context(staged.group_context()).map_err(|_| stored_state())?;
+        // Merging another device's commit drops this device's waiting one, if any: its epoch is taken.
         group
             .merge_staged_commit(provider, *staged)
             .map_err(openmls_error)?;
+        row.echo = None;
         row.members = after;
         row.statements.clear();
         if group.is_active() {

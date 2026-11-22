@@ -235,6 +235,42 @@ fn losing_commit_retries() {
 }
 
 #[test]
+fn own_commit_answered_refused_settles_from_the_queue() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut b1] = new_devices(&mut server, [a, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    // B1's refresh: the server takes it, but B1 hears a refusal.
+    let refresh = command("refresh", conversation);
+    let made = ok(&mut b1.core, refresh.clone());
+    let seq = server.take_unheard(&mut b1, conversation, &made);
+
+    // Until the queue says which commit took the epoch, B1 makes no other and sends nothing.
+    assert_eq!(
+        error(&mut b1.core, refresh.clone())["code"],
+        "pending_commit"
+    );
+    assert_eq!(
+        ready(&mut b1, conversation).unwrap_err()["code"],
+        "pending_commit"
+    );
+
+    // The queue brings B1's own commit back: B1 merges it, and its group isn't blocked.
+    let replies = server.deliver(&mut b1);
+    assert_eq!(results(&replies), [json!([seq, "commit", "own", null])]);
+    server.deliver(&mut a1);
+    let state = same_group(&mut [&mut a1, &mut b1], conversation);
+    assert_eq!(state["epoch"], 2);
+    assert_eq!(state["blocked"], false);
+    assert_eq!(ready(&mut b1, conversation), Ok(()));
+    server.commit(&mut b1, conversation, refresh).unwrap();
+}
+
+#[test]
 fn concurrent_epoch_zero_converges() {
     let mut server = FakeServer::new();
     let (a, b) = (new_id(), new_id());
