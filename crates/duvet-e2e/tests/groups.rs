@@ -904,7 +904,7 @@ fn holes_are_reported_in_and_out_of_the_group() {
     let entries = server.entries(conversation);
     let first = ok(&mut b1.core, apply(conversation, &entries[..1]));
     assert_eq!(
-        results(&[first.clone()]),
+        results(std::slice::from_ref(&first)),
         [json!([1, "commit", "ignored", null])]
     );
     assert_eq!(first["applied_through"], Value::Null);
@@ -945,7 +945,7 @@ fn holes_are_reported_in_and_out_of_the_group() {
     // nothing from it, and its cursor doesn't pass the hole.
     let early = ok(&mut b1.core, apply(conversation, &entries[7..8]));
     assert_eq!(
-        results(&[early.clone()]),
+        results(std::slice::from_ref(&early)),
         [json!([8, "commit", "ignored", null])]
     );
     assert_eq!(early["applied_through"], 5);
@@ -953,7 +953,7 @@ fn holes_are_reported_in_and_out_of_the_group() {
     // The backlog brings the welcome: B1 is back, and takes the refresh after it.
     let backlog = ok(&mut b1.core, apply(conversation, &entries[5..]));
     assert_eq!(
-        results(&[backlog.clone()]),
+        results(std::slice::from_ref(&backlog)),
         [
             json!([6, "commit", "ignored", null]),
             json!([7, "welcome", "applied", null]),
