@@ -1,1 +1,3 @@
 /target
+# The validator's vectors, which expire with their key packages: each run writes them anew.
+/host-tests/go/testdata/
