@@ -425,6 +425,16 @@ impl FakeServer {
         self.key_packages.insert(device.id, published);
     }
 
+    /// `device`'s last-resort key package, which a welcome doesn't use up.
+    pub fn last_resort(&self, device: Uuid) -> String {
+        self.key_packages[&device]
+            .iter()
+            .find(|kp| kp.last_resort)
+            .expect("a last-resort key package")
+            .data
+            .clone()
+    }
+
     /// A key package for each device of each of `users` that published some, as `create_group`
     /// and `reset_group` take them: a single-use one never handed out before, else the last resort.
     pub fn claim(&mut self, users: &[Uuid]) -> Value {

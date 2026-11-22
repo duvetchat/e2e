@@ -95,7 +95,8 @@ pub(crate) enum Applied {
     /// A commit that took this device out of the group.
     Removed,
     /// Refused, for the rule it breaks (or `malformed`, `invalid_commit`, `invalid_welcome`,
-    /// `invalid_proposal`, `wrong_group` for what isn't a valid message of this group). Another
+    /// `invalid_proposal`, `wrong_group` for what isn't a valid message of this group, and
+    /// `stale_welcome` for a welcome to an epoch this device held or saw pass). Another
     /// device's commit refused for a rule, or one OpenMLS can't process, also blocks the group, and
     /// nothing goes on it but a reset; a malformed entry, a commit entry that holds no commit, and a
     /// refused welcome or proposal leave the group as it was.
@@ -256,7 +257,8 @@ impl EntryHandler for Commits {
             return Ok(Applied::Ignored);
         };
         // Another epoch's: an old one replayed, or one this device can't follow.
-        if message.epoch() != group.epoch() {
+        let epoch = message.epoch().as_u64();
+        if epoch != group.epoch().as_u64() {
             return Ok(Applied::Ignored);
         }
         let context = group.public_group().group_context().clone();
@@ -297,6 +299,8 @@ impl EntryHandler for Commits {
         row.echo = None;
         row.members = after;
         row.statements.clear();
+        // The epoch the commit leads to, whether or not this device is in it.
+        row.epoch = epoch + 1;
         if group.is_active() {
             return Ok(Applied::Done {
                 epoch: group.epoch().as_u64(),
@@ -344,7 +348,14 @@ impl EntryHandler for Welcomes {
                 let users: Vec<Uuid> = row.members.users.iter().map(|entry| entry.user).collect();
                 entered_at_start(row.members.kind, row.members.owner, &users, generation)
             }),
-            Some(row) if generation == row.generation && at.group.is_none() && !row.blocked => None,
+            Some(row) if generation == row.generation && at.group.is_none() && !row.blocked => {
+                // A welcome to an epoch this device held or saw pass is an old one, handed out
+                // again: in it, members removed since still hold the keys.
+                if processed.unverified_group_info().epoch().as_u64() <= row.epoch {
+                    return Ok(rejected("stale_welcome"));
+                }
+                None
+            }
             // An older generation's, or this device is in the group, or the group is blocked.
             Some(_) => return Ok(Applied::Ignored),
         };
@@ -416,6 +427,7 @@ impl EntryHandler for Welcomes {
             conversation: at.id,
             generation,
             last_seq: at.row.as_ref().and_then(|row| row.last_seq),
+            epoch,
             members: list,
             blocked: false,
             leaf_updated_at: made.unwrap_or(tx.now()),

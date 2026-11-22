@@ -470,6 +470,40 @@ fn removed_device_cannot_rejoin() {
 }
 
 #[test]
+fn replayed_welcome_keeps_a_removed_device_out() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut b1] = new_devices(&mut server, [a, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+
+    // B1 enters with its last-resort key package, which the welcome doesn't use up.
+    let mut create = server.create_group(conversation);
+    create["key_packages"][b.to_string().as_str()] = json!([server.last_resort(b1.id)]);
+    server.commit(&mut a1, conversation, create).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    let welcome = server.entries(conversation)[1].clone();
+    assert_eq!(welcome["kind"], "welcome");
+    assert_eq!(b1.group(conversation)["epoch"], 1);
+
+    // A removes B: B1 is out.
+    let remove = json!({"cmd": "remove_members", "conversation_id": conversation, "users": [b]});
+    server.commit(&mut a1, conversation, remove).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    assert_eq!(b1.no_group(conversation)["what"], "membership");
+
+    // The server hands B1 its old welcome again, under a new number. It still opens, but it's for
+    // an epoch B1 has seen pass: B1 refuses it, and stays out.
+    let seq = server.force(conversation, "welcome", bytes(&welcome["data"]));
+    let replies = server.deliver(&mut b1);
+    assert_eq!(
+        results(&replies),
+        [json!([seq, "welcome", "rejected", "stale_welcome"])]
+    );
+    assert_eq!(b1.no_group(conversation)["what"], "membership");
+}
+
+#[test]
 fn returning_device_rejoins_external() {
     let mut server = FakeServer::new();
     let (a, b) = (new_id(), new_id());

@@ -249,6 +249,12 @@ pub(crate) fn join_external(tx: &Tx<'_>, request: JoinExternal) -> Result<Commit
         return Err(violation(duvet_e2e_rules::RuleViolation::DeviceNotListed));
     }
 
+    // The epoch the group info shows is one this device has now seen.
+    let seen = match &row {
+        Some(row) if row.generation == request.generation => row.epoch.max(info.epoch().as_u64()),
+        _ => info.epoch().as_u64(),
+    };
+
     if let Some(row) = &row {
         delete_group(tx, conversation, row.generation)?;
     }
@@ -300,6 +306,8 @@ pub(crate) fn join_external(tx: &Tx<'_>, request: JoinExternal) -> Result<Commit
         conversation,
         generation: request.generation,
         last_seq: None,
+        // Its own epoch once the server takes the commit (`commit_result`).
+        epoch: seen,
         members: MemberList::from_group_context(context).map_err(|_| stored_state())?,
         blocked: false,
         leaf_updated_at: tx.now(),

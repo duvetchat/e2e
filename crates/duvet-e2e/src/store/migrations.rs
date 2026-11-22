@@ -72,6 +72,8 @@ CREATE TABLE groups (
     generation INTEGER NOT NULL,
     -- The last entry of the conversation's queue applied; none until one takes effect.
     last_seq INTEGER,
+    -- The latest epoch of this generation the device held, or saw a commit take the group to.
+    epoch INTEGER NOT NULL DEFAULT 0,
     -- The member list in CBOR, as the group last had it.
     members BLOB NOT NULL,
     owner BLOB,

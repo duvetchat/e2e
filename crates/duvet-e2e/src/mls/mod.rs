@@ -100,6 +100,9 @@ pub struct GroupRow {
     pub generation: u32,
     /// The last entry of the queue applied; none until one took effect.
     pub last_seq: Option<u64>,
+    /// The latest epoch of `generation` this device held, or saw a commit take the group to: a
+    /// welcome to it or an earlier one is an old one, again.
+    pub epoch: u64,
     pub members: MemberList,
     pub blocked: bool,
     /// When this device's leaf in the group was last new, in Unix milliseconds.
@@ -117,6 +120,7 @@ impl GroupRow {
         type Columns = (
             i64,
             Option<i64>,
+            i64,
             Vec<u8>,
             bool,
             i64,
@@ -127,8 +131,8 @@ impl GroupRow {
         let columns: Option<Columns> = tx
             .conn()
             .query_row(
-                "SELECT generation, last_seq, members, blocked, leaf_updated_at, pending, echo, \
-                 statements FROM groups WHERE conversation_id = ?1",
+                "SELECT generation, last_seq, epoch, members, blocked, leaf_updated_at, pending, \
+                 echo, statements FROM groups WHERE conversation_id = ?1",
                 [conversation.as_bytes().as_slice()],
                 |row| {
                     Ok((
@@ -140,6 +144,7 @@ impl GroupRow {
                         row.get(5)?,
                         row.get(6)?,
                         row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
@@ -147,6 +152,7 @@ impl GroupRow {
         let Some((
             generation,
             last_seq,
+            epoch,
             members,
             blocked,
             leaf_updated_at,
@@ -171,6 +177,7 @@ impl GroupRow {
             last_seq: last_seq
                 .map(|seq| u64::try_from(seq).map_err(|_| malformed_row()))
                 .transpose()?,
+            epoch: u64::try_from(epoch).map_err(|_| malformed_row())?,
             members: from_cbor(&members).ok_or_else(malformed_row)?,
             blocked,
             leaf_updated_at,
@@ -189,6 +196,7 @@ impl GroupRow {
             .last_seq
             .map(|seq| i64::try_from(seq).map_err(|_| malformed_row()))
             .transpose()?;
+        let epoch = i64::try_from(self.epoch).map_err(|_| malformed_row())?;
         let statements = if self.statements.is_empty() {
             None
         } else {
@@ -200,18 +208,19 @@ impl GroupRow {
             Some(to_cbor(&statements)?)
         };
         tx.conn().execute(
-            "INSERT INTO groups (conversation_id, generation, last_seq, members, owner, kind, \
-             blocked, leaf_updated_at, pending, echo, statements) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+            "INSERT INTO groups (conversation_id, generation, last_seq, epoch, members, owner, \
+             kind, blocked, leaf_updated_at, pending, echo, statements) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
              ON CONFLICT (conversation_id) DO UPDATE SET generation = excluded.generation, \
-             last_seq = excluded.last_seq, members = excluded.members, owner = excluded.owner, \
-             kind = excluded.kind, blocked = excluded.blocked, \
+             last_seq = excluded.last_seq, epoch = excluded.epoch, members = excluded.members, \
+             owner = excluded.owner, kind = excluded.kind, blocked = excluded.blocked, \
              leaf_updated_at = excluded.leaf_updated_at, pending = excluded.pending, \
              echo = excluded.echo, statements = excluded.statements",
             params![
                 self.conversation.as_bytes().as_slice(),
                 self.generation,
                 last_seq,
+                epoch,
                 to_cbor(&self.members)?,
                 self.members.owner.map(|owner| owner.as_bytes().to_vec()),
                 kind,
@@ -290,11 +299,12 @@ pub(crate) fn can_commit(group: &MlsGroup, row: &GroupRow) -> Result<(), Error> 
     Ok(())
 }
 
-/// The row once this device's own commit is merged: the members its group has now, no statement
-/// left to carry, and its leaf new, as every commit of this device's renews it.
+/// The row once this device's own commit is merged: the members and epoch its group has now, no
+/// statement left to carry, and its leaf new, as every commit of this device's renews it.
 pub(crate) fn own_merged(tx: &Tx<'_>, row: &mut GroupRow, group: &MlsGroup) -> Result<(), Error> {
     row.members = MemberList::from_group_context(group.public_group().group_context())
         .map_err(|_| stored_state())?;
+    row.epoch = group.epoch().as_u64();
     row.statements.clear();
     row.leaf_updated_at = tx.now();
     Ok(())
