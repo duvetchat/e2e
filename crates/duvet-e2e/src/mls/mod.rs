@@ -31,7 +31,7 @@ use serde_bytes::ByteBuf;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::identity::{from_cbor, not_found, to_cbor};
+use crate::identity::{from_cbor, not_found, renewed_at, to_cbor};
 use crate::protocol::b64;
 use crate::{Error, OwnDevice, SqlStorageError, Tx};
 
@@ -300,13 +300,14 @@ pub(crate) fn can_commit(group: &MlsGroup, row: &GroupRow) -> Result<(), Error> 
 }
 
 /// The row once this device's own commit is merged: the members and epoch its group has now, no
-/// statement left to carry, and its leaf new, as every commit of this device's renews it.
+/// statement left to carry, and its leaf new, as every commit of this device's renews it (but one
+/// made before the identity changed, whose leaf is due at once: `renewed_at`).
 pub(crate) fn own_merged(tx: &Tx<'_>, row: &mut GroupRow, group: &MlsGroup) -> Result<(), Error> {
     row.members = MemberList::from_group_context(group.public_group().group_context())
         .map_err(|_| stored_state())?;
     row.epoch = group.epoch().as_u64();
     row.statements.clear();
-    row.leaf_updated_at = tx.now();
+    row.leaf_updated_at = renewed_at(tx, group)?;
     Ok(())
 }
 

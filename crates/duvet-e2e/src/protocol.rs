@@ -40,6 +40,12 @@ pub(crate) enum Command {
     },
     KeyPackages,
 
+    // Starting over and changing the keys.
+    ResetIdentity,
+    RotateKeys {
+        remove: Vec<Uuid>,
+    },
+
     // Attachments' parts.
     AttachmentKey,
     AttachmentEncrypt(parts::AttachmentPart),
@@ -113,6 +119,9 @@ pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error
             reply(identity::verify_user(tx, user_id, qr.as_deref())?)
         }
         Command::KeyPackages => reply(identity::key_packages(tx)?),
+
+        Command::ResetIdentity => reply(identity::reset_identity(tx)?),
+        Command::RotateKeys { remove } => reply(identity::rotate_keys(tx, &remove)?),
 
         Command::AttachmentKey => reply(parts::attachment_key(tx)?),
         Command::AttachmentEncrypt(part) => reply(parts::attachment_encrypt(part)?),

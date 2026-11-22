@@ -12,7 +12,7 @@ use super::{
     not_found, random, recovery, unix_ms,
 };
 use crate::protocol::b64;
-use crate::{Error, Tx};
+use crate::{Error, OwnDevice, Tx};
 
 #[derive(Serialize)]
 pub(crate) struct CreatedIdentity {
@@ -39,6 +39,17 @@ pub(crate) fn create_identity(tx: &mut Tx<'_>) -> Result<CreatedIdentity, Error>
             what: "identity".into(),
         });
     }
+    Ok(new_identity(tx, &own, vec![own.device])?.0)
+}
+
+/// A new identity for this device's user, in place of any the device had: it certifies the device
+/// and signs `devices` as the user's list, from version 1, and a new backup key, wrapped by a new
+/// recovery key, encrypts it. The reply, and the new backup key.
+pub(super) fn new_identity(
+    tx: &Tx<'_>,
+    own: &OwnDevice,
+    devices: Vec<Uuid>,
+) -> Result<(CreatedIdentity, Zeroizing<Vec<u8>>), Error> {
     let rand = tx.provider().rand();
     let secret = random(rand, 32)?;
     let secret = thirty_two(&secret)?;
@@ -59,12 +70,12 @@ pub(crate) fn create_identity(tx: &mut Tx<'_>) -> Result<CreatedIdentity, Error>
         DeviceCertificate::new(own.user, own.device, signature_key, hpke_key, unix_ms(tx)?)
             .sign(&identity.signer)
             .map_err(signing)?;
-    let device_list = DeviceList::new(own.user, identity.public, 1, vec![own.device])
+    let device_list = DeviceList::new(own.user, identity.public, 1, devices)
         .sign(&identity.signer)
         .map_err(signing)?;
 
-    let backup_key = random(rand, 32)?;
-    let backup_key = thirty_two(&backup_key)?;
+    let backup = random(rand, 32)?;
+    let backup_key = thirty_two(&backup)?;
     let recovery_key = recovery::generate(rand)?;
     let wrapped_backup_key = recovery::wrap_backup_key(
         rand,
@@ -80,14 +91,15 @@ pub(crate) fn create_identity(tx: &mut Tx<'_>) -> Result<CreatedIdentity, Error>
     meta_put(tx, IDENTITY_SECRET, secret)?;
     meta_put(tx, DEVICE_LIST, &device_list)?;
     meta_put(tx, BACKUP_KEY, backup_key)?;
-    Ok(CreatedIdentity {
+    let created = CreatedIdentity {
         identity_key: identity.public.to_vec(),
         certificate,
         device_list,
         recovery_key,
         wrapped_backup_key,
         encrypted_identity,
-    })
+    };
+    Ok((created, backup))
 }
 
 #[derive(Serialize)]

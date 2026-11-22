@@ -430,6 +430,39 @@ impl FakeServer {
         record.list = signed;
     }
 
+    /// The new identity a device of `user` made (`rotate_keys`, `reset_identity`'s `reply`), which
+    /// the server takes in place of the one it had: the key, the secret its blobs hold (opened as a
+    /// recovered device opens them), the list, and the certificate of the device that made it, the
+    /// only device that list may name, as nothing certifies the user's other devices anew.
+    pub fn take_identity(&mut self, user: Uuid, reply: &Value) {
+        let recovery_key = recovery::parse(reply["recovery_key"].as_str().unwrap()).unwrap();
+        let backup_key =
+            recovery::unwrap_backup_key(&recovery_key, user, &bytes(&reply["wrapped_backup_key"]))
+                .unwrap();
+        let seed =
+            recovery::decrypt_identity(&backup_key, user, &bytes(&reply["encrypted_identity"]))
+                .unwrap();
+        let identity_key: [u8; 32] = bytes(&reply["identity_key"]).try_into().unwrap();
+        let list = bytes(&reply["device_list"]);
+        let taken = DeviceList::verify(&list, &identity_key).unwrap();
+        let certificate = bytes(&reply["certificate"]);
+        let device = DeviceCertificate::verify(&certificate, &identity_key)
+            .unwrap()
+            .device;
+        assert_eq!(taken.devices, [device], "only the device that made it");
+        self.users.insert(
+            user,
+            User {
+                seed: *seed,
+                identity_key,
+                version: taken.version,
+                devices: taken.devices,
+                list,
+                certificates: BTreeMap::from([(device, certificate)]),
+            },
+        );
+    }
+
     /// `device`'s key packages: all its live ones, which the server keeps.
     pub fn publish(&mut self, device: &mut TestDevice) {
         let reply = ok(&mut device.core, json!({"cmd": "key_packages"}));

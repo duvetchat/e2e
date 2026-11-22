@@ -9,6 +9,7 @@ mod device;
 mod identity;
 mod recover;
 pub mod recovery;
+mod rotate;
 
 pub(crate) use approval::{
     ApprovalAccept, ApprovalCheck, ApprovalConfirm, ApprovalFromQr, ApprovalOffer, ApprovalReceive,
@@ -20,6 +21,7 @@ pub(crate) use contacts::{observe_user, safety_number, verify_user};
 pub(crate) use device::{create_device, key_packages};
 pub(crate) use identity::{create_identity, sign_device_list};
 pub(crate) use recover::{Recover, recover};
+pub(crate) use rotate::{renewed_at, reset_identity, rotate_keys};
 
 use duvet_e2e_rules::DeviceList;
 use openmls::prelude::{BasicCredential, CredentialWithKey, SignatureScheme};
