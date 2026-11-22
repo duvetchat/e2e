@@ -74,7 +74,12 @@ jobs:
       CARGO_TARGET_DIR: /cache/target/validator
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: cargo build --locked --release --target wasm32-wasip1 -p duvet-e2e-rules -p duvet-e2e-validator
+      # The module goes at once to where the Go test reads it, in this run's checkout: other runs
+      # share the target directory.
+      - run: |
+          cargo build --locked --release --target wasm32-wasip1 -p duvet-e2e-rules -p duvet-e2e-validator
+          mkdir -p target/wasm32-wasip1/release
+          cp "$CARGO_TARGET_DIR/wasm32-wasip1/release/duvet_e2e_validator.wasm" target/wasm32-wasip1/release/
       # The module's exports exist on wasm32 alone, where the rust job's clippy doesn't look.
       - run: cargo clippy --locked --target wasm32-wasip1 -p duvet-e2e-validator -- -D warnings
       # The vectors expire with their key packages, so each run writes them anew.
@@ -87,7 +92,6 @@ jobs:
       - name: Run the module under wazero, as the API does
         working-directory: host-tests/go
         env:
-          DUVET_VALIDATOR_WASM: /cache/target/validator/wasm32-wasip1/release/duvet_e2e_validator.wasm
           GOCACHE: /cache/go/build
           GOMODCACHE: /cache/go/mod
           GOFLAGS: -mod=readonly
