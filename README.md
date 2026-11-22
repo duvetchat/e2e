@@ -13,6 +13,7 @@ It has no network of its own. Clients hand it what the server sent, and send wha
 | `duvet-e2e-validator` | The API's commit validator, a `wasm32-wasip1` module the API runs under wazero. |
 | `duvet-e2e-ffi` | The C ABI the desktop's Bun loads. |
 | `duvet-e2e-wasm` | The core's WebAssembly build, for the web's worker. |
+| `duvet_e2e` (`flutter/duvet_e2e/rust`) | The Flutter plugin's crate, for the mobile app: flutter_rust_bridge over the core, built by cargokit. |
 
 ## Building
 
