@@ -39,8 +39,9 @@ pub(crate) struct Entry {
     /// The MLS message.
     #[serde(with = "b64")]
     pub(crate) data: Vec<u8>,
-    /// On the welcome of a conversation from before the cutover: its members as this device knew
-    /// them then, which the group must have.
+    /// On the welcome of a conversation from before the cutover: its owner and members as this
+    /// device's client showed them then, from the client's own record (the API never gives it),
+    /// which the group must have.
     #[serde(default)]
     pub(crate) expected: Option<Expected>,
     /// On the server's proposal to remove a leaf of a user who leaves: their signed statement, for

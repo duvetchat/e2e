@@ -291,26 +291,24 @@ fn concurrent_epoch_zero_converges() {
     );
     assert_eq!(a1.no_group(conversation)["what"], "group");
 
-    // A welcome whose members aren't the ones a device knew from before the cutover is refused.
-    let mut welcome = server.entries(conversation)[1].clone();
-    assert_eq!(welcome["kind"], "welcome");
-    welcome["expected"] = json!({"owner": b, "members": [a, b]});
-    let refused = ok(&mut a2.core, apply(conversation, &[welcome]));
+    // A device holds the welcome to the members its client showed before the cutover: A2's shows
+    // another owner, and A2 refuses it.
+    a1.remember(conversation, Some(a), &[a, b]);
+    a2.remember(conversation, Some(b), &[a, b]);
+    let refused = server.deliver(&mut a2);
     assert_eq!(
-        results(&[refused]),
+        results(&refused),
         [json!([2, "welcome", "rejected", "member_list_mismatch"])]
     );
     assert_eq!(a2.no_group(conversation)["what"], "group");
 
-    // A device that didn't know the conversation before the cutover has no list to hold the
-    // welcome to, and takes it as it comes, though B, not the owner, made the group.
-    let mut welcome = server.entries(conversation)[1].clone();
-    welcome.as_object_mut().unwrap().remove("expected");
-    let taken = ok(&mut b2.core, apply(conversation, &[welcome]));
-    assert_eq!(results(&[taken]), [json!([2, "welcome", "applied", null])]);
+    // A device whose client didn't know the conversation before the cutover has no list to hold
+    // the welcome to, and takes it as it comes, though B, not the owner, made the group.
+    let taken = server.deliver(&mut b2);
+    assert_eq!(results(&taken), [json!([2, "welcome", "applied", null])]);
 
-    // A1 takes the winner's welcome; A2, whose key package that refused welcome used up, rejoins
-    // by external commit. All four end in one group.
+    // A1 takes the winner's welcome, which matches its record; A2, whose key package that refused
+    // welcome used up, rejoins by external commit. All four end in one group.
     server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
     let join = joining(&server, conversation);
     server.commit(&mut a2, conversation, join).unwrap();
@@ -320,6 +318,31 @@ fn concurrent_epoch_zero_converges() {
     assert_eq!(state["owner"], json!(a));
     assert_eq!(members(&state), [a, b]);
     assert_eq!(device_set(&state).len(), 4);
+}
+
+#[test]
+fn legacy_welcome_is_held_to_the_devices_own_record() {
+    let mut server = FakeServer::new();
+    let (a, b, x) = (new_id(), new_id(), new_id());
+    let [mut a1, mut b1, mut x1] = new_devices(&mut server, [a, b, x]);
+    let conversation = new_id();
+    // Before the cutover, B's client showed the conversation with A, its owner, and B. The server
+    // now has X in it too, and A1 makes the group as the server has it.
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b, x], true);
+    b1.remember(conversation, Some(a), &[a, b]);
+    start(&mut server, &mut a1, conversation);
+
+    // B1 holds the welcome to its own record, not the server's: X is a member too many.
+    let refused = server.deliver(&mut b1);
+    assert_eq!(
+        results(&refused),
+        [json!([2, "welcome", "rejected", "member_list_mismatch"])]
+    );
+    assert_eq!(b1.no_group(conversation)["what"], "group");
+
+    // X1, whose client had no record of the conversation, takes the welcome as it comes.
+    let taken = server.deliver(&mut x1);
+    assert_eq!(results(&taken), [json!([2, "welcome", "applied", null])]);
 }
 
 #[test]

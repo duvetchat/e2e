@@ -73,10 +73,19 @@ pub struct TestDevice {
     pub core: Core,
     pub user: Uuid,
     pub id: Uuid,
+    /// The client's own record of conversations from before the cutover, by conversation: the
+    /// owner and members it showed for each, which it hands `apply` as a welcome's `expected`.
+    records: BTreeMap<Uuid, Value>,
     _dir: TempDir,
 }
 
 impl TestDevice {
+    /// The owner and members this device's client showed for `conversation` before the cutover.
+    pub fn remember(&mut self, conversation: Uuid, owner: Option<Uuid>, members: &[Uuid]) {
+        self.records
+            .insert(conversation, json!({"owner": owner, "members": members}));
+    }
+
     /// The `group` command's reply.
     pub fn group(&mut self, conversation: Uuid) -> Value {
         ok(
@@ -149,18 +158,15 @@ pub struct QueueEntry {
     pub data: Vec<u8>,
     /// The leave statement a removal proposal brings.
     pub statement: Option<Vec<u8>>,
-    /// The members a device knew of a conversation from before the cutover: on its epoch 0's welcome.
-    pub expected: Option<Value>,
 }
 
 impl QueueEntry {
+    /// The entry as the API hands it out. It never carries `expected`, which a client adds from
+    /// its own record.
     pub fn json(&self) -> Value {
         let mut entry = json!({"seq": self.seq, "kind": self.kind, "data": b64(&self.data)});
         if let Some(statement) = &self.statement {
             entry["statement"] = json!(b64(statement));
-        }
-        if let Some(expected) = &self.expected {
-            entry["expected"] = expected.clone();
         }
         entry
     }
@@ -196,7 +202,6 @@ impl Chat {
             kind,
             data,
             statement,
-            expected: None,
         });
         seq
     }
@@ -322,6 +327,7 @@ impl FakeServer {
             core,
             user,
             id,
+            records: BTreeMap::new(),
             _dir: dir,
         }
     }
@@ -682,12 +688,6 @@ impl FakeServer {
         }
         if let Some(welcome) = reply["welcome"].as_str() {
             let welcome_seq = chat.push("welcome", STANDARD.decode(welcome).unwrap(), None);
-            if chat.legacy && generation == 0 {
-                chat.queue.last_mut().unwrap().expected = Some(json!({
-                    "owner": chat.owner,
-                    "members": chat.users,
-                }));
-            }
             // A device new to the conversation gets the queue from its welcome on; one that had it
             // (a reset brings everyone in again) goes on in order.
             for added in &change.devices_added {
@@ -766,18 +766,26 @@ impl FakeServer {
     }
 
     /// Hands `device` the entries of each of its conversations it hasn't had yet, through `apply`:
-    /// the replies.
+    /// the replies. As its client does, it adds its own record of a conversation from before the
+    /// cutover to the welcomes of that conversation, as their `expected`.
     pub fn deliver(&mut self, device: &mut TestDevice) -> Vec<Value> {
         let mut replies = Vec::new();
         for (conversation, chat) in &mut self.chats {
             let Some(&next) = chat.cursors.get(&device.id) else {
                 continue;
             };
+            let record = device.records.get(conversation);
             let entries: Vec<Value> = chat
                 .queue
                 .iter()
                 .filter(|entry| entry.seq >= next)
-                .map(QueueEntry::json)
+                .map(|entry| {
+                    let mut json = entry.json();
+                    if let (Some(record), "welcome") = (record, entry.kind) {
+                        json["expected"] = record.clone();
+                    }
+                    json
+                })
                 .collect();
             if entries.is_empty() {
                 continue;
