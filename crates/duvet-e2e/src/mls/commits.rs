@@ -1,0 +1,349 @@
+//! The server's word on this device's commits, the commits a device makes on its own (pending
+//! removals, its leaf's renewal), joining by external commit, and what the group is.
+
+use duvet_e2e_rules::{
+    CommitAad, Kind, MemberList, check_joined_state, group_id, join_config, leaf_capabilities,
+    leaves,
+};
+use openmls::prelude::tls_codec::DeserializeBytes as _;
+use openmls::prelude::{
+    CreationFromExternalError, ExternalCommitBuilderError, LeafNodeParameters, MlsGroup,
+    MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, OpenMlsProvider,
+};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use super::members::Committed;
+use super::{
+    ConversationId, Extra, GroupRow, Pending, REFRESH_AFTER_MS, can_commit, delete_group, digest,
+    draft, load_group, openmls_error, rule_context, stage, storage_error, stored_state, tls,
+    violation,
+};
+use crate::identity::{invalid, not_found, stored_uuid};
+use crate::protocol::b64;
+use crate::{Error, Tx};
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct CommitResult {
+    conversation_id: Uuid,
+    /// Whether the server took the commit; refused, it's a 409 or the validator's refusal.
+    accepted: bool,
+}
+
+#[derive(Serialize)]
+pub(crate) struct Epoch {
+    /// The group's epoch after the server's word; none once the group is gone.
+    epoch: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct JoinExternal {
+    conversation_id: Uuid,
+    generation: u32,
+    /// The group info of the group's latest epoch, as the API serves it.
+    #[serde(with = "b64")]
+    group_info: Vec<u8>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct Due {
+    conversations: Vec<Uuid>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct GroupState {
+    generation: u32,
+    epoch: u64,
+    kind: Kind,
+    owner: Option<Uuid>,
+    members: Vec<Member>,
+    devices: Vec<Device>,
+    /// The epoch's authenticator: the same on every device in the same group at the same epoch.
+    #[serde(with = "b64")]
+    authenticator: Vec<u8>,
+    blocked: bool,
+}
+
+#[derive(Serialize)]
+struct Member {
+    user_id: Uuid,
+    /// When the user entered.
+    generation: u32,
+    epoch: u64,
+}
+
+#[derive(Serialize)]
+struct Device {
+    user_id: Uuid,
+    device_id: Uuid,
+    leaf: u32,
+}
+
+/// The server's word on this device's waiting commit. Taken, it's merged (an external commit, merged
+/// as it was made, stays). Refused, a member's commit is dropped; epoch 0 goes whole with its group,
+/// for the winner's welcome to come through `apply`, and so does a refused external commit.
+pub(crate) fn commit_result(tx: &Tx<'_>, request: CommitResult) -> Result<Epoch, Error> {
+    let conversation = request.conversation_id;
+    let mut row = GroupRow::read(tx, conversation)?.ok_or_else(|| not_found("group"))?;
+    let pending = row.pending.take().ok_or_else(|| not_found("commit"))?;
+    let generation = match pending {
+        Pending::Reset => row
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| Error::Internal("the conversation's generations ran out".into()))?,
+        Pending::Create | Pending::Commit | Pending::External => row.generation,
+    };
+    let provider = tx.provider();
+    let mut group = MlsGroup::load(provider.storage(), &group_id(conversation, generation))
+        .map_err(storage_error)?
+        .ok_or_else(|| Error::Internal("the waiting commit's group isn't stored".into()))?;
+
+    if !request.accepted {
+        row.echo = None;
+        if pending == Pending::Commit {
+            group
+                .clear_pending_commit(provider.storage())
+                .map_err(storage_error)?;
+            row.write(tx)?;
+            return Ok(Epoch {
+                epoch: Some(group.epoch().as_u64()),
+            });
+        }
+        group.delete(provider.storage()).map_err(storage_error)?;
+        if pending == Pending::Create {
+            GroupRow::delete(tx, conversation)?;
+        } else {
+            row.write(tx)?;
+        }
+        return Ok(Epoch { epoch: None });
+    }
+
+    if pending != Pending::External {
+        group
+            .merge_pending_commit(provider)
+            .map_err(openmls_error)?;
+    }
+    if pending == Pending::Reset {
+        delete_group(tx, conversation, row.generation)?;
+        row.generation = generation;
+        row.blocked = false;
+    }
+    row.members = MemberList::from_group_context(group.public_group().group_context())
+        .map_err(|_| stored_state())?;
+    row.statements.clear();
+    // Every commit of this device's renews its leaf.
+    row.leaf_updated_at = tx.now();
+    row.write(tx)?;
+    Ok(Epoch {
+        epoch: Some(group.epoch().as_u64()),
+    })
+}
+
+/// Commits the removals the server proposed, with the leave statements that came with them: what
+/// `encrypt` asks for first when it answers `pending_proposals`. Nothing pending is `not_found`
+/// (`proposals`).
+pub(crate) fn commit_pending(tx: &Tx<'_>, request: ConversationId) -> Result<Committed, Error> {
+    let (group, row) = load_group(tx, request.conversation_id)?;
+    can_commit(&group, &row)?;
+    if !group.has_pending_proposals() {
+        return Err(not_found("proposals"));
+    }
+    own_commit(tx, group, row)
+}
+
+/// Renews this device's leaf with a commit that has a path, with whatever is pending.
+pub(crate) fn refresh(tx: &Tx<'_>, request: ConversationId) -> Result<Committed, Error> {
+    let (group, row) = load_group(tx, request.conversation_id)?;
+    can_commit(&group, &row)?;
+    own_commit(tx, group, row)
+}
+
+fn own_commit(tx: &Tx<'_>, mut group: MlsGroup, mut row: GroupRow) -> Result<Committed, Error> {
+    let own = tx.own_device()?;
+    let draft = draft(tx, &group, &row, Vec::new(), &[], &[])?;
+    let staged = stage(tx, &mut group, &own, draft, Extra::default())?;
+    row.staged(Pending::Commit, &staged);
+    row.write(tx)?;
+    Ok(Committed {
+        commit: staged.commit,
+        group_info: staged.group_info,
+    })
+}
+
+/// The conversations whose group this device's leaf is due to renew in (`refresh`): 7 days after
+/// it was last new, by the core's clock, where the device can commit.
+pub(crate) fn refresh_due(tx: &Tx<'_>) -> Result<Due, Error> {
+    let before = tx.now().saturating_sub(REFRESH_AFTER_MS);
+    let mut candidates = Vec::new();
+    for conversation in tx
+        .conn()
+        .prepare(
+            "SELECT conversation_id FROM groups WHERE pending IS NULL AND blocked = 0 \
+             AND leaf_updated_at <= ?1 ORDER BY leaf_updated_at, conversation_id",
+        )?
+        .query_map([before], |row| row.get::<_, Vec<u8>>(0))?
+    {
+        candidates.push(stored_uuid(&conversation?)?);
+    }
+    let mut conversations = Vec::new();
+    for conversation in candidates {
+        match load_group(tx, conversation) {
+            Ok((group, row)) => {
+                if can_commit(&group, &row).is_ok() {
+                    conversations.push(conversation);
+                }
+            }
+            // Not in the group any more: nothing to renew.
+            Err(Error::NotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(Due { conversations })
+}
+
+/// Joins the conversation's group at `generation` with an external commit on the group info the
+/// API serves: a device on its user's list whose user is a member, coming back after it was
+/// removed or its state fell behind, or new to the group. Whatever this device had of the group
+/// goes, and the queue counts again from this commit. The group it enters is held to the rules
+/// first, as a welcome's is. Merged as it's made, it waits for `commit_result` all the same.
+pub(crate) fn join_external(tx: &Tx<'_>, request: JoinExternal) -> Result<Committed, Error> {
+    let conversation = request.conversation_id;
+    let own = tx.own_device()?;
+    let credential = own.credential()?;
+    let info = match MlsMessageIn::tls_deserialize_exact_bytes(&request.group_info)
+        .map(MlsMessageIn::extract)
+    {
+        Ok(MlsMessageBodyIn::GroupInfo(info)) => info,
+        _ => {
+            return Err(invalid(
+                "group_info",
+                "the group info isn't an MLS group info",
+            ));
+        }
+    };
+    if info.group_id() != &group_id(conversation, request.generation) {
+        return Err(invalid(
+            "group_info",
+            "the group info is another conversation's or generation's",
+        ));
+    }
+    let row = GroupRow::read(tx, conversation)?;
+    if let Some(row) = &row {
+        if row.pending.is_some() {
+            return Err(Error::PendingCommit);
+        }
+        if row.generation > request.generation {
+            return Err(invalid(
+                "generation",
+                "the conversation is at a later generation",
+            ));
+        }
+        if row.blocked && row.generation == request.generation {
+            return Err(Error::RuleViolation {
+                rule: super::GROUP_BLOCKED.into(),
+            });
+        }
+    }
+    // This device must be on its user's list as it knows it, as every member checks.
+    let listed = tx
+        .device_list_of(own.user)?
+        .is_some_and(|list| list.contains(own.device));
+    if !listed {
+        return Err(violation(duvet_e2e_rules::RuleViolation::DeviceNotListed));
+    }
+
+    if let Some(row) = &row {
+        delete_group(tx, conversation, row.generation)?;
+    }
+    delete_group(tx, conversation, request.generation)?;
+    let provider = tx.provider();
+    let (group, bundle) = MlsGroup::external_commit_builder()
+        .with_config(join_config())
+        .with_aad(CommitAad::new(Vec::new()).encode())
+        // A leaf a device that never came back left in the tree must not keep anyone out.
+        .skip_lifetime_validation()
+        .build_group(provider, info, credential)
+        .map_err(|error| match error {
+            ExternalCommitBuilderError::PublicGroupError(
+                CreationFromExternalError::InvalidGroupInfoSignature,
+            ) => Error::InvalidSignature {
+                what: "group_info".into(),
+            },
+            ExternalCommitBuilderError::PublicGroupError(
+                CreationFromExternalError::WriteToStorageError(error),
+            )
+            | ExternalCommitBuilderError::StorageError(error) => storage_error(error),
+            _ => invalid("group_info", "the group info doesn't make a group"),
+        })?
+        .leaf_node_parameters(
+            LeafNodeParameters::builder()
+                .with_capabilities(leaf_capabilities())
+                .build(),
+        )
+        .load_psks(provider.storage())
+        .map_err(openmls_error)?
+        .build(provider.rand(), provider.crypto(), &own.signer, |_| true)
+        .map_err(openmls_error)?
+        .finalize(provider)
+        .map_err(openmls_error)?;
+
+    // The group this device enters, as a welcome's: every leaf certified by its user's pinned
+    // identity, its user a member, this device's own among them.
+    let context = group.public_group().group_context();
+    let leaves = leaves(group.members()).map_err(violation)?;
+    let ctx = rule_context(tx, leaves.values().map(|leaf| leaf.user))?;
+    check_joined_state(&ctx, context, &leaves).map_err(violation)?;
+
+    let commit = tls(bundle.commit())?;
+    let group_info = bundle
+        .group_info()
+        .ok_or_else(|| Error::Internal("the commit came without its group info".into()))?;
+    let group_info = tls(&MlsMessageOut::from(group_info.clone()))?;
+    GroupRow {
+        conversation,
+        generation: request.generation,
+        last_seq: None,
+        members: MemberList::from_group_context(context).map_err(|_| stored_state())?,
+        blocked: false,
+        leaf_updated_at: tx.now(),
+        pending: Some(Pending::External),
+        echo: Some(digest(&commit)),
+        statements: Vec::new(),
+    }
+    .write(tx)?;
+    Ok(Committed { commit, group_info })
+}
+
+/// The group as this device has it.
+pub(crate) fn group(tx: &Tx<'_>, request: ConversationId) -> Result<GroupState, Error> {
+    let (group, row) = load_group(tx, request.conversation_id)?;
+    let list = MemberList::from_group_context(group.public_group().group_context())
+        .map_err(|_| stored_state())?;
+    let devices = leaves(group.members())
+        .map_err(|_| stored_state())?
+        .into_iter()
+        .map(|(leaf, device)| Device {
+            user_id: device.user,
+            device_id: device.device,
+            leaf,
+        })
+        .collect();
+    Ok(GroupState {
+        generation: row.generation,
+        epoch: group.epoch().as_u64(),
+        kind: list.kind,
+        owner: list.owner,
+        members: list
+            .users
+            .iter()
+            .map(|entry| Member {
+                user_id: entry.user,
+                generation: entry.generation,
+                epoch: entry.epoch,
+            })
+            .collect(),
+        devices,
+        authenticator: group.epoch_authenticator().as_slice().to_vec(),
+        blocked: row.blocked,
+    })
+}

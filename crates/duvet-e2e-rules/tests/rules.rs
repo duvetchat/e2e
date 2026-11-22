@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use duvet_e2e_rules::{
     CommitAad, DeviceCertificate, DeviceList, Entry, Kind, LeaveStatement, MEMBER_LIST_EXTENSION,
     MemberList, MembershipChange, Removed, RuleContext, RuleViolation, SUITE, check_change,
-    check_state, extract_change, group_config, group_id, join_config, leaf_capabilities, leaves,
+    check_joined_state, check_state, extract_change, group_config, group_id, join_config,
+    leaf_capabilities, leaves,
 };
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
@@ -1060,6 +1061,63 @@ fn starting_leaves_are_members_listed_devices() {
         state,
         Err(RuleViolation::DeviceNotListed),
         "an unlisted creator"
+    );
+}
+
+#[test]
+fn joined_state_takes_unlisted_devices_not_other_identities() {
+    // O adds A and B; A joins by the welcome.
+    let world = World::new(&[1, 1, 1]);
+    let members = MemberList::new(
+        Kind::Group,
+        Some(world.id(O)),
+        vec![world.entry(O, 0), world.entry(A, 0), world.entry(B, 0)],
+    );
+    let (_, bundle) = world.first_commit((O, 0), &members, &[(A, 0), (B, 0)]);
+    let joined = world.welcomed((A, 0), &bundle);
+    let leaves = leaves(joined.members()).unwrap();
+    let context = joined.group_context();
+    assert_eq!(
+        check_joined_state(&world.context(), context, &leaves),
+        Ok(())
+    );
+
+    // B's latest list, as A has it, no longer has the device B is in the group with: its removal
+    // is on its way, as it is for the members.
+    let b = world.id(B);
+    let mut ctx = world.context();
+    let without = DeviceList::new(b, public(&world.users[B].identity), 2, vec![]);
+    ctx.device_lists.insert(b, without);
+    assert_eq!(
+        check_state(&ctx, context, &leaves),
+        Err(RuleViolation::DeviceNotListed)
+    );
+    assert_eq!(
+        check_joined_state(&ctx, context, &leaves),
+        Ok(()),
+        "a device on its way out"
+    );
+
+    // A pinned another identity for B than the one that certified B's leaf.
+    let mut ctx = world.context();
+    ctx.identities.insert(b, public(&signer()));
+    assert_eq!(
+        check_joined_state(&ctx, context, &leaves),
+        Err(RuleViolation::LeafNotSigned),
+        "another identity"
+    );
+
+    // And the rest of check_state holds: the list it must be.
+    let mut ctx = world.context();
+    ctx.expected_initial = Some(MemberList::new(
+        Kind::Group,
+        Some(world.id(O)),
+        vec![world.entry(O, 0), world.entry(A, 0)],
+    ));
+    assert_eq!(
+        check_joined_state(&ctx, context, &leaves),
+        Err(RuleViolation::MemberListMismatch),
+        "another list"
     );
 }
 

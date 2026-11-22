@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{Error, KeyStorage, PROTOCOL, Tx, identity, parts};
+use crate::{Error, KeyStorage, PROTOCOL, Tx, identity, mls, parts};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -44,6 +44,20 @@ pub(crate) enum Command {
     AttachmentKey,
     AttachmentEncrypt(parts::AttachmentPart),
     AttachmentDecrypt(parts::AttachmentPart),
+
+    // Conversations' groups.
+    CreateGroup(mls::CreateGroup),
+    CommitResult(mls::CommitResult),
+    AddMembers(mls::AddMembers),
+    RemoveMembers(mls::RemoveMembers),
+    Leave(mls::ConversationId),
+    CommitPending(mls::ConversationId),
+    RefreshDue,
+    Refresh(mls::ConversationId),
+    JoinExternal(mls::JoinExternal),
+    ResetGroup(mls::ResetGroup),
+    Group(mls::ConversationId),
+    Apply(mls::ApplyRequest),
 }
 
 pub(crate) fn parse(command: &str) -> Result<Command, Error> {
@@ -80,6 +94,19 @@ pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error
         Command::AttachmentKey => reply(parts::attachment_key(tx)?),
         Command::AttachmentEncrypt(part) => reply(parts::attachment_encrypt(part)?),
         Command::AttachmentDecrypt(part) => reply(parts::attachment_decrypt(part)?),
+
+        Command::CreateGroup(request) => reply(mls::create_group(tx, request)?),
+        Command::CommitResult(request) => reply(mls::commit_result(tx, request)?),
+        Command::AddMembers(request) => reply(mls::add_members(tx, request)?),
+        Command::RemoveMembers(request) => reply(mls::remove_members(tx, request)?),
+        Command::Leave(request) => reply(mls::leave(tx, request)?),
+        Command::CommitPending(request) => reply(mls::commit_pending(tx, request)?),
+        Command::RefreshDue => reply(mls::refresh_due(tx)?),
+        Command::Refresh(request) => reply(mls::refresh(tx, request)?),
+        Command::JoinExternal(request) => reply(mls::join_external(tx, request)?),
+        Command::ResetGroup(request) => reply(mls::reset_group(tx, request)?),
+        Command::Group(request) => reply(mls::group(tx, request)?),
+        Command::Apply(request) => reply(mls::apply(tx, request)?),
     }
 }
 
@@ -135,12 +162,17 @@ fn cmd_status(tx: &mut Tx<'_>) -> Result<Status, Error> {
 /// Binary fields in the JSON protocol: standard base64 with its padding. Use with
 /// `#[serde(with = "b64")]` on a `Vec<u8>`, `b64::option` on an `Option<Vec<u8>>`,
 /// `b64::list` on a `Vec<Vec<u8>>` a command takes, or `b64::secret` on a key it takes, a
-/// `Zeroizing<Vec<u8>>`.
+/// `Zeroizing<Vec<u8>>`. [`b64::Bytes`] is one binary value inside a list or map a command takes.
 pub(crate) mod b64 {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use serde::de::Error as _;
     use serde::{Deserialize, Deserializer, Serializer};
+
+    /// A binary value a command takes inside a list or a map.
+    #[derive(Debug, Deserialize)]
+    #[serde(transparent)]
+    pub(crate) struct Bytes(#[serde(deserialize_with = "deserialize")] pub(crate) Vec<u8>);
 
     pub(crate) fn serialize<S: Serializer>(
         bytes: impl AsRef<[u8]>,

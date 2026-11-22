@@ -1,0 +1,869 @@
+//! A fake of the API for the core's tests: each conversation's queue in order, the compare-and-set
+//! of its generation and epoch, the key packages devices publish, each device's inbox, and the API's
+//! commit validator on every commit, as the API runs it. Devices are cores, each in a database of
+//! its own, driven by JSON as a client drives them.
+
+// Each test file uses its share of these.
+#![allow(dead_code)]
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use duvet_e2e::{Clock, Core, Error, FakeClock, OpenConfig, Tx, recovery};
+use duvet_e2e_rules::{
+    DeviceCertificate, DeviceList, Kind, SUITE, group_id_parts, leaf_capabilities,
+};
+use duvet_e2e_validator::{Members, Op, Request, Response, validate_bytes};
+use ed25519_dalek::SigningKey;
+use openmls::prelude::tls_codec::DeserializeBytes as _;
+use openmls::prelude::{
+    BasicCredential, CredentialWithKey, KeyPackage, Lifetime, MlsMessageBodyIn, MlsMessageIn,
+    OpenMlsProvider, OpenMlsRand, SignatureScheme,
+};
+use openmls_basic_credential::SignatureKeyPair;
+use openmls_rust_crypto::OpenMlsRustCrypto;
+use serde_bytes::ByteBuf;
+use serde_json::{Value, json};
+use tempfile::TempDir;
+use uuid::Uuid;
+
+pub const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+pub fn new_id() -> Uuid {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    Uuid::from_u64_pair(0x0193_0000_0000_7000, NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+pub fn b64(bytes: &[u8]) -> String {
+    STANDARD.encode(bytes)
+}
+
+pub fn bytes(value: &Value) -> Vec<u8> {
+    STANDARD
+        .decode(value.as_str().expect("base64 text"))
+        .expect("padded base64")
+}
+
+pub fn run(core: &mut Core, command: &Value) -> Value {
+    serde_json::from_str(&core.handle(&command.to_string())).expect("a JSON reply")
+}
+
+/// The reply of a command that must succeed.
+pub fn ok(core: &mut Core, command: Value) -> Value {
+    let reply = run(core, &command);
+    reply
+        .get("ok")
+        .cloned()
+        .unwrap_or_else(|| panic!("{} failed: {reply}", command["cmd"]))
+}
+
+/// The error of a command that must fail.
+pub fn error(core: &mut Core, command: Value) -> Value {
+    let reply = run(core, &command);
+    reply
+        .get("error")
+        .cloned()
+        .unwrap_or_else(|| panic!("{} didn't fail: {reply}", command["cmd"]))
+}
+
+/// A device: a core in a database of its own, on the server's clock.
+pub struct TestDevice {
+    pub core: Core,
+    pub user: Uuid,
+    pub id: Uuid,
+    _dir: TempDir,
+}
+
+impl TestDevice {
+    /// The `group` command's reply.
+    pub fn group(&mut self, conversation: Uuid) -> Value {
+        ok(
+            &mut self.core,
+            json!({"cmd": "group", "conversation_id": conversation}),
+        )
+    }
+
+    /// The `group` command's error.
+    pub fn no_group(&mut self, conversation: Uuid) -> Value {
+        error(
+            &mut self.core,
+            json!({"cmd": "group", "conversation_id": conversation}),
+        )
+    }
+
+    /// Runs `f` in a transaction of this device's database that is then rolled back: what it
+    /// makes, the database doesn't keep.
+    pub fn rolled_back<T>(&mut self, f: impl FnOnce(&mut Tx<'_>) -> Result<T, Error>) -> T {
+        let mut made = None;
+        let refused = self.core.transaction(|tx| {
+            made = Some(f(tx));
+            Err::<(), _>(Error::Internal("rolled back".into()))
+        });
+        assert!(refused.is_err());
+        made.expect("the closure ran").expect("it worked")
+    }
+}
+
+/// A user as the server and the test know them: the test holds their identity's secret, to sign
+/// the certificates and lists of the devices it adds to them.
+struct User {
+    seed: [u8; 32],
+    identity_key: [u8; 32],
+    version: u64,
+    devices: Vec<Uuid>,
+    list: Vec<u8>,
+    certificates: BTreeMap<Uuid, Vec<u8>>,
+}
+
+impl User {
+    fn identity(&self) -> SignatureKeyPair {
+        SignatureKeyPair::from_raw(
+            SignatureScheme::ED25519,
+            self.seed.to_vec(),
+            self.identity_key.to_vec(),
+        )
+    }
+}
+
+/// A device with no core of its own: the test makes its key packages, whatever their lifetime.
+struct Virtual {
+    user: Uuid,
+    signer: SignatureKeyPair,
+    certificate: Vec<u8>,
+    provider: OpenMlsRustCrypto,
+}
+
+/// A key package a device published.
+struct Published {
+    data: String,
+    last_resort: bool,
+}
+
+/// An entry of a conversation's queue.
+#[derive(Clone, Debug)]
+pub struct QueueEntry {
+    pub seq: u64,
+    pub kind: &'static str,
+    pub data: Vec<u8>,
+    /// The leave statement a removal proposal brings.
+    pub statement: Option<Vec<u8>>,
+    /// The members a device knew of a conversation from before the cutover: on its epoch 0's welcome.
+    pub expected: Option<Value>,
+}
+
+impl QueueEntry {
+    pub fn json(&self) -> Value {
+        let mut entry = json!({"seq": self.seq, "kind": self.kind, "data": b64(&self.data)});
+        if let Some(statement) = &self.statement {
+            entry["statement"] = json!(b64(statement));
+        }
+        if let Some(expected) = &self.expected {
+            entry["expected"] = expected.clone();
+        }
+        entry
+    }
+}
+
+/// A conversation as the API keeps it.
+pub struct Chat {
+    pub kind: Kind,
+    pub owner: Option<Uuid>,
+    pub users: Vec<Uuid>,
+    /// From before the cutover: any member may make its epoch 0.
+    pub legacy: bool,
+    pub generation: Option<u32>,
+    pub epoch: u64,
+    state: Option<ByteBuf>,
+    /// The group info of the latest epoch, for external commits.
+    pub group_info: Option<Vec<u8>>,
+    pub queue: Vec<QueueEntry>,
+    /// The next entry each device gets.
+    cursors: BTreeMap<Uuid, u64>,
+    /// Each device's leaf.
+    leaves: BTreeMap<Uuid, u32>,
+    /// The devices whose removal the server proposes in every epoch until they're out, with the
+    /// statement of their user's leaving.
+    removals: BTreeMap<Uuid, Option<Vec<u8>>>,
+}
+
+impl Chat {
+    fn push(&mut self, kind: &'static str, data: Vec<u8>, statement: Option<Vec<u8>>) -> u64 {
+        let seq = self.queue.len() as u64 + 1;
+        self.queue.push(QueueEntry {
+            seq,
+            kind,
+            data,
+            statement,
+            expected: None,
+        });
+        seq
+    }
+}
+
+/// Why the server didn't take a commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// Another commit took the epoch first: HTTP 409.
+    Conflict,
+    /// The validator's code.
+    Invalid(String),
+}
+
+pub struct FakeServer {
+    pub clock: FakeClock,
+    api: SigningKey,
+    users: BTreeMap<Uuid, User>,
+    virtuals: BTreeMap<Uuid, Virtual>,
+    key_packages: BTreeMap<Uuid, Vec<Published>>,
+    handed_out: BTreeSet<String>,
+    pub chats: BTreeMap<Uuid, Chat>,
+    inboxes: BTreeMap<Uuid, Vec<Vec<u8>>>,
+}
+
+impl Default for FakeServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FakeServer {
+    pub fn new() -> FakeServer {
+        let seed: [u8; 32] = OpenMlsRustCrypto::default().rand().random_array().unwrap();
+        FakeServer {
+            clock: FakeClock::now(),
+            api: SigningKey::from_bytes(&seed),
+            users: BTreeMap::new(),
+            virtuals: BTreeMap::new(),
+            key_packages: BTreeMap::new(),
+            handed_out: BTreeSet::new(),
+            chats: BTreeMap::new(),
+            inboxes: BTreeMap::new(),
+        }
+    }
+
+    /// The API's public key, every group's external sender, as `create_group` takes it.
+    pub fn external_sender(&self) -> String {
+        b64(self.api.verifying_key().as_bytes())
+    }
+
+    /// A new device of `user`. The user's first device makes their identity; the next ones get
+    /// it as a recovered device would (the test signs their certificates and the list with them).
+    pub fn device(&mut self, user: Uuid) -> TestDevice {
+        let dir = tempfile::tempdir().unwrap();
+        let mut core = Core::open(OpenConfig {
+            clock: Box::new(self.clock.clone()),
+            ..OpenConfig::new(dir.path().join("core.db"), [1; 32])
+        })
+        .unwrap();
+        let id = new_id();
+        let created = ok(
+            &mut core,
+            json!({"cmd": "create_device", "user_id": user, "device_id": id}),
+        );
+        if let Some(record) = self.users.get_mut(&user) {
+            let certificate = DeviceCertificate::new(
+                user,
+                id,
+                bytes(&created["signature_key"]).try_into().unwrap(),
+                bytes(&created["hpke_key"]).try_into().unwrap(),
+                self.clock.now_ms() as u64,
+            )
+            .sign(&record.identity())
+            .unwrap();
+            add_to_list(record, id, certificate.clone());
+            let (identity_key, seed, list) =
+                (record.identity_key, record.seed, record.list.clone());
+            core.transaction(|tx| {
+                tx.conn()
+                    .execute("UPDATE device SET certificate = ?1", [&certificate])?;
+                for (key, value) in [
+                    ("identity_key", identity_key.as_slice()),
+                    ("identity_secret", seed.as_slice()),
+                    ("device_list", list.as_slice()),
+                ] {
+                    tx.conn().execute(
+                        "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+                        rusqlite::params![key, value],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        } else {
+            let identity = ok(&mut core, json!({"cmd": "create_identity"}));
+            let recovery_key = recovery::parse(identity["recovery_key"].as_str().unwrap()).unwrap();
+            let backup_key = recovery::unwrap_backup_key(
+                &recovery_key,
+                user,
+                &bytes(&identity["wrapped_backup_key"]),
+            )
+            .unwrap();
+            let seed = recovery::decrypt_identity(
+                &backup_key,
+                user,
+                &bytes(&identity["encrypted_identity"]),
+            )
+            .unwrap();
+            self.users.insert(
+                user,
+                User {
+                    seed: *seed,
+                    identity_key: bytes(&identity["identity_key"]).try_into().unwrap(),
+                    version: 1,
+                    devices: vec![id],
+                    list: bytes(&identity["device_list"]),
+                    certificates: BTreeMap::from([(id, bytes(&identity["certificate"]))]),
+                },
+            );
+        }
+        TestDevice {
+            core,
+            user,
+            id,
+            _dir: dir,
+        }
+    }
+
+    /// A device of `user` with no core, on their list, whose key packages the test makes.
+    pub fn virtual_device(&mut self, user: Uuid) -> Uuid {
+        let id = new_id();
+        let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        let record = self.users.get_mut(&user).expect("a user with an identity");
+        let certificate = DeviceCertificate::new(
+            user,
+            id,
+            signer.public().try_into().unwrap(),
+            [9; 32],
+            self.clock.now_ms() as u64,
+        )
+        .sign(&record.identity())
+        .unwrap();
+        add_to_list(record, id, certificate.clone());
+        self.virtuals.insert(
+            id,
+            Virtual {
+                user,
+                signer,
+                certificate,
+                provider: OpenMlsRustCrypto::default(),
+            },
+        );
+        id
+    }
+
+    /// A key package of a virtual device that lasts `seconds` from now, in base64.
+    pub fn virtual_key_package(&self, device: Uuid, seconds: u64) -> String {
+        let device = &self.virtuals[&device];
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let credential = CredentialWithKey {
+            credential: BasicCredential::new(device.certificate.clone()).into(),
+            signature_key: device.signer.public().into(),
+        };
+        let key_package: KeyPackage = KeyPackage::builder()
+            .key_package_lifetime(Lifetime::init(now - 60, now + seconds))
+            .leaf_node_capabilities(leaf_capabilities())
+            .build(SUITE, &device.provider, &device.signer, credential)
+            .unwrap()
+            .key_package()
+            .clone();
+        b64(&openmls::prelude::tls_codec::Serialize::tls_serialize_detached(&key_package).unwrap())
+    }
+
+    /// `user`'s identity, latest list and the certificates of its devices, as `observe_user` takes them.
+    pub fn observed(&self, user: Uuid) -> Value {
+        let record = &self.users[&user];
+        let certificates: Vec<String> = record
+            .devices
+            .iter()
+            .map(|device| b64(&record.certificates[device]))
+            .collect();
+        json!({
+            "cmd": "observe_user",
+            "user_id": user,
+            "identity_key": b64(&record.identity_key),
+            "device_list": b64(&record.list),
+            "certificates": certificates,
+        })
+    }
+
+    /// `device` observes every user the server knows, its own included: their identities and
+    /// latest lists.
+    pub fn introduce(&self, device: &mut TestDevice) {
+        for user in self.users.keys() {
+            let observed = ok(&mut device.core, self.observed(*user));
+            assert_ne!(observed["state"], "rejected", "{observed}");
+        }
+    }
+
+    /// The device list a device of `user` signed (`sign_device_list`), which the server takes.
+    pub fn take_list(&mut self, user: Uuid, list: &Value) {
+        let record = self.users.get_mut(&user).unwrap();
+        let signed = bytes(list);
+        let taken = DeviceList::verify(&signed, &record.identity_key).unwrap();
+        record.version = taken.version;
+        record.devices = taken.devices.clone();
+        record.list = signed;
+    }
+
+    /// `device`'s key packages: all its live ones, which the server keeps.
+    pub fn publish(&mut self, device: &mut TestDevice) {
+        let reply = ok(&mut device.core, json!({"cmd": "key_packages"}));
+        let published = reply["key_packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|kp| Published {
+                data: kp["data"].as_str().unwrap().to_string(),
+                last_resort: kp["last_resort"].as_bool().unwrap(),
+            })
+            .collect();
+        self.key_packages.insert(device.id, published);
+    }
+
+    /// A key package for each device of each of `users` that published some, as `create_group`
+    /// and `reset_group` take them: a single-use one never handed out before, else the last resort.
+    pub fn claim(&mut self, users: &[Uuid]) -> Value {
+        let mut claimed = serde_json::Map::new();
+        for user in users {
+            let mut theirs = Vec::new();
+            for device in &self.users[user].devices {
+                let Some(published) = self.key_packages.get(device) else {
+                    continue;
+                };
+                let single = published
+                    .iter()
+                    .find(|kp| !kp.last_resort && !self.handed_out.contains(&kp.data));
+                let chosen = single.or_else(|| published.iter().find(|kp| kp.last_resort));
+                if let Some(kp) = chosen {
+                    self.handed_out.insert(kp.data.clone());
+                    theirs.push(json!(kp.data));
+                }
+            }
+            claimed.insert(user.to_string(), Value::Array(theirs));
+        }
+        Value::Object(claimed)
+    }
+
+    /// A conversation the API has: its kind, owner and members.
+    pub fn conversation(
+        &mut self,
+        id: Uuid,
+        kind: Kind,
+        owner: Option<Uuid>,
+        users: &[Uuid],
+        legacy: bool,
+    ) {
+        self.chats.insert(
+            id,
+            Chat {
+                kind,
+                owner,
+                users: users.to_vec(),
+                legacy,
+                generation: None,
+                epoch: 0,
+                state: None,
+                group_info: None,
+                queue: Vec::new(),
+                cursors: BTreeMap::new(),
+                leaves: BTreeMap::new(),
+                removals: BTreeMap::new(),
+            },
+        );
+    }
+
+    /// `create_group` for `conversation`, as the API has it, with a key package for each device.
+    pub fn create_group(&mut self, conversation: Uuid) -> Value {
+        let chat = &self.chats[&conversation];
+        let (kind, owner, users, legacy) = (chat.kind, chat.owner, chat.users.clone(), chat.legacy);
+        json!({
+            "cmd": "create_group",
+            "conversation_id": conversation,
+            "kind": kind,
+            "owner": owner,
+            "members": users,
+            "key_packages": self.claim(&users),
+            "external_sender": self.external_sender(),
+            "legacy": legacy,
+        })
+    }
+
+    /// The group info of `conversation`'s latest epoch, in base64, for `join_external`.
+    pub fn group_info(&self, conversation: Uuid) -> String {
+        b64(self.chats[&conversation].group_info.as_ref().unwrap())
+    }
+
+    /// Every entry of `conversation`'s queue, in JSON.
+    pub fn entries(&self, conversation: Uuid) -> Vec<Value> {
+        self.chats[&conversation]
+            .queue
+            .iter()
+            .map(QueueEntry::json)
+            .collect()
+    }
+
+    /// Runs `command` on `device` and hands the commit it makes to the server: `Ok` once the server
+    /// took it, with the command's reply.
+    pub fn commit(
+        &mut self,
+        device: &mut TestDevice,
+        conversation: Uuid,
+        command: Value,
+    ) -> Result<Value, Refusal> {
+        let reply = ok(&mut device.core, command);
+        self.submit(device, conversation, &reply)?;
+        Ok(reply)
+    }
+
+    /// The server's side of a commit `device` made (`reply`, the command's): the compare-and-set
+    /// of the generation and epoch, then the validator. The device hears the answer through
+    /// `commit_result`.
+    pub fn submit(
+        &mut self,
+        device: &mut TestDevice,
+        conversation: Uuid,
+        reply: &Value,
+    ) -> Result<(), Refusal> {
+        let taken = self.take(device, conversation, reply);
+        let result = ok(
+            &mut device.core,
+            json!({"cmd": "commit_result", "conversation_id": conversation, "accepted": taken.is_ok()}),
+        );
+        if taken.is_ok() {
+            assert_eq!(
+                result["epoch"],
+                json!(self.chats[&conversation].epoch),
+                "the device's epoch is the server's"
+            );
+        }
+        taken
+    }
+
+    /// The validator's word on a commit, without keeping it.
+    pub fn check(&self, conversation: Uuid, commit: &[u8], group_info: &[u8]) -> Response {
+        let chat = &self.chats[&conversation];
+        let request = Request {
+            state: chat.state.clone(),
+            message: Some(ByteBuf::from(commit.to_vec())),
+            new_group_info: Some(ByteBuf::from(group_info.to_vec())),
+            identities: self.identities(),
+            device_lists: self.device_lists(),
+            ..Request::new(Op::Commit, conversation, chat.generation.unwrap())
+        };
+        validate(&request)
+    }
+
+    fn take(
+        &mut self,
+        device: &mut TestDevice,
+        conversation: Uuid,
+        reply: &Value,
+    ) -> Result<(), Refusal> {
+        let commit = bytes(&reply["commit"]);
+        let new_group_info = bytes(&reply["group_info"]);
+        let message = MlsMessageIn::tls_deserialize_exact_bytes(&commit)
+            .unwrap()
+            .try_into_protocol_message()
+            .unwrap();
+        let (_, generation) = group_id_parts(message.group_id()).unwrap();
+        let epoch = message.epoch().as_u64();
+        let identities = self.identities();
+        let device_lists = self.device_lists();
+        let api_key = ByteBuf::from(self.api.verifying_key().as_bytes().to_vec());
+        let chat = self.chats.get_mut(&conversation).unwrap();
+        let create = reply.get("initial_group_info").is_some();
+        let request = if create {
+            if generation != chat.generation.map_or(0, |current| current + 1) {
+                return Err(Refusal::Conflict);
+            }
+            Request {
+                group_info: Some(ByteBuf::from(bytes(&reply["initial_group_info"]))),
+                message: Some(ByteBuf::from(commit.clone())),
+                new_group_info: Some(ByteBuf::from(new_group_info.clone())),
+                members: Some(Members {
+                    kind: chat.kind,
+                    owner: chat.owner,
+                    users: chat.users.clone(),
+                }),
+                identities,
+                device_lists,
+                external_sender: Some(api_key),
+                legacy: chat.legacy && generation == 0,
+                ..Request::new(Op::Create, conversation, generation)
+            }
+        } else {
+            if Some(generation) != chat.generation || epoch != chat.epoch {
+                return Err(Refusal::Conflict);
+            }
+            Request {
+                state: chat.state.clone(),
+                message: Some(ByteBuf::from(commit.clone())),
+                new_group_info: Some(ByteBuf::from(new_group_info.clone())),
+                identities,
+                device_lists,
+                ..Request::new(Op::Commit, conversation, generation)
+            }
+        };
+        let response = validate(&request);
+        if !response.ok {
+            return Err(Refusal::Invalid(response.error.unwrap().code));
+        }
+        let change = response.change.unwrap();
+        chat.state = response.state;
+        chat.epoch = response.epoch.unwrap();
+        chat.generation = Some(generation);
+        chat.group_info = Some(new_group_info);
+        // A create's change is from an empty group: everyone entered.
+        if create {
+            chat.users.clear();
+            chat.leaves.clear();
+        }
+        chat.users
+            .retain(|user| !change.users_removed.contains(user));
+        chat.users.extend(change.users_added.iter().copied());
+        chat.owner = change.owner;
+        for removed in &change.devices_removed {
+            chat.leaves.remove(&removed.device);
+        }
+        for added in &change.devices_added {
+            chat.leaves.insert(added.device, added.leaf);
+        }
+        let seq = chat.push("commit", commit, None);
+        // The committer gets the queue from its own commit on, when it had none of it before, as
+        // does a device that joins by external commit.
+        let joined = !create
+            && change
+                .devices_added
+                .iter()
+                .any(|added| added.device == device.id);
+        if joined {
+            chat.cursors.insert(device.id, seq);
+        } else {
+            chat.cursors.entry(device.id).or_insert(seq);
+        }
+        if let Some(welcome) = reply["welcome"].as_str() {
+            let welcome_seq = chat.push("welcome", STANDARD.decode(welcome).unwrap(), None);
+            if chat.legacy && generation == 0 {
+                chat.queue.last_mut().unwrap().expected = Some(json!({
+                    "owner": chat.owner,
+                    "members": chat.users,
+                }));
+            }
+            // A device new to the conversation gets the queue from its welcome on; one that had it
+            // (a reset brings everyone in again) goes on in order.
+            for added in &change.devices_added {
+                if added.device != device.id {
+                    chat.cursors.entry(added.device).or_insert(welcome_seq);
+                }
+            }
+        }
+        // Proposals last one epoch: the removals still to make are proposed again.
+        let (again, done): (Vec<Uuid>, Vec<Uuid>) = chat
+            .removals
+            .keys()
+            .copied()
+            .partition(|device| chat.leaves.contains_key(device));
+        for device in done {
+            chat.removals.remove(&device);
+        }
+        for device in again {
+            self.propose_removal(conversation, device);
+        }
+        Ok(())
+    }
+
+    /// The API proposes removing `device`'s leaf from `conversation`'s group (a logout, a device
+    /// removed from its list, a device inactive for 45 days), and again in each epoch until it's out.
+    pub fn remove_device(&mut self, conversation: Uuid, device: Uuid) {
+        let chat = self.chats.get_mut(&conversation).unwrap();
+        chat.removals.insert(device, None);
+        self.propose_removal(conversation, device);
+    }
+
+    /// `device`'s user leaves `conversation` with their statement: the API proposes the removal of
+    /// each of the user's leaves, with the statement for the commit that takes them out.
+    pub fn leave(&mut self, device: &mut TestDevice, conversation: Uuid) {
+        let left = ok(
+            &mut device.core,
+            json!({"cmd": "leave", "conversation_id": conversation}),
+        );
+        let statement = bytes(&left["statement"]);
+        let devices = self.users[&device.user].devices.clone();
+        let chat = self.chats.get_mut(&conversation).unwrap();
+        let leaving: Vec<Uuid> = devices
+            .into_iter()
+            .filter(|device| chat.leaves.contains_key(device))
+            .collect();
+        for device in &leaving {
+            chat.removals.insert(*device, Some(statement.clone()));
+        }
+        for device in leaving {
+            self.propose_removal(conversation, device);
+        }
+    }
+
+    fn propose_removal(&mut self, conversation: Uuid, device: Uuid) {
+        let chat = self.chats.get_mut(&conversation).unwrap();
+        let request = Request {
+            state: chat.state.clone(),
+            signer_key: Some(ByteBuf::from(self.api.to_bytes().to_vec())),
+            leaf_index: Some(chat.leaves[&device]),
+            ..Request::new(Op::ProposeRemove, conversation, chat.generation.unwrap())
+        };
+        let response = validate(&request);
+        assert!(response.ok, "{:?}", response.error);
+        chat.state = response.state;
+        let statement = chat.removals[&device].clone();
+        chat.push("proposal", response.message.unwrap().into_vec(), statement);
+    }
+
+    /// Puts an entry in `conversation`'s queue without the validator, as a server that skips it
+    /// would.
+    pub fn force(&mut self, conversation: Uuid, kind: &'static str, data: Vec<u8>) -> u64 {
+        self.chats
+            .get_mut(&conversation)
+            .unwrap()
+            .push(kind, data, None)
+    }
+
+    /// Hands `device` the entries of each of its conversations it hasn't had yet, through `apply`:
+    /// the replies.
+    pub fn deliver(&mut self, device: &mut TestDevice) -> Vec<Value> {
+        let mut replies = Vec::new();
+        for (conversation, chat) in &mut self.chats {
+            let Some(&next) = chat.cursors.get(&device.id) else {
+                continue;
+            };
+            let entries: Vec<Value> = chat
+                .queue
+                .iter()
+                .filter(|entry| entry.seq >= next)
+                .map(QueueEntry::json)
+                .collect();
+            if entries.is_empty() {
+                continue;
+            }
+            let reply = ok(
+                &mut device.core,
+                json!({"cmd": "apply", "conversation_id": conversation, "entries": entries}),
+            );
+            chat.cursors.insert(device.id, chat.queue.len() as u64 + 1);
+            replies.push(reply);
+        }
+        replies
+    }
+
+    /// Delivers to each of `devices`.
+    pub fn deliver_all(&mut self, devices: &mut [&mut TestDevice]) {
+        for device in devices.iter_mut() {
+            self.deliver(device);
+        }
+    }
+
+    /// The device-to-device channel: `message` waits in `device`'s inbox.
+    pub fn post(&mut self, device: Uuid, message: Vec<u8>) {
+        self.inboxes.entry(device).or_default().push(message);
+    }
+
+    /// What waits in `device`'s inbox, which it takes.
+    pub fn inbox(&mut self, device: Uuid) -> Vec<Vec<u8>> {
+        self.inboxes.remove(&device).unwrap_or_default()
+    }
+
+    fn identities(&self) -> BTreeMap<Uuid, ByteBuf> {
+        self.users
+            .iter()
+            .map(|(user, record)| (*user, ByteBuf::from(record.identity_key.to_vec())))
+            .collect()
+    }
+
+    fn device_lists(&self) -> BTreeMap<Uuid, ByteBuf> {
+        self.users
+            .iter()
+            .map(|(user, record)| (*user, ByteBuf::from(record.list.clone())))
+            .collect()
+    }
+}
+
+/// Adds `device` to its user's list, under the next version, signed by their identity.
+fn add_to_list(record: &mut User, device: Uuid, certificate: Vec<u8>) {
+    record.version += 1;
+    record.devices.push(device);
+    let user = DeviceCertificate::read_unverified(&certificate)
+        .unwrap()
+        .user;
+    record.list = DeviceList::new(
+        user,
+        record.identity_key,
+        record.version,
+        record.devices.clone(),
+    )
+    .sign(&record.identity())
+    .unwrap();
+    record.certificates.insert(device, certificate);
+}
+
+fn validate(request: &Request) -> Response {
+    let mut input = Vec::new();
+    ciborium::into_writer(request, &mut input).unwrap();
+    ciborium::from_reader(validate_bytes(&input).as_slice()).unwrap()
+}
+
+/// The group of `conversation` as each of `devices` has it: they must all have the same
+/// generation, epoch, members and authenticator. The state they share.
+pub fn same_group(devices: &mut [&mut TestDevice], conversation: Uuid) -> Value {
+    let states: Vec<Value> = devices
+        .iter_mut()
+        .map(|device| device.group(conversation))
+        .collect();
+    for state in &states[1..] {
+        for field in [
+            "generation",
+            "epoch",
+            "kind",
+            "owner",
+            "members",
+            "devices",
+            "authenticator",
+        ] {
+            assert_eq!(state[field], states[0][field], "{field}");
+        }
+    }
+    states[0].clone()
+}
+
+/// The users of a `group` reply's members, in order.
+pub fn members(state: &Value) -> Vec<Uuid> {
+    state["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|member| member["user_id"].as_str().unwrap().parse().unwrap())
+        .collect()
+}
+
+/// The devices of a `group` reply, in leaf order.
+pub fn devices(state: &Value) -> Vec<Uuid> {
+    state["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|device| device["device_id"].as_str().unwrap().parse().unwrap())
+        .collect()
+}
+
+/// The welcome a commit's reply carries, as OpenMLS reads it.
+pub fn welcome_of(reply: &Value) -> openmls::prelude::Welcome {
+    match MlsMessageIn::tls_deserialize_exact_bytes(&bytes(&reply["welcome"]))
+        .unwrap()
+        .extract()
+    {
+        MlsMessageBodyIn::Welcome(welcome) => welcome,
+        _ => panic!("not a welcome"),
+    }
+}

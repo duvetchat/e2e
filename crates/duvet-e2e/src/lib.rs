@@ -7,6 +7,7 @@ mod direct;
 mod envelope;
 mod error;
 mod identity;
+pub mod mls;
 pub mod parts;
 mod protocol;
 mod provider;

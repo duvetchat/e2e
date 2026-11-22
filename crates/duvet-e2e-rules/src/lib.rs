@@ -19,7 +19,10 @@ pub use extract::{
 };
 pub use identity::{DeviceCertificate, DeviceList, LeaveStatement};
 pub use members::{CommitAad, Entry, Kind, MAX_MEMBERS, MEMBER_LIST_EXTENSION, MemberList};
-pub use rules::{RuleContext, RuleViolation, check_change, check_state};
+pub use rules::{
+    Place, RuleContext, RuleViolation, check_change, check_joined_state, check_state,
+    statement_user,
+};
 pub use signed::{
     DEVICE_CERTIFICATE, DEVICE_LIST, DIRECT_MESSAGE, HISTORY_SHARE, LEAVE, sign, verify,
 };

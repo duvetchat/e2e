@@ -70,12 +70,20 @@ CREATE TABLE contact_identities (
 CREATE TABLE groups (
     conversation_id BLOB PRIMARY KEY,
     generation INTEGER NOT NULL,
-    last_seq INTEGER NOT NULL DEFAULT 0,
+    -- The last entry of the conversation's queue applied; none until one takes effect.
+    last_seq INTEGER,
+    -- The member list in CBOR, as the group last had it.
     members BLOB NOT NULL,
     owner BLOB,
     kind TEXT NOT NULL CHECK (kind IN ('dm', 'group')),
     blocked INTEGER NOT NULL DEFAULT 0,
-    leaf_updated_at INTEGER NOT NULL
+    leaf_updated_at INTEGER NOT NULL,
+    -- This device's commit waiting for commit_result.
+    pending TEXT CHECK (pending IN ('create', 'reset', 'commit', 'external')),
+    -- The SHA-256 of this device's last commit, to know it in the queue.
+    echo BLOB,
+    -- The leave statements this epoch's removal proposals brought, in CBOR.
+    statements BLOB
 );
 
 -- Messages as decrypted, with their edits applied. message_id is the API's, unknown while one is being sent.

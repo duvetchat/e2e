@@ -4,7 +4,8 @@
 //! What changed from upstream: its map's six helpers (`write`, `append`, `remove_item`, `read`, `read_list`,
 //! `delete`) are SQL here, and so are the methods that reached into the map directly. Values stay JSON, as
 //! upstream. Upstream's `clear_proposal_queue` removed each proposal under a key without its label and
-//! version, which left the proposals stored: this one deletes them. Nothing here logs.
+//! version, which left the proposals stored: this one deletes them. Upstream's `queued_proposals`
+//! panicked on a reference without its proposal: this one answers `MissingProposal`. Nothing here logs.
 
 // Ported from openmls_memory_storage 0.6.0 (https://github.com/openmls/openmls/tree/main/memory_storage),
 // under the MIT license:
@@ -45,6 +46,9 @@ pub enum SqlStorageError {
     Database(#[from] rusqlite::Error),
     #[error("error serializing value")]
     Serialization,
+    /// A queued proposal's reference without the proposal: a store that was tampered with.
+    #[error("a queued proposal is missing from the store")]
+    MissingProposal,
 }
 
 impl From<serde_json::Error> for SqlStorageError {
@@ -319,11 +323,14 @@ impl StorageProvider<CURRENT_VERSION> for SqlStorage<'_> {
             self.read_list(PROPOSAL_QUEUE_REFS_LABEL, &serde_json::to_vec(group_id)?)?;
 
         refs.into_iter()
-            .map(|proposal_ref| -> Result<_, _> {
+            .map(|proposal_ref| -> Result<_, SqlStorageError> {
                 let key = (group_id, &proposal_ref);
                 let key = serde_json::to_vec(&key)?;
 
-                let proposal = self.read(QUEUED_PROPOSAL_LABEL, &key)?.unwrap();
+                // Upstream unwraps here, which aborts the web's worker on a tampered store.
+                let proposal = self
+                    .read(QUEUED_PROPOSAL_LABEL, &key)?
+                    .ok_or(SqlStorageError::MissingProposal)?;
                 Ok((proposal_ref, proposal))
             })
             .collect::<Result<Vec<_>, _>>()

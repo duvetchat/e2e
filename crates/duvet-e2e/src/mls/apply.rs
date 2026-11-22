@@ -1,0 +1,543 @@
+//! A conversation's queue, as the server keeps it: one sequence of entries (commits, welcomes,
+//! proposals, messages, edits, deletes), which the core applies in strict order of their numbers.
+//! An entry applied already is skipped, without an error or an effect; a missing one is a `gap`.
+//! Each kind of entry has its handler ([`EntryHandler`]); the order is this module's alone.
+
+use duvet_e2e_rules::{
+    Entry as ListEntry, Kind, LeaveStatement, MemberList, Place, RuleViolation, check_joined_state,
+    extract_change, group_id_parts, join_config, leaves, statement_user,
+};
+use openmls::prelude::tls_codec::DeserializeBytes as _;
+use openmls::prelude::{
+    MlsGroup, MlsMessageBodyIn, MlsMessageIn, OpenMlsProvider, ProcessMessageError,
+    ProcessedMessageContent, Proposal, ProtocolMessage, Sender, StagedWelcome, Welcome,
+    WelcomeError,
+};
+use rusqlite::OptionalExtension;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use super::{
+    Extra, GroupRow, check, delete_group, digest, openmls_error, rule_context, storage_error,
+    stored_group, stored_state,
+};
+use crate::identity::{invalid, not_found};
+use crate::protocol::b64;
+use crate::{Error, Tx};
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ApplyRequest {
+    conversation_id: Uuid,
+    entries: Vec<Entry>,
+}
+
+/// An entry of a conversation's queue, as the API hands it out.
+#[derive(Debug, Deserialize)]
+pub(crate) struct Entry {
+    pub(crate) seq: u64,
+    pub(crate) kind: EntryKind,
+    /// The MLS message.
+    #[serde(with = "b64")]
+    pub(crate) data: Vec<u8>,
+    /// On the welcome of a conversation from before the cutover: its members as this device knew
+    /// them then, which the group must have.
+    #[serde(default)]
+    pub(crate) expected: Option<Expected>,
+    /// On the server's proposal to remove a leaf of a user who leaves: their signed statement, for
+    /// the commit that takes them out.
+    #[serde(default, with = "b64::option")]
+    pub(crate) statement: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EntryKind {
+    Commit,
+    Welcome,
+    Proposal,
+    Message,
+    Edit,
+    Delete,
+}
+
+/// A conversation's members as a device knew them before the cutover.
+#[derive(Debug, Deserialize)]
+pub(crate) struct Expected {
+    /// A group's owner; a DM has none.
+    #[serde(default)]
+    owner: Option<Uuid>,
+    members: Vec<Uuid>,
+}
+
+impl Expected {
+    /// The list epoch 0 must have: a group's when there's an owner, a DM's when there isn't.
+    fn list(&self, generation: u32) -> MemberList {
+        let kind = if self.owner.is_some() {
+            Kind::Group
+        } else {
+            Kind::Dm
+        };
+        entered_at_start(kind, self.owner, &self.members, generation)
+    }
+}
+
+/// What an entry did.
+#[derive(Debug, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub(crate) enum Applied {
+    /// It took effect: a commit merged, a welcome joined, a proposal kept for the next commit.
+    /// The group's epoch after it.
+    #[serde(rename = "applied")]
+    Done { epoch: u64 },
+    /// This device's own commit, merged already by `commit_result`.
+    Own,
+    /// A commit that took this device out of the group.
+    Removed,
+    /// Refused, for the rule it breaks (or `malformed`, `invalid_commit`, `invalid_welcome`,
+    /// `invalid_proposal`, `wrong_group` for what isn't a valid message of this group). A refused
+    /// commit blocks the group: nothing goes on it but a reset.
+    Rejected { rule: String },
+    /// Not for this device, or not now: a welcome for other devices, an entry of another generation
+    /// or epoch, of a group this device isn't in, or after its group was blocked.
+    Ignored,
+}
+
+#[derive(Serialize)]
+struct EntryResult {
+    seq: u64,
+    kind: EntryKind,
+    #[serde(flatten)]
+    applied: Applied,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ApplyReply {
+    /// Every entry up to this one is applied, or was skipped.
+    applied_through: Option<u64>,
+    /// What each entry this call applied did; those applied before aren't in it.
+    results: Vec<EntryResult>,
+    catch_up_due: Vec<Uuid>,
+}
+
+/// A conversation as `apply` walks its queue: its row, and the group this device holds of it,
+/// loaded once for the whole call.
+pub(crate) struct Conversation {
+    pub(crate) id: Uuid,
+    pub(crate) row: Option<GroupRow>,
+    /// The group at the row's generation, while this device is in it.
+    pub(crate) group: Option<MlsGroup>,
+}
+
+/// What an entry of one kind does to its conversation. `apply` hands each entry, in order, to the
+/// handler of its kind, which changes `at` (its row and group are written once all are applied).
+pub(crate) trait EntryHandler {
+    fn apply(&self, tx: &Tx<'_>, at: &mut Conversation, entry: &Entry) -> Result<Applied, Error>;
+}
+
+fn handler(kind: EntryKind) -> &'static dyn EntryHandler {
+    match kind {
+        EntryKind::Commit => &Commits,
+        EntryKind::Welcome => &Welcomes,
+        EntryKind::Proposal => &Proposals,
+        EntryKind::Message | EntryKind::Edit | EntryKind::Delete => &Messages,
+    }
+}
+
+/// Applies `entries` to the conversation, in order: one already applied is skipped, and one after
+/// a missing one is a `gap` that names the first entry the core still needs (nothing of the call
+/// is kept then). Numbers count while this device holds the conversation's group; until its first
+/// entry takes effect (its own first commit, or the welcome that brings it in), and while it isn't
+/// in the group, it takes entries as they come.
+pub(crate) fn apply(tx: &Tx<'_>, request: ApplyRequest) -> Result<ApplyReply, Error> {
+    let row = GroupRow::read(tx, request.conversation_id)?;
+    if row.as_ref().is_some_and(|row| row.pending.is_some()) {
+        return Err(Error::PendingCommit);
+    }
+    let group = match &row {
+        Some(row) => stored_group(tx, request.conversation_id, row.generation)?,
+        None => None,
+    };
+    let mut at = Conversation {
+        id: request.conversation_id,
+        row,
+        group,
+    };
+    let start = at.last_seq();
+    let held = at.group.is_some();
+    let mut first_effect = None;
+    let mut seen = None;
+    let mut results = Vec::new();
+    for entry in &request.entries {
+        if i64::try_from(entry.seq).is_err() {
+            return Err(invalid("entries", "an entry's number is out of range"));
+        }
+        if let Some(last) = at.last_seq() {
+            if entry.seq <= last {
+                continue;
+            }
+            if at.group.is_some() && entry.seq != last + 1 {
+                // Nothing of this call is kept: the core needs what it needed when the call began.
+                let from = match start {
+                    Some(start) if held => start + 1,
+                    _ => first_effect.unwrap_or(last + 1),
+                };
+                return Err(Error::Gap { from });
+            }
+        }
+        let applied = handler(entry.kind).apply(tx, &mut at, entry)?;
+        let effect = !matches!(applied, Applied::Ignored);
+        if effect && first_effect.is_none() {
+            first_effect = Some(entry.seq);
+        }
+        if let Some(row) = at.row.as_mut()
+            && (effect || row.last_seq.is_some())
+        {
+            row.last_seq = Some(entry.seq);
+        }
+        seen = Some(seen.map_or(entry.seq, |seen: u64| seen.max(entry.seq)));
+        results.push(EntryResult {
+            seq: entry.seq,
+            kind: entry.kind,
+            applied,
+        });
+    }
+    if let Some(row) = &at.row {
+        row.write(tx)?;
+    }
+    Ok(ApplyReply {
+        applied_through: at.last_seq().or(seen).or(start),
+        results,
+        catch_up_due: Vec::new(),
+    })
+}
+
+impl Conversation {
+    fn last_seq(&self) -> Option<u64> {
+        self.row.as_ref().and_then(|row| row.last_seq)
+    }
+}
+
+/// Commits: each one at this device's epoch is held to the rules, then merged. One that breaks
+/// them, or that this device can't process, blocks the group.
+struct Commits;
+
+impl EntryHandler for Commits {
+    fn apply(&self, tx: &Tx<'_>, at: &mut Conversation, entry: &Entry) -> Result<Applied, Error> {
+        let Some(row) = at.row.as_mut() else {
+            return Ok(Applied::Ignored);
+        };
+        let Some(message) = protocol_message(&entry.data) else {
+            return Ok(rejected("malformed"));
+        };
+        if !in_group(&message, at.id, row.generation) || row.blocked {
+            return Ok(Applied::Ignored);
+        }
+        if row.echo.as_deref() == Some(digest(&entry.data).as_slice()) {
+            row.echo = None;
+            return Ok(Applied::Own);
+        }
+        let Some(group) = at.group.as_mut() else {
+            return Ok(Applied::Ignored);
+        };
+        // Another epoch's: an old one replayed, or one this device can't follow.
+        if message.epoch() != group.epoch() {
+            return Ok(Applied::Ignored);
+        }
+        let provider = tx.provider();
+        let context = group.public_group().group_context().clone();
+        let leaves = leaves(group.members()).map_err(|_| stored_state())?;
+        let processed = match group.process_message(provider, message) {
+            Ok(processed) => processed,
+            Err(ProcessMessageError::StorageError(error)) => return Err(storage_error(error)),
+            Err(_) => return Ok(block(row, "invalid_commit")),
+        };
+        let sender = processed.sender().clone();
+        let aad = processed.aad().to_vec();
+        let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
+            return Ok(rejected("invalid_commit"));
+        };
+        let change = match extract_change(&context, &leaves, &staged, &sender, &aad) {
+            Ok(change) => change,
+            Err(violation) => return Ok(block(row, violation.name())),
+        };
+        if let Err(violation) = check(tx, &change, Extra::default())? {
+            return Ok(block(row, violation.name()));
+        }
+        let after =
+            MemberList::from_group_context(staged.group_context()).map_err(|_| stored_state())?;
+        group
+            .merge_staged_commit(provider, *staged)
+            .map_err(openmls_error)?;
+        row.members = after;
+        row.statements.clear();
+        if group.is_active() {
+            return Ok(Applied::Done {
+                epoch: group.epoch().as_u64(),
+            });
+        }
+        // The commit took this device out: nothing of the group is of use to it any more.
+        if let Some(mut group) = at.group.take() {
+            group.delete(provider.storage()).map_err(storage_error)?;
+        }
+        Ok(Applied::Removed)
+    }
+}
+
+/// Welcomes: one for this device brings it into a group, after it holds that group to the rules.
+struct Welcomes;
+
+impl EntryHandler for Welcomes {
+    fn apply(&self, tx: &Tx<'_>, at: &mut Conversation, entry: &Entry) -> Result<Applied, Error> {
+        let Some(welcome) = welcome(&entry.data) else {
+            return Ok(rejected("malformed"));
+        };
+        let provider = tx.provider();
+        // The welcome's secrets for this device open with one of its key packages, which this uses
+        // up (but the last resort): only then is its group info readable.
+        let joining = match StagedWelcome::build_from_welcome(provider, &join_config(), welcome) {
+            Ok(joining) => joining,
+            Err(WelcomeError::NoMatchingKeyPackage) => return Ok(Applied::Ignored),
+            Err(WelcomeError::StorageError(error)) => return Err(storage_error(error)),
+            Err(_) => return Ok(rejected("invalid_welcome")),
+        };
+        let processed = joining.processed_welcome();
+        let Ok((conversation, generation)) =
+            group_id_parts(processed.unverified_group_info().group_id())
+        else {
+            return Ok(rejected("malformed"));
+        };
+        if conversation != at.id {
+            return Ok(rejected("wrong_group"));
+        }
+        // A welcome to a later generation is a reset, which keeps the members the group had, as
+        // this device has them while it's in the group.
+        let reset = match &at.row {
+            None => None,
+            Some(row) if generation > row.generation => at.group.is_some().then(|| {
+                let users: Vec<Uuid> = row.members.users.iter().map(|entry| entry.user).collect();
+                entered_at_start(row.members.kind, row.members.owner, &users, generation)
+            }),
+            Some(row) if generation == row.generation && at.group.is_none() && !row.blocked => None,
+            // An older generation's, or this device is in the group, or the group is blocked.
+            Some(_) => return Ok(Applied::Ignored),
+        };
+        let key_package = processed
+            .own_key_package()
+            .map(|key_package| key_package.hash_ref(provider.crypto()))
+            .transpose()
+            .map_err(openmls_error)?;
+        // What this device held of the group at that generation (a group it left) goes.
+        delete_group(tx, at.id, generation)?;
+
+        // A leaf that a device which never came back left in the tree must not keep anyone out.
+        let staged = match joining.skip_lifetime_validation().build() {
+            Ok(staged) => staged,
+            Err(WelcomeError::StorageError(error)) => return Err(storage_error(error)),
+            Err(_) => return Ok(rejected("invalid_welcome")),
+        };
+        let leaves = match leaves(staged.members()) {
+            Ok(leaves) => leaves,
+            Err(violation) => return Ok(rejected(violation.name())),
+        };
+        let context = staged.group_context();
+        let epoch = context.epoch().as_u64();
+        let expected = entry
+            .expected
+            .as_ref()
+            .map(|expected| expected.list(generation));
+        let mut ctx = rule_context(tx, leaves.values().map(|leaf| leaf.user))?;
+        ctx.expected_initial = expected.or(reset);
+        if let Err(violation) = check_joined_state(&ctx, context, &leaves) {
+            return Ok(rejected(violation.name()));
+        }
+        let list = MemberList::from_group_context(context).map_err(|_| stored_state())?;
+        // Only the owner adds a user to a group, and a welcome's group info is signed by the
+        // commit's maker: the welcome of the commit that added this device's user must be the
+        // owner's. Who made a group's epoch 0 the validator checked, as no welcome shows it.
+        let own_user = tx.own_user()?.ok_or_else(|| not_found("device"))?;
+        let added_now = list
+            .entry(own_user)
+            .is_some_and(|entry| (entry.generation, entry.epoch) == (generation, epoch));
+        let signer = leaves
+            .get(&staged.welcome_sender_index().u32())
+            .map(|leaf| leaf.user);
+        if list.kind == Kind::Group && added_now && signer != list.owner {
+            return Ok(rejected(RuleViolation::MembersChangedByNonOwner.name()));
+        }
+
+        // In: the group of the generation before goes.
+        if let Some(mut old) = at.group.take() {
+            old.delete(provider.storage()).map_err(storage_error)?;
+        }
+        let group = staged.into_group(provider).map_err(|error| match error {
+            WelcomeError::StorageError(error) => storage_error(error),
+            error => openmls_error(error),
+        })?;
+        // The leaf this device joined with is its key package's, as new as that.
+        let made: Option<i64> = match &key_package {
+            Some(reference) => tx
+                .conn()
+                .query_row(
+                    "SELECT created_at FROM key_packages WHERE hash_ref = ?1",
+                    [reference.as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()?,
+            None => None,
+        };
+        at.row = Some(GroupRow {
+            conversation: at.id,
+            generation,
+            last_seq: at.row.as_ref().and_then(|row| row.last_seq),
+            members: list,
+            blocked: false,
+            leaf_updated_at: made.unwrap_or(tx.now()),
+            pending: None,
+            echo: None,
+            statements: Vec::new(),
+        });
+        at.group = Some(group);
+        Ok(Applied::Done { epoch })
+    }
+}
+
+/// Proposals: the server's removals of leaves, kept for the next commit, with the statement of a
+/// user who leaves. The rules take nothing else from the server, and members propose nothing.
+struct Proposals;
+
+impl EntryHandler for Proposals {
+    fn apply(&self, tx: &Tx<'_>, at: &mut Conversation, entry: &Entry) -> Result<Applied, Error> {
+        let Some(row) = at.row.as_mut() else {
+            return Ok(Applied::Ignored);
+        };
+        let Some(message) = protocol_message(&entry.data) else {
+            return Ok(rejected("malformed"));
+        };
+        if !in_group(&message, at.id, row.generation) || row.blocked {
+            return Ok(Applied::Ignored);
+        }
+        let Some(group) = at.group.as_mut() else {
+            return Ok(Applied::Ignored);
+        };
+        // Proposals last one epoch.
+        if message.epoch() != group.epoch() {
+            return Ok(Applied::Ignored);
+        }
+        let provider = tx.provider();
+        let processed = match group.process_message(provider, message) {
+            Ok(processed) => processed,
+            Err(ProcessMessageError::StorageError(error)) => return Err(storage_error(error)),
+            Err(_) => return Ok(rejected("invalid_proposal")),
+        };
+        let ProcessedMessageContent::ProposalMessage(proposal) = processed.into_content() else {
+            return Ok(rejected("invalid_proposal"));
+        };
+        let removal = matches!(proposal.sender(), Sender::External(_))
+            && matches!(proposal.proposal(), Proposal::Remove(_));
+        if !removal {
+            return Ok(rejected(RuleViolation::ServerProposalNotRemove.name()));
+        }
+        group
+            .store_pending_proposal(provider.storage(), *proposal)
+            .map_err(storage_error)?;
+        if let Some(statement) = &entry.statement {
+            keep_statement(tx, row, group, statement)?;
+        }
+        Ok(Applied::Done {
+            epoch: group.epoch().as_u64(),
+        })
+    }
+}
+
+/// Keeps a leave statement that came with a removal, when it holds for this group now, for the
+/// commit that takes its user out; one that doesn't hold changes nothing.
+fn keep_statement(
+    tx: &Tx<'_>,
+    row: &mut GroupRow,
+    group: &MlsGroup,
+    signed: &[u8],
+) -> Result<(), Error> {
+    let Ok(claimed) = LeaveStatement::read_unverified(signed) else {
+        return Ok(());
+    };
+    let list = MemberList::from_group_context(group.public_group().group_context())
+        .map_err(|_| stored_state())?;
+    if !list.contains(claimed.user) {
+        return Ok(());
+    }
+    let leaves = leaves(group.members()).map_err(|_| stored_state())?;
+    let ctx = rule_context(tx, [claimed.user])?;
+    let place = Place {
+        conversation: row.conversation,
+        generation: row.generation,
+        epoch: group.epoch().as_u64(),
+    };
+    let Some(user) = statement_user(&ctx, &list, &leaves, place, signed) else {
+        return Ok(());
+    };
+    row.statements.retain(
+        |kept| !matches!(LeaveStatement::read_unverified(kept), Ok(kept) if kept.user == user),
+    );
+    row.statements.push(signed.to_vec());
+    Ok(())
+}
+
+/// Messages, edits and deletes are the messages' handlers' to apply; until those exist here, they
+/// change nothing, and the queue goes on past them.
+struct Messages;
+
+impl EntryHandler for Messages {
+    fn apply(&self, _: &Tx<'_>, _: &mut Conversation, _: &Entry) -> Result<Applied, Error> {
+        Ok(Applied::Ignored)
+    }
+}
+
+fn rejected(rule: &str) -> Applied {
+    Applied::Rejected { rule: rule.into() }
+}
+
+/// A commit refused: the group is blocked, and only a reset takes it on.
+fn block(row: &mut GroupRow, rule: &str) -> Applied {
+    row.blocked = true;
+    rejected(rule)
+}
+
+/// `users` entered at the start of `generation`.
+fn entered_at_start(
+    kind: Kind,
+    owner: Option<Uuid>,
+    users: &[Uuid],
+    generation: u32,
+) -> MemberList {
+    let entries = users
+        .iter()
+        .map(|&user| ListEntry {
+            user,
+            generation,
+            epoch: 0,
+        })
+        .collect();
+    MemberList::new(kind, owner, entries)
+}
+
+fn protocol_message(bytes: &[u8]) -> Option<ProtocolMessage> {
+    MlsMessageIn::tls_deserialize_exact_bytes(bytes)
+        .ok()?
+        .try_into_protocol_message()
+        .ok()
+}
+
+fn welcome(bytes: &[u8]) -> Option<Welcome> {
+    match MlsMessageIn::tls_deserialize_exact_bytes(bytes)
+        .ok()?
+        .extract()
+    {
+        MlsMessageBodyIn::Welcome(welcome) => Some(welcome),
+        _ => None,
+    }
+}
+
+/// Whether `message` is of `conversation`'s group at `generation`.
+fn in_group(message: &ProtocolMessage, conversation: Uuid, generation: u32) -> bool {
+    group_id_parts(message.group_id()) == Ok((conversation, generation))
+}
