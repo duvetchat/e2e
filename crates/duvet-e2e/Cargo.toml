@@ -38,4 +38,5 @@ rusqlite = { workspace = true, features = ["bundled-sqlcipher", "ffi-sqlite-wasm
 web-time.workspace = true
 
 [dev-dependencies]
+duvet-e2e-validator.workspace = true
 tempfile = "3"

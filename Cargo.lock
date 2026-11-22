@@ -842,6 +842,7 @@ dependencies = [
  "bs58",
  "ciborium",
  "duvet-e2e-rules",
+ "duvet-e2e-validator",
  "ed25519-dalek",
  "getrandom 0.2.17",
  "hkdf 0.13.0",

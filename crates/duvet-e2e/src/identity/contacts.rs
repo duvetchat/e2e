@@ -79,6 +79,12 @@ pub(crate) fn observe_user(
     let version = i64::try_from(list.version)
         .map_err(|_| invalid("device_list", "the device list's version is out of range"))?;
 
+    // The client observed the user anew: what `apply` asked about them was looked at.
+    tx.conn().execute(
+        "UPDATE observe_asks SET observed = 1 WHERE user_id = ?1",
+        [user.as_bytes().as_slice()],
+    )?;
+
     let own = tx.own_user()? == Some(user);
     let pinned = if own {
         let key = tx
