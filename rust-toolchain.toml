@@ -1,0 +1,6 @@
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+# The Android targets are added by the Flutter build when it needs them.
+targets = ["wasm32-unknown-unknown", "wasm32-wasip1"]

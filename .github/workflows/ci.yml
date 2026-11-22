@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The runner keeps /var/cache/duvet-e2e between runs: the registry, and a target directory per job.
+  CARGO_HOME: /cache/cargo
+
+# Every job runs in the same image, whose toolchain matches rust-toolchain.toml, so the runner's
+# instances never install a toolchain into the home they share.
+jobs:
+  rust:
+    runs-on: [self-hosted, linux, x64, duvet]
+    container:
+      image: docker.io/library/rust:1.99.1-bookworm
+      volumes:
+        - /var/cache/duvet-e2e:/cache
+    env:
+      CARGO_TARGET_DIR: /cache/target/rust
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  deny:
+    runs-on: [self-hosted, linux, x64, duvet]
+    container:
+      image: docker.io/library/rust:1.99.1-bookworm
+      volumes:
+        - /var/cache/duvet-e2e:/cache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install cargo-deny 0.22.0
+        run: |
+          curl -sSfL -o /tmp/cargo-deny.tar.gz https://github.com/EmbarkStudios/cargo-deny/releases/download/0.22.0/cargo-deny-0.22.0-x86_64-unknown-linux-musl.tar.gz
+          echo "98c56e6a408bfa5c3c60744b6015aaa6aa08f743fdeb88386d06fca035bb1786  /tmp/cargo-deny.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/cargo-deny.tar.gz -C /tmp
+          install /tmp/cargo-deny-0.22.0-x86_64-unknown-linux-musl/cargo-deny /usr/local/bin/
+      - run: cargo deny --locked check
+
+  wasm:
+    runs-on: [self-hosted, linux, x64, duvet]
+    container:
+      image: docker.io/library/rust:1.99.1-bookworm
+      volumes:
+        - /var/cache/duvet-e2e:/cache
+    env:
+      CARGO_TARGET_DIR: /cache/target/wasm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # SQLCipher's C is compiled for wasm32, which takes clang: the image has gcc alone.
+      - run: apt-get update && apt-get install -y --no-install-recommends clang lld llvm
+      - run: cargo build --locked --target wasm32-unknown-unknown -p duvet-e2e -p duvet-e2e-wasm
+
+  validator:
+    runs-on: [self-hosted, linux, x64, duvet]
+    container:
+      image: docker.io/library/rust:1.99.1-bookworm
+      volumes:
+        - /var/cache/duvet-e2e:/cache
+    env:
+      CARGO_TARGET_DIR: /cache/target/validator
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: cargo build --locked --release --target wasm32-wasip1 -p duvet-e2e-validator

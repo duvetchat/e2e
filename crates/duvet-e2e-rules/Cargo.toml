@@ -1,0 +1,9 @@
+[package]
+name = "duvet-e2e-rules"
+description = "Duvet's group rules, shared by the core and the API's validator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]

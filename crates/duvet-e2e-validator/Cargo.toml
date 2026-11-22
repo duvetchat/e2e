@@ -1,0 +1,9 @@
+[package]
+name = "duvet-e2e-validator"
+description = "The API's MLS commit validator, a wasm32-wasip1 module"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
