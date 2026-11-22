@@ -62,7 +62,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # SQLCipher's C is compiled for wasm32, which takes clang: the image has gcc alone.
       - run: apt-get update && apt-get install -y --no-install-recommends clang lld llvm
-      - run: cargo build --locked --target wasm32-unknown-unknown -p duvet-e2e -p duvet-e2e-wasm
+      - run: cargo build --locked --target wasm32-unknown-unknown -p duvet-e2e-rules -p duvet-e2e -p duvet-e2e-wasm
 
   validator:
     runs-on: [self-hosted, linux, x64, duvet]
@@ -74,4 +74,4 @@ jobs:
       CARGO_TARGET_DIR: /cache/target/validator
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: cargo build --locked --release --target wasm32-wasip1 -p duvet-e2e-validator
+      - run: cargo build --locked --release --target wasm32-wasip1 -p duvet-e2e-rules -p duvet-e2e-validator

@@ -7,3 +7,20 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+ciborium.workspace = true
+ed25519-dalek.workspace = true
+openmls.workspace = true
+openmls_traits.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+# OpenMLS builds for no wasm32 target without `js`. On wasm32-wasip1 it takes nothing from JS:
+# getrandom reads WASI's randomness there, and web-time is std's time.
+[target.'cfg(target_family = "wasm")'.dependencies]
+openmls = { workspace = true, features = ["js"] }
+
+[dev-dependencies]
+openmls_basic_credential.workspace = true
+openmls_rust_crypto.workspace = true
