@@ -120,6 +120,10 @@ const EARLIER_KEY_ROOM: usize = 64;
 /// A backup key from before the current one, and the UTC day it was replaced on (`YYYY-MM-DD`): it
 /// opens only the backup's segments of the days before that one, so whoever kept it (the lost device
 /// a rotation is for) can't seal segments of later days that devices would take.
+///
+/// Its key is wiped where it lies as it drops, so a list of them is sized before keys go in, read by
+/// reference, and sorted in place: a list that grows, or hands its keys out by value, leaves copies
+/// in the blocks it frees.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EarlierKey {
@@ -202,7 +206,7 @@ pub(crate) fn rotate_keys(
         .certificate
         .clone()
         .ok_or_else(|| Error::Internal("the device has the identity but no certificate".into()))?;
-    let kept = kept_keys(tx, own.user)?;
+    let kept = kept_keys(tx, own.user, 0)?;
     let previous_list = meta_get(tx, DEVICE_LIST)?
         .ok_or_else(|| Error::Internal("the identity has no device list".into()))?;
     keep_earlier_identity(tx, own.user, &held)?;
@@ -477,7 +481,7 @@ pub(crate) fn receive_rotation(
     // The backup keys from before: this device's own, then the transfer's it hasn't, each once, with
     // the earliest day either says it was replaced on (this device's current key, replaced now as it
     // takes the transfer, was replaced when the rotation was made).
-    let mut kept = kept_keys(tx, own.user)?;
+    let mut kept = kept_keys(tx, own.user, transfer.previous_backup_keys.len())?;
     let replaced = kept.len().checked_sub(1);
     for earlier in &transfer.previous_backup_keys {
         match kept.iter_mut().find(|kept| *kept.key == *earlier.key) {
@@ -490,7 +494,7 @@ pub(crate) fn receive_rotation(
     if let Some(replaced) = replaced {
         crate::backup::rebuild_from(tx, kept[replaced].until)?;
     }
-    kept.sort_by_key(|kept| kept.until);
+    kept.sort_unstable_by_key(|kept| kept.until);
 
     tx.conn().execute(
         "UPDATE device SET certificate = ?1",
@@ -554,8 +558,8 @@ impl Tx<'_> {
     pub fn previous_backup_keys(&self) -> Result<Vec<Zeroizing<[u8; 32]>>, Error> {
         Ok(self
             .earlier_backup_keys()?
-            .into_iter()
-            .map(|earlier| earlier.key)
+            .iter()
+            .map(|earlier| earlier.key.clone())
             .collect())
     }
 
@@ -595,12 +599,15 @@ fn all_groups_due(tx: &Tx<'_>) -> Result<(), Error> {
 }
 
 /// The backup keys a rotation keeps: those before the current one, then the current one, replaced
-/// today, oldest first. None while the device has no backup key.
-fn kept_keys(tx: &Tx<'_>, user: Uuid) -> Result<Vec<EarlierKey>, Error> {
+/// today, oldest first; none while the device has no backup key. The list has room for `more`, so
+/// it never grows.
+fn kept_keys(tx: &Tx<'_>, user: Uuid, more: usize) -> Result<Vec<EarlierKey>, Error> {
     let Some(current) = backup_key(tx)? else {
-        return Ok(Vec::new());
+        return Ok(Vec::with_capacity(more));
     };
-    let mut kept = previous_keys(tx, user, &current)?;
+    let previous = previous_keys(tx, user, &current)?;
+    let mut kept = Vec::with_capacity(previous.len() + 1 + more);
+    kept.extend(previous.iter().cloned());
     kept.push(EarlierKey {
         key: current,
         until: Day::of(tx.now()),

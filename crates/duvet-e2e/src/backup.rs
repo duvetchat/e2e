@@ -638,13 +638,13 @@ fn held_key(tx: &Tx<'_>, key_id: &[u8], day: Day) -> Result<Option<Zeroizing<[u8
     {
         return Ok(Some(current));
     }
-    let earlier = tx
-        .earlier_backup_keys()?
-        .into_iter()
-        .find(|earlier| recovery::key_id(&earlier.key).as_slice() == key_id);
-    match earlier {
+    let earlier = tx.earlier_backup_keys()?;
+    match earlier
+        .iter()
+        .find(|earlier| recovery::key_id(&earlier.key).as_slice() == key_id)
+    {
         Some(earlier) if day >= earlier.until => Err(unopened()),
-        earlier => Ok(earlier.map(|earlier| earlier.key)),
+        earlier => Ok(earlier.map(|earlier| earlier.key.clone())),
     }
 }
 

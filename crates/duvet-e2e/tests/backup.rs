@@ -8,6 +8,9 @@
 
 mod support;
 
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use duvet_e2e::messages::{self, Record, RecordKind};
@@ -22,6 +25,53 @@ use uuid::Uuid;
 
 const MINUTE: i64 = 60 * 1000;
 const HOUR: i64 = 60 * MINUTE;
+
+/// These tests' allocator: the system's, each block zeroed as it's handed out, and, while a key is
+/// watched, a count of the blocks freed with that key still in them.
+struct Watching;
+
+#[global_allocator]
+static ALLOCATOR: Watching = Watching;
+
+static WATCHING: AtomicBool = AtomicBool::new(false);
+static WATCHED: [AtomicU8; 32] = [const { AtomicU8::new(0) }; 32];
+static FREED_WITH_IT: AtomicUsize = AtomicUsize::new(0);
+
+// SAFETY: each call goes to the system's allocator with its own arguments. A block is read only
+// before it's handed back, within its layout, and each of its bytes was written as it was handed
+// out (zeroed).
+unsafe impl GlobalAlloc for Watching {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if WATCHING.load(Ordering::SeqCst) {
+            let watched: [u8; 32] = std::array::from_fn(|i| WATCHED[i].load(Ordering::SeqCst));
+            let block = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
+            if block.windows(32).any(|window| window == watched) {
+                FREED_WITH_IT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+/// How many blocks were freed with `key` still in them while `run` ran.
+fn freed_with(key: &[u8; 32], run: impl FnOnce()) -> usize {
+    for (watched, byte) in WATCHED.iter().zip(key) {
+        watched.store(*byte, Ordering::SeqCst);
+    }
+    FREED_WITH_IT.store(0, Ordering::SeqCst);
+    WATCHING.store(true, Ordering::SeqCst);
+    run();
+    WATCHING.store(false, Ordering::SeqCst);
+    FREED_WITH_IT.load(Ordering::SeqCst)
+}
 
 /// A segment as the contract lays it out: `{v: 1, key_id, user, conversation, day, complete,
 /// nonce, ct}`.
@@ -1609,6 +1659,19 @@ fn an_earlier_key_opens_only_the_days_before_its_change() {
             until: utc_day(day + DAY_MS),
         }]
     );
+}
+
+#[test]
+fn earlier_keys_leave_no_copy_in_freed_memory() {
+    let mut dm = dm();
+    let (_, old, old_key, _) = old_segment_then_rotation(&mut dm);
+    // A second change keeps the old key in a longer list; then a segment under the old key opens
+    // with it. Neither leaves a copy of the old key in a block it frees.
+    let freed = freed_with(&old_key, || {
+        ok(&mut dm.a1.core, json!({"cmd": "rotate_keys", "remove": []}));
+        assert_eq!(imported(&mut dm.a1, &old["data"]), 0);
+    });
+    assert_eq!(freed, 0);
 }
 
 #[test]
