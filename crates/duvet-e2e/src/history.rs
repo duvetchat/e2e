@@ -834,9 +834,7 @@ pub(crate) fn history_import(tx: &Tx<'_>, request: HistoryImport) -> Result<Impo
     if body.header != expected {
         return Err(rule("share_mismatch"));
     }
-    let records = inflate_records(&body.records)?;
-    drop(body);
-    let imported = import(tx, stored.conversation, &records, Some(stored.user))?;
+    let imported = import_records(tx, stored.conversation, stored.user, &body.records)?;
     // The key is used up: kept, it would open the server's copy of the package again, a message
     // deleted since included.
     tx.conn().execute(
@@ -870,11 +868,17 @@ fn open_parts(key: &[u8; 32], share: Uuid, parts: Vec<Vec<u8>>) -> Result<Vec<u8
     Ok(package)
 }
 
-/// The records `deflated` holds, read as they inflate, in steps: once more than `MAX_RECORDS`
-/// bytes inflated, `too_large`, and nothing more is inflated. A stream that isn't DEFLATE, or
-/// what it inflates to that isn't one list of records and nothing after, is `decrypt_failed`
-/// (`history`).
-fn inflate_records(deflated: &[u8]) -> Result<Vec<Record>, Error> {
+/// Imports the records `deflated` holds as shared by `sharer`, one at a time as they inflate: what
+/// this holds is one record, never the list. Once more than `MAX_RECORDS` bytes inflated, it's
+/// `too_large`, and nothing more is inflated; a stream that isn't DEFLATE, or what it inflates to
+/// that isn't one list of records and nothing after, is `decrypt_failed` (`history`). Either undoes
+/// what was imported, with the rest of the command. How many records changed something.
+fn import_records(
+    tx: &Tx<'_>,
+    conversation: Uuid,
+    sharer: Uuid,
+    deflated: &[u8],
+) -> Result<usize, Error> {
     let mut inflater = Inflater {
         state: InflateState::new_boxed(DataFormat::Raw),
         input: deflated,
@@ -883,13 +887,53 @@ fn inflate_records(deflated: &[u8]) -> Result<Vec<Record>, Error> {
         ended: false,
         over: false,
     };
-    match ciborium::from_reader::<Vec<Record>, _>(&mut inflater) {
-        Ok(records) if inflater.finished() => Ok(records),
-        Err(_) if inflater.over => Err(Error::TooLarge {
-            limit: MAX_RECORDS as u64,
-        }),
-        _ => Err(unreadable()),
+    let refused = |inflater: &Inflater<'_>| {
+        if inflater.over {
+            Error::TooLarge {
+                limit: MAX_RECORDS as u64,
+            }
+        } else {
+            unreadable()
+        }
+    };
+    let count = array_len(&mut inflater).map_err(|_| refused(&inflater))?;
+    let mut imported = 0;
+    for _ in 0..count {
+        let record: Record =
+            ciborium::from_reader(&mut inflater).map_err(|_| refused(&inflater))?;
+        imported += import(
+            tx,
+            conversation,
+            std::slice::from_ref(&record),
+            Some(sharer),
+        )?;
     }
+    if !inflater.finished() {
+        return Err(unreadable());
+    }
+    Ok(imported)
+}
+
+/// The length of the CBOR array `reader` begins with: a definite one, as this core writes its
+/// lists of records.
+fn array_len(reader: &mut impl Read) -> io::Result<u64> {
+    let mut first = [0u8; 1];
+    reader.read_exact(&mut first)?;
+    let (major, info) = (first[0] >> 5, first[0] & 0x1f);
+    if major != 4 {
+        return Err(io::Error::other("not an array"));
+    }
+    let width = match info {
+        0..=23 => return Ok(u64::from(info)),
+        24 => 1,
+        25 => 2,
+        26 => 4,
+        27 => 8,
+        _ => return Err(io::Error::other("not an array of a stated length")),
+    };
+    let mut length = [0u8; 8];
+    reader.read_exact(&mut length[8 - width..])?;
+    Ok(u64::from_be_bytes(length))
 }
 
 /// What a raw DEFLATE stream inflates to, as it's read, until more than `limit` bytes inflated.
