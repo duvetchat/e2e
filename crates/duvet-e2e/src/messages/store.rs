@@ -641,6 +641,93 @@ pub fn records_for(
     Ok(records)
 }
 
+/// Which records of a conversation a package carries, with their authors' edits: what this device
+/// shows of it (a share), or what it noted for one of its members (a catch-up, under the identity
+/// it pins for them now).
+pub(crate) enum Scope {
+    Shown { conversation: Uuid },
+    Noted { conversation: Uuid, user: Uuid },
+}
+
+/// Hands `each` the records of `scope` sent from `since` on (all of them, with none), one at a
+/// time, oldest or newest first, in a package's order (by time, number, then message before edit),
+/// until it answers false: what a package carries, read without holding all of it. The same
+/// records `records_for` and `noted_records` give.
+pub(crate) fn each_record(
+    tx: &Tx<'_>,
+    scope: &Scope,
+    since: Option<i64>,
+    newest_first: bool,
+    mut each: impl FnMut(Record) -> Result<bool, Error>,
+) -> Result<(), Error> {
+    let (conversation, user, messages, edits) = match scope {
+        Scope::Shown { conversation } => (
+            *conversation,
+            Uuid::nil(),
+            "m.conversation_id = ?1".to_string(),
+            "e.conversation_id = ?1".to_string(),
+        ),
+        Scope::Noted { conversation, user } => (
+            *conversation,
+            *user,
+            format!("m.id IN ({})", deviceless::NOTED),
+            format!("e.conversation_id = ?1 AND m.id IN ({})", deviceless::NOTED),
+        ),
+    };
+    let order = if newest_first { "DESC" } else { "ASC" };
+    let mut statement = tx.conn().prepare(&format!(
+        "SELECT 0, m.message_id, m.seq, m.user_id, m.device_id, m.sent_at, m.envelope, NULL, \
+         m.shared_by, m.reply_to FROM messages m WHERE {messages} AND m.status = 'ok' \
+         AND m.deleted = 0 AND m.message_id IS NOT NULL AND m.seq IS NOT NULL \
+         AND m.envelope IS NOT NULL AND (?3 IS NULL OR m.sent_at >= ?3) \
+         UNION ALL \
+         SELECT 1, e.message_id, e.seq, e.user_id, e.device_id, e.sent_at, NULL, e.text, \
+         e.shared_by, NULL FROM edits e JOIN messages m ON m.message_id = e.message_id \
+         AND m.conversation_id = e.conversation_id AND m.user_id = e.user_id \
+         WHERE {edits} AND e.seq IS NOT NULL AND m.deleted = 0 AND m.status = 'ok' \
+         AND (?3 IS NULL OR e.sent_at >= ?3) \
+         ORDER BY 6 {order}, 3 {order}, 1 {order}"
+    ))?;
+    let mut rows = statement.query(params![
+        conversation.as_bytes().as_slice(),
+        user.as_bytes().as_slice(),
+        since
+    ])?;
+    while let Some(row) = rows.next()? {
+        let edit: bool = row.get(0)?;
+        let id = stored_uuid(&row.get::<_, Vec<u8>>(1)?)?;
+        let envelope = if edit {
+            Envelope::Edit {
+                message_id: id,
+                text: row.get(7)?,
+            }
+            .encode()?
+        } else {
+            row.get(6)?
+        };
+        let uuid = |bytes: Option<Vec<u8>>| bytes.as_deref().map(stored_uuid).transpose();
+        let record = Record {
+            kind: if edit {
+                RecordKind::Edit
+            } else {
+                RecordKind::Message
+            },
+            id,
+            seq: u64::try_from(row.get::<_, i64>(2)?).map_err(|_| malformed())?,
+            user: stored_uuid(&row.get::<_, Vec<u8>>(3)?)?,
+            device: stored_uuid(&row.get::<_, Vec<u8>>(4)?)?,
+            sent: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+            envelope,
+            shared_by: uuid(row.get(8)?)?,
+            reply_to: uuid(row.get(9)?)?,
+        };
+        if !each(record)? {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// A message's record, if it's one to carry: sent, shown and not deleted.
 pub(super) fn message_record(row: &Row) -> Option<Record> {
     if row.deleted || row.status != Status::Ok {

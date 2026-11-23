@@ -22,6 +22,7 @@ use crate::identity::invalid;
 use crate::protocol::b64;
 use crate::{Attachment, Envelope, Error, ThumbnailRef};
 
+pub(crate) use deviceless::NOTED;
 #[cfg(feature = "test-hooks")]
 pub use deviceless::forget_noted;
 pub use deviceless::noted_records;
@@ -29,7 +30,7 @@ pub(crate) use deviceless::{WithoutDevices, catch_up_due, entered, without_devic
 pub(crate) use receive::{Messages, erase_deleted};
 pub(crate) use search::{Search, search};
 pub(crate) use send::{Delete, Discard, Edit, Encrypt, Sent, delete, discard, edit, encrypt, sent};
-pub(crate) use store::{ListMessages, messages};
+pub(crate) use store::{ListMessages, Scope, each_record, messages};
 pub use store::{import, import_shared, records_for};
 
 /// The largest ciphertext of a message, an edit or a deletion: 32 KiB.

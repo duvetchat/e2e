@@ -186,3 +186,36 @@ fn an_import_holds_one_record_at_a_time() {
     assert_eq!(reply["ok"]["imported"], 6144, "{reply}");
     assert!(peak < 8 * MIB, "the import held {} MiB at once", peak / MIB);
 }
+
+#[test]
+fn a_share_holds_one_record_at_a_time() {
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let (conversation, mut a1, _b1) = group(&mut server, a, b);
+
+    // A1 has 24 MiB of a conversation's history.
+    let records = messages_of_a(a, &a1, 6144);
+    let kept = a1
+        .core
+        .transaction(|tx| duvet_e2e::messages::import(tx, conversation, &records, None))
+        .unwrap();
+    assert_eq!(kept, 6144);
+    drop(records);
+    let command = json!({
+        "cmd": "history_share",
+        "conversation_id": conversation,
+        "to_user": b,
+        "range": "all",
+        "devices": certificates(&server, b).iter().map(|signed| b64(signed)).collect::<Vec<_>>(),
+    })
+    .to_string();
+
+    // Sharing all of it reads the records one at a time, and deflates them as they're written.
+    let (reply, peak) = peak_during(|| a1.core.handle(&command));
+    let reply: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(reply["ok"]["truncated"], false, "{reply}");
+    assert!(peak < 8 * MIB, "the share held {} MiB at once", peak / MIB);
+}

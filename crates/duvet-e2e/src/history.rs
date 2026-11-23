@@ -25,6 +25,8 @@ use std::io::{self, Read};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use duvet_e2e_rules::{DeviceCertificate, HISTORY_SHARE, RuleViolation, sign, verify};
+use miniz_oxide::deflate::core::{CompressorOxide, create_comp_flags_from_zip_params};
+use miniz_oxide::deflate::stream::deflate;
 use miniz_oxide::inflate::stream::{InflateState, inflate};
 use miniz_oxide::{DataFormat, MZFlush, MZStatus};
 use openmls_traits::OpenMlsProvider;
@@ -36,7 +38,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::identity::{from_cbor, invalid, not_found, random, stored_key, stored_uuid, to_cbor};
-use crate::messages::{Empty, Record, RecordKind, import_shared, noted_records, records_for};
+use crate::messages::{Empty, NOTED, Record, Scope, each_record, import_shared};
 use crate::mls::{GroupRow, ask_first};
 use crate::parts::{PACKAGE_PART, TAG, fits, open_part, seal_part};
 use crate::protocol::b64;
@@ -274,8 +276,6 @@ pub fn share(
 ) -> Result<Shared, Error> {
     let own = sharing_with(tx, conversation, to, "to_user")?;
     let recipients = recipients(tx, to, devices)?;
-    let start = range.start(tx.now());
-    let records = records_for(tx, conversation, start, i64::MAX)?;
     let header = Header {
         kind: ShareKind::Share,
         conversation,
@@ -283,7 +283,9 @@ pub fn share(
         device: own.device,
         to,
     };
-    let (shared, _) = pack(tx, &own, &header, &records, start, limit, &recipients)?;
+    let scope = Scope::Shown { conversation };
+    let since = Some(range.start(tx.now()));
+    let (shared, _) = pack(tx, &own, &header, &scope, since, limit, &recipients)?;
     Ok(shared)
 }
 
@@ -321,12 +323,15 @@ pub fn catch_up_within(
         ],
         |row| row.get(0),
     )?;
-    let records = if without {
-        Vec::new()
-    } else {
-        noted_records(tx, conversation, user)?
-    };
-    if records.is_empty() {
+    let scope = Scope::Noted { conversation, user };
+    let mut noted = false;
+    if !without {
+        each_record(tx, &scope, None, true, |_| {
+            noted = true;
+            Ok(false)
+        })?;
+    }
+    if !noted {
         return Err(not_found("catch_up"));
     }
     let recipients = recipients(tx, user, devices)?;
@@ -337,32 +342,31 @@ pub fn catch_up_within(
         device: own.device,
         to: user,
     };
-    let (shared, carried) = pack(tx, &own, &header, &records, 0, limit, &recipients)?;
+    let (shared, from) = pack(tx, &own, &header, &scope, None, limit, &recipients)?;
     // A catch-up the server no longer keeps can't be delivered: its record goes, and its messages'
     // notes stay for another.
     tx.conn().execute(
         "DELETE FROM catch_ups WHERE created_at < ?1",
         [tx.now().saturating_sub(PACKAGE_KEPT_MS)],
     )?;
-    let share = shared.sealed.share_id;
-    for record in carried
-        .iter()
-        .filter(|record| record.kind == RecordKind::Message)
-    {
-        tx.conn().execute(
-            "INSERT OR IGNORE INTO catch_ups (share_id, conversation_id, user_id, message, \
-             taken, created_at) SELECT ?1, ?2, ?3, m.id, d.taken, ?5 FROM messages m \
-             JOIN deviceless d ON d.message = m.id AND d.conversation_id = ?2 AND d.user_id = ?3 \
-             WHERE m.conversation_id = ?2 AND m.message_id = ?4",
-            params![
-                share.as_bytes().as_slice(),
-                conversation.as_bytes().as_slice(),
-                user.as_bytes().as_slice(),
-                record.id.as_bytes().as_slice(),
-                tx.now(),
-            ],
-        )?;
-    }
+    // The messages it carried, as `each_record` chose them, with their notes' count.
+    tx.conn().execute(
+        &format!(
+            "INSERT OR IGNORE INTO catch_ups (share_id, conversation_id, user_id, message, taken, \
+             created_at) SELECT ?4, ?1, ?2, d.message, d.taken, ?5 FROM deviceless d \
+             JOIN messages m ON m.id = d.message WHERE d.conversation_id = ?1 AND d.user_id = ?2 \
+             AND d.message IN ({NOTED}) AND m.status = 'ok' AND m.deleted = 0 \
+             AND m.message_id IS NOT NULL AND m.seq IS NOT NULL AND m.envelope IS NOT NULL \
+             AND (?3 IS NULL OR m.sent_at >= ?3)"
+        ),
+        params![
+            conversation.as_bytes().as_slice(),
+            user.as_bytes().as_slice(),
+            from,
+            shared.sealed.share_id.as_bytes().as_slice(),
+            tx.now(),
+        ],
+    )?;
     Ok(shared)
 }
 
@@ -412,91 +416,231 @@ fn sharing_with(
     Ok(own)
 }
 
-/// The package of the newest `records` that fit, sealed (see [`newest_that_fit`]), with the
-/// records it carries.
-fn pack<'r>(
+/// The package of the newest records of `scope` from `since` on that fit, sealed (see
+/// [`newest_that_fit`]), and the time from which it holds them all (`since`, when none was left
+/// out).
+fn pack(
     tx: &Tx<'_>,
     own: &OwnDevice,
     header: &Header,
-    records: &'r [Record],
-    start: i64,
+    scope: &Scope,
+    since: Option<i64>,
     limit: usize,
     recipients: &[(Uuid, [u8; 32])],
-) -> Result<(Shared, &'r [Record]), Error> {
-    let (signed, start, first) = newest_that_fit(records, start, limit, |kept| {
-        package(&own.signer, header, &deflate(kept)?)
+) -> Result<(Shared, Option<i64>), Error> {
+    let (signed, cut) = newest_that_fit(tx, scope, since, limit, |records| {
+        package(&own.signer, header, records)
     })?;
     let sealed = seal_for(tx, header.kind, header.conversation, &signed, recipients)?;
+    let from = cut.or(since);
     let shared = Shared {
         sealed,
-        start,
-        truncated: first > 0,
+        start: from.unwrap_or(0),
+        truncated: cut.is_some(),
     };
-    Ok((shared, &records[first..]))
+    Ok((shared, from))
 }
 
-/// The package `build` makes of the newest of `records` (in the order they were sent) that fit:
-/// their CBOR within `MAX_RECORDS`, and the package, once sealed, within `limit`. With where its
-/// window starts (`start` when they all fit, else just after the newest record left out, so the
-/// package holds every record from then on) and the first record it holds: any before were left
-/// out.
+/// The package `sign` makes of the newest records of `scope` from `since` on that fit: their CBOR
+/// within `MAX_RECORDS`, and the package, once sealed, within `limit`. With the time from which it
+/// holds every record, when older ones were left out: just after the newest of them, a whole
+/// instant at a time, so every record from then on is in it.
+///
+/// It holds one record at a time, never the list: a first pass, newest first, finds where the
+/// records within the budget begin; a second, oldest first, writes their CBOR through deflate as
+/// it goes. A package past `limit` is found as its deflated bytes pass it, and is made again of
+/// fewer, by how far over it was.
 fn newest_that_fit(
-    records: &[Record],
-    start: i64,
+    tx: &Tx<'_>,
+    scope: &Scope,
+    since: Option<i64>,
     limit: usize,
-    build: impl Fn(&[Record]) -> Result<Vec<u8>, Error>,
-) -> Result<(Vec<u8>, i64, usize), Error> {
-    let sizes = records
-        .iter()
-        .map(|record| to_cbor(record).map(|bytes| bytes.len()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut first = 0;
-    let mut kept: usize = sizes.iter().sum();
-    while first < records.len() && kept + ARRAY_HEADER > MAX_RECORDS {
-        kept -= sizes[first];
-        first += 1;
-    }
+    sign: impl Fn(&[u8]) -> Result<Vec<u8>, Error>,
+) -> Result<(Vec<u8>, Option<i64>), Error> {
+    let unwritten = || Error::Internal("a package's records couldn't be written".into());
+    let mut budget = MAX_RECORDS - ARRAY_HEADER;
     loop {
-        let package = build(&records[first..])?;
-        let sealed = sealed_len(package.len());
-        if sealed <= limit {
-            let start = match first.checked_sub(1) {
-                Some(last_out) => i64::try_from(records[last_out].sent)
-                    .unwrap_or(i64::MAX)
-                    .saturating_add(1),
-                None => start,
-            };
-            return Ok((package, start, first));
+        let (cut, count, size) = cut_for(tx, scope, since, budget)?;
+        let mut deflater = Deflater::new(limit);
+        io::Write::write_all(&mut deflater, &array_header(count)).map_err(|_| unwritten())?;
+        let mut written: u64 = 0;
+        each_record(tx, scope, cut.or(since), false, |record| {
+            written += 1;
+            ciborium::into_writer(&record, &mut deflater).map_err(|_| unwritten())?;
+            Ok(true)
+        })?;
+        if written != count {
+            return Err(Error::Internal(
+                "a package's records changed as it was made".into(),
+            ));
         }
-        if first == records.len() {
+        let (deflated, total) = deflater.finish().map_err(|_| unwritten())?;
+        let measure = match deflated {
+            Some(deflated) => {
+                let package = sign(&deflated)?;
+                let sealed = sealed_len(package.len());
+                if sealed <= limit {
+                    return Ok((package, cut));
+                }
+                sealed
+            }
+            // Past the cap, its bytes were only counted. ponytail: such a package is deflated to its
+            // end to measure it; stop at the cap if the time that takes ever shows.
+            None => sealed_len(total),
+        };
+        if count == 0 {
             return Err(Error::TooLarge {
                 limit: limit as u64,
             });
         }
-        // What the cap takes of these records, by how far over they are, a tenth less: one fewer
-        // at least.
-        let target = (kept as u128 * limit as u128 * 9 / (sealed as u128 * 10)) as usize;
+        // What the cap takes of these records, by how far over they are, a tenth less: one
+        // instant fewer at least.
+        let shrunk = (size as u128 * limit as u128 * 9 / (measure as u128 * 10)) as usize;
+        budget = shrunk.min(size.saturating_sub(1));
+    }
+}
+
+/// The newest records of `scope` from `since` on whose CBOR fits `budget`, a whole instant at a
+/// time: where they begin when older ones are left out (just after the newest of those), how many
+/// they are, and their CBOR's size.
+fn cut_for(
+    tx: &Tx<'_>,
+    scope: &Scope,
+    since: Option<i64>,
+    budget: usize,
+) -> Result<(Option<i64>, u64, usize), Error> {
+    // What the instants newer than the one being read hold, and what that one holds so far.
+    let (mut size, mut count) = (0usize, 0u64);
+    let (mut instant, mut instant_size, mut instant_count) = (None, 0usize, 0u64);
+    let mut cut = None;
+    each_record(tx, scope, since, true, |record| {
+        if instant != Some(record.sent) {
+            size += instant_size;
+            count += instant_count;
+            (instant, instant_size, instant_count) = (Some(record.sent), 0, 0);
+        }
+        let mut counted = Counted(0);
+        ciborium::into_writer(&record, &mut counted)
+            .map_err(|_| Error::Internal("a CBOR value couldn't be written".into()))?;
+        if size + instant_size + counted.0 > budget {
+            cut = Some(
+                i64::try_from(record.sent)
+                    .unwrap_or(i64::MAX)
+                    .saturating_add(1),
+            );
+            return Ok(false);
+        }
+        instant_size += counted.0;
+        instant_count += 1;
+        Ok(true)
+    })?;
+    if cut.is_none() {
+        size += instant_size;
+        count += instant_count;
+    }
+    Ok((cut, count, size))
+}
+
+/// A writer that only counts what it's given.
+struct Counted(usize);
+
+impl io::Write for Counted {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The header of a CBOR array of `count` items, in its shortest form, as ciborium writes a list's.
+fn array_header(count: u64) -> Vec<u8> {
+    let mut header = Vec::with_capacity(ARRAY_HEADER);
+    if count < 24 {
+        header.push(0x80 | count as u8);
+    } else if let Ok(count) = u8::try_from(count) {
+        header.extend([0x98, count]);
+    } else if let Ok(count) = u16::try_from(count) {
+        header.push(0x99);
+        header.extend(count.to_be_bytes());
+    } else if let Ok(count) = u32::try_from(count) {
+        header.push(0x9a);
+        header.extend(count.to_be_bytes());
+    } else {
+        header.push(0x9b);
+        header.extend(count.to_be_bytes());
+    }
+    header
+}
+
+/// Raw DEFLATE as what's written comes, kept in memory up to `limit` bytes: past them, what comes
+/// out is only counted, so memory holds `limit` at most and the total is known.
+struct Deflater {
+    compressor: Box<CompressorOxide>,
+    out: Vec<u8>,
+    limit: usize,
+    /// What came out so far.
+    total: usize,
+}
+
+impl Deflater {
+    fn new(limit: usize) -> Deflater {
+        let flags = create_comp_flags_from_zip_params(COMPRESSION.into(), 0, 0);
+        Deflater {
+            compressor: Box::new(CompressorOxide::new(flags)),
+            out: Vec::new(),
+            limit,
+            total: 0,
+        }
+    }
+
+    /// One step of deflate over `input`: how much of it it took, and where it stands.
+    fn step(&mut self, input: &[u8], flush: MZFlush) -> io::Result<(usize, MZStatus)> {
+        let mut chunk = [0u8; 16 * 1024];
+        let step = deflate(&mut self.compressor, input, &mut chunk, flush);
+        self.total += step.bytes_written;
+        if self.total <= self.limit {
+            self.out.extend_from_slice(&chunk[..step.bytes_written]);
+        } else if !self.out.is_empty() {
+            self.out = Vec::new();
+        }
+        let status = step
+            .status
+            .map_err(|_| io::Error::other("deflate failed"))?;
+        Ok((step.bytes_consumed, status))
+    }
+
+    /// What all it took deflates to, unless that passed `limit`; and its size either way.
+    fn finish(mut self) -> io::Result<(Option<Vec<u8>>, usize)> {
         loop {
-            kept -= sizes[first];
-            first += 1;
-            if first == records.len() || kept <= target {
-                break;
+            if let (_, MZStatus::StreamEnd) = self.step(&[], MZFlush::Finish)? {
+                let kept = (self.total <= self.limit).then_some(self.out);
+                return Ok((kept, self.total));
             }
         }
+    }
+}
+
+impl io::Write for Deflater {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let (took, _) = self.step(rest, MZFlush::None)?;
+            rest = &rest[took..];
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
 /// What `len` bytes take sealed: each part of 1 MiB gains its tag.
 fn sealed_len(len: usize) -> usize {
     len + TAG * len.div_ceil(PACKAGE_PART).max(1)
-}
-
-/// `records`' CBOR, deflated.
-fn deflate(records: &[Record]) -> Result<Vec<u8>, Error> {
-    Ok(miniz_oxide::deflate::compress_to_vec(
-        &to_cbor(&records)?,
-        COMPRESSION,
-    ))
 }
 
 /// A package: `header` and `records` (their CBOR, deflated), signed by `signer`, the key of the

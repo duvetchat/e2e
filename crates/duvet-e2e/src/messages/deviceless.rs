@@ -21,7 +21,7 @@ use crate::mls::GroupRow;
 use crate::{Error, Tx};
 
 /// The noted messages whose identity is the one now pinned for their user, or none.
-const NOTED: &str = "SELECT d.message FROM deviceless d LEFT JOIN contacts c ON c.user_id = d.user_id \
+pub(crate) const NOTED: &str = "SELECT d.message FROM deviceless d LEFT JOIN contacts c ON c.user_id = d.user_id \
      WHERE d.conversation_id = ?1 AND d.user_id = ?2 \
      AND (d.identity_key IS NULL OR d.identity_key = c.identity_key)";
 
