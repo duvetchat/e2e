@@ -843,6 +843,29 @@ mod tests {
     }
 
     #[test]
+    fn building_stops_at_the_limit() {
+        let record = Record {
+            kind: RecordKind::Message,
+            id: Uuid::from_u128(1),
+            seq: 1,
+            user: Uuid::from_u128(2),
+            device: Uuid::from_u128(3),
+            sent: 4,
+            envelope: vec![0; 4096],
+            shared_by: None,
+            reply_to: None,
+        };
+        let records = vec![record];
+        let size = to_cbor(&records).unwrap().len();
+        let deflated = deflate(&records, size).unwrap();
+        assert_eq!(records_in(&deflated, size).unwrap(), records);
+        assert!(matches!(
+            deflate(&records, size - 1),
+            Err(Error::TooLarge { limit }) if limit == (size - 1) as u64
+        ));
+    }
+
+    #[test]
     fn records_compare_in_any_order() {
         let record = |seq: u64| Record {
             kind: RecordKind::Message,

@@ -637,8 +637,16 @@ fn segment_rejects_tampering_and_other_keys() {
     let backup_key = backup_key_of(dm.a, &dm.identity);
     let records = segment.open(&backup_key);
     let mut a2 = recovered(&mut dm.server, dm.a, &dm.identity);
+    // Each is refused alike by an import and by a move to the current key.
     let mut refused = |blob: Vec<u8>| -> (String, String) {
-        refusal(&error(&mut a2.core, import_command(&json!(b64(&blob)))))
+        let data = json!(b64(&blob));
+        let by_import = refusal(&error(&mut a2.core, import_command(&data)));
+        let by_reencrypt = refusal(&error(
+            &mut a2.core,
+            json!({"cmd": "backup_reencrypt", "data": data}),
+        ));
+        assert_eq!(by_reencrypt, by_import);
+        by_import
     };
 
     // A byte of its ciphertext changed.
@@ -1185,6 +1193,32 @@ fn reencrypt_moves_only_what_an_import_takes() {
         Segment::read(&bytes(&moved["data"])).open(&backup_key),
         records
     );
+}
+
+#[test]
+fn an_import_leaves_out_records_of_other_days() {
+    let mut dm = dm();
+    let (conversation, day) = (dm.conversation, dm.day);
+    dm.at(day + HOUR);
+    let hello = say(&mut dm.server, &mut dm.a1, conversation, "hola");
+    dm.deliver();
+    dm.at(day + DAY_MS + HOUR);
+    let the_day = utc_day(day);
+    let built = back_up(&mut dm.a1, conversation, &the_day);
+    assert_eq!(due(&mut dm.a1), []);
+    let backup_key = backup_key_of(dm.a, &dm.identity);
+    let read = Segment::read(&bytes(&built["data"]));
+    let records = read.clone().open(&backup_key);
+
+    // The server's copy of the day holds a record of the next day besides the day's own: an import
+    // leaves it out, and the day is due again, to upload without it.
+    let mut stray = records[0].clone();
+    stray.id = new_id();
+    stray.sent += DAY_MS as u64;
+    let mixed = json!(b64(&read.sealed(&backup_key, &[records[0].clone(), stray])));
+    assert_eq!(imported(&mut dm.a1, &mixed), 0);
+    assert_eq!(shown_ids(&mut dm.a1, conversation), [hello]);
+    assert_eq!(due(&mut dm.a1), [(conversation, the_day, false)]);
 }
 
 #[test]
