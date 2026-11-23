@@ -1166,27 +1166,53 @@ fn approval_state_lasts_ten_minutes() {
     let a = new_id();
     let (mut a1, _) = server.first_device(a);
 
-    // The new device's attempt holds a millisecond short of 10 minutes, and not at 10.
+    // The new device's attempt waits 10 minutes for an offer: a millisecond short of them it still
+    // takes one, and from then on it lasts 10 minutes from that offer. The approver's window began
+    // with its offer, before, so its transfer is in time even when it confirms at the last moment.
     let mut n = server.bare_device(a);
     let begun = begin(&mut n);
     server.clock.advance(TEN_MINUTES_MS - 1);
     let offered = ok(&mut a1.core, offer(&begun["commitment"]));
     let revealed = ok(&mut n.core, reveal(&offered["offer"]));
-    server.clock.advance(1);
+    server.clock.advance(TEN_MINUTES_MS - 1);
     let checked = ok(&mut a1.core, check(&revealed["reveal"]));
-    let approved = ok(&mut a1.core, confirm(checked["code"].as_str().unwrap()));
-    let refused = error(&mut n.core, approval_receive(&approved["transfer"]));
-    assert_eq!(refusal(&refused), expect("not_found", "approval"));
+    let code = checked["code"].as_str().unwrap();
+    let approved = ok(&mut a1.core, confirm(code));
+    ok(&mut n.core, accept(code));
+    ok(&mut n.core, approval_receive(&approved["transfer"]));
 
-    // So does the approver's, from its offer.
+    // 10 minutes from its offer, it's over: a transfer that comes later finds no attempt, and the
+    // device, listed already, can't be approved again. Removed from the list, it can.
     let mut m = server.bare_device(a);
     let begun = begin(&mut m);
     let offered = ok(&mut a1.core, offer(&begun["commitment"]));
     let revealed = ok(&mut m.core, reveal(&offered["offer"]));
+    let checked = ok(&mut a1.core, check(&revealed["reveal"]));
+    let code = checked["code"].as_str().unwrap();
+    let approved = ok(&mut a1.core, confirm(code));
+    ok(&mut m.core, accept(code));
+    server.clock.advance(TEN_MINUTES_MS);
+    let refused = error(&mut m.core, approval_receive(&approved["transfer"]));
+    assert_eq!(refusal(&refused), expect("not_found", "approval"));
+    let begun = begin(&mut m);
+    let refused = error(&mut a1.core, from_qr(&begun["qr"]));
+    assert_eq!(refusal(&refused), expect("exists", "device exists already"));
+    ok(
+        &mut a1.core,
+        json!({"cmd": "sign_device_list", "remove": [m.id]}),
+    );
+    let approved = ok(&mut a1.core, from_qr(&begun["qr"]));
+    ok(&mut m.core, approval_receive(&approved["transfer"]));
+
+    // The approver's attempt lasts 10 minutes from its offer.
+    let mut o = server.bare_device(a);
+    let begun = begin(&mut o);
+    let offered = ok(&mut a1.core, offer(&begun["commitment"]));
+    let revealed = ok(&mut o.core, reveal(&offered["offer"]));
     server.clock.advance(TEN_MINUTES_MS);
     let refused = error(&mut a1.core, check(&revealed["reveal"]));
     assert_eq!(refusal(&refused), expect("not_found", "approval"));
-    let refused = error(&mut m.core, reveal(&offered["offer"]));
+    let refused = error(&mut o.core, reveal(&offered["offer"]));
     assert_eq!(refusal(&refused), expect("not_found", "approval"));
 }
 

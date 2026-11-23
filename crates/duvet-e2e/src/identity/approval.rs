@@ -32,8 +32,9 @@
 //!   the code the approver shows (`approval_accept`), and only from that approver.
 //!
 //! An attempt's state lasts 10 minutes by the core's clock, in `approvals`: the new device's
-//! (`new`) from `approval_begin`, the approver's (`approver`) from `approval_offer`. Each device
-//! has one at a time: a new attempt replaces the one before.
+//! (`new`) from `approval_begin`, and once it takes an offer, from that offer; the approver's
+//! (`approver`) from `approval_offer`, so the approver's window ends first. Each device has one at
+//! a time: a new attempt replaces the one before.
 
 use std::fmt;
 
@@ -405,11 +406,11 @@ pub(crate) struct Revealed {
 }
 
 /// The new device's answer to the approver's offer: the key and the nonce its commitment hid, and
-/// the code to compare with the approver's. An attempt takes the first offer: the same one again
-/// gets the same answer, and another one `exists`.
+/// the code to compare with the approver's. An attempt takes the first offer, and lasts 10 minutes
+/// from then on: the same one again gets the same answer, and another one `exists`.
 pub(crate) fn approval_reveal(tx: &mut Tx<'_>, request: ApprovalReveal) -> Result<Revealed, Error> {
     let own = tx.own_device()?;
-    let (id, expires_at, mut attempt) = under_way::<Attempt>(tx, NEW)?;
+    let (id, _, mut attempt) = under_way::<Attempt>(tx, NEW)?;
     let offer: Offer = from_cbor(&request.offer)
         .filter(|offer: &Offer| offer.v == 1)
         .ok_or_else(|| invalid("offer", "the offer isn't an approval's"))?;
@@ -439,13 +440,15 @@ pub(crate) fn approval_reveal(tx: &mut Tx<'_>, request: ApprovalReveal) -> Resul
         }
         Some(_) => {}
         None => {
+            // From the offer it takes on: the approver's window, which began with its offer,
+            // ends first, so its transfer comes within this one.
             let capacity = FIXED_PARTS + answer.certificate.len();
             attempt.answer = Some(answer.clone());
             store(
                 tx,
                 NEW,
                 &id,
-                expires_at,
+                tx.now().saturating_add(LIFETIME_MS),
                 &to_secret_cbor(&attempt, capacity)?,
             )?;
         }
