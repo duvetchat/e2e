@@ -1160,3 +1160,104 @@ impl FakeServer {
         }
     }
 }
+
+// The end-to-end scenarios and the server as an attacker: what the server holds, the API's key as
+// an attacker server signs with it, and one installation opened again.
+
+impl FakeServer {
+    /// Every blob the server holds, each with where it holds it: each queue entry's MLS message,
+    /// the statement beside it and the fields the API adds to it; each group's info and its
+    /// validator state; the key packages; what waits in the inboxes; each user's identity key,
+    /// lists and certificates; and the nonces devices sent their messages under.
+    pub fn held(&self) -> Vec<(String, Vec<u8>)> {
+        let mut held = Vec::new();
+        for (conversation, chat) in &self.chats {
+            for entry in &chat.queue {
+                let place = format!("conversation {conversation}, entry {}", entry.seq);
+                held.push((format!("{place}: data"), entry.data.clone()));
+                if let Some(statement) = &entry.statement {
+                    held.push((format!("{place}: statement"), statement.clone()));
+                }
+                let meta = Value::Object(entry.meta.clone()).to_string();
+                held.push((format!("{place}: meta"), meta.into_bytes()));
+            }
+            if let Some(info) = &chat.group_info {
+                held.push((
+                    format!("conversation {conversation}: group info"),
+                    info.clone(),
+                ));
+            }
+            if let Some(state) = &chat.state {
+                held.push((
+                    format!("conversation {conversation}: state"),
+                    state.to_vec(),
+                ));
+            }
+        }
+        for (device, published) in &self.key_packages {
+            for key_package in published {
+                let data = STANDARD.decode(&key_package.data).expect("padded base64");
+                held.push((format!("device {device}: key package"), data));
+            }
+        }
+        for (device, inbox) in &self.inboxes {
+            for message in inbox {
+                held.push((format!("device {device}: inbox"), message.clone()));
+            }
+        }
+        for (user, record) in &self.users {
+            held.push((
+                format!("user {user}: identity key"),
+                record.identity_key.to_vec(),
+            ));
+            held.push((format!("user {user}: device list"), record.list.clone()));
+            for (device, certificate) in &record.certificates {
+                held.push((
+                    format!("user {user}: certificate of {device}"),
+                    certificate.clone(),
+                ));
+            }
+        }
+        for (device, nonce) in self.nonces.keys() {
+            held.push((format!("device {device}: nonce"), nonce.as_bytes().to_vec()));
+        }
+        held
+    }
+
+    /// The API's key, every group's external sender: what an attacker server signs its own
+    /// proposals with.
+    pub fn api_signer(&self) -> SignatureKeyPair {
+        SignatureKeyPair::from_raw(
+            SignatureScheme::ED25519,
+            self.api.to_bytes().to_vec(),
+            self.api.verifying_key().to_bytes().to_vec(),
+        )
+    }
+}
+
+impl TestDevice {
+    /// The same installation opened again: its client closed the core (a session that ended, a
+    /// logout, the app quitting) and opens the database it left, with its key.
+    pub fn reopened(self, clock: FakeClock) -> TestDevice {
+        let TestDevice {
+            core,
+            user,
+            id,
+            records,
+            _dir: dir,
+        } = self;
+        core.close();
+        let core = Core::open(OpenConfig {
+            clock: Box::new(clock),
+            ..OpenConfig::new(dir.path().join("core.db"), [1; 32])
+        })
+        .expect("the same database opens again");
+        TestDevice {
+            core,
+            user,
+            id,
+            records,
+            _dir: dir,
+        }
+    }
+}
