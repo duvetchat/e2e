@@ -243,7 +243,7 @@ CREATE TABLE catch_up_devices (
 );
 
 -- A conversation's messages and edits by time, then number: the order a history package carries
--- them in, which a share or a catch-up reads without a sort.
+-- them in, which a share or a catch-up reads without a sort, and a backup's day by its times.
 CREATE INDEX messages_by_time ON messages (conversation_id, sent_at, seq);
 CREATE INDEX edits_by_time ON edits (conversation_id, sent_at, seq);
 
@@ -295,9 +295,6 @@ END;
 CREATE TRIGGER segments_edit_delete AFTER DELETE ON edits BEGIN
     INSERT INTO segment_changes VALUES (old.conversation_id, old.sent_at);
 END;
--- A day's messages and edits, as a segment and a complete day read them.
-CREATE INDEX messages_by_day ON messages (conversation_id, sent_at);
-CREATE INDEX edits_by_day ON edits (conversation_id, sent_at);
 
 -- When this device was in each conversation's group, for the backup's complete days: from when it
 -- entered to the latest time it knows it was still in (the newest entry it applied there, or the
