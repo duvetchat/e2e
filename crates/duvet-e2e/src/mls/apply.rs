@@ -18,9 +18,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    Extra, GroupRow, check, commit_asks_first, delete_group, digest, openmls_error, own_merged,
-    rule_context, skip_unchanged_leaves, storage_error, stored_group, stored_state,
-    welcome_asks_first,
+    Extra, GroupRow, certify_by_pinned, check, commit_asks_first, delete_group, digest,
+    openmls_error, own_merged, rule_context, skip_unchanged_leaves, storage_error, stored_group,
+    stored_state, welcome_asks_first,
 };
 use crate::identity::{invalid, not_found};
 use crate::protocol::b64;
@@ -324,6 +324,7 @@ impl EntryHandler for Commits {
             Err(violation) => return Ok(block(row, violation.name())),
         };
         skip_unchanged_leaves(&mut change);
+        certify_by_pinned(tx, &mut change)?;
         if let Err(violation) = check(tx, &change, Extra::default())? {
             commit_asks_first(tx, &digest(&entry.data), &change, violation)?;
             return Ok(block(row, violation.name()));

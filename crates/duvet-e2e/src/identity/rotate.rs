@@ -16,6 +16,7 @@
 //! that takes a transfer.
 
 use std::collections::BTreeMap;
+use std::iter;
 
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -30,7 +31,8 @@ use zeroize::Zeroizing;
 use super::identity::{CreatedIdentity, create_identity, new_identity};
 use super::{
     BACKUP_KEY, DEVICE_LIST, IDENTITY_KEY, IDENTITY_SECRET, Identity, OwnDevice, from_cbor,
-    invalid, meta_get, meta_put, not_found, random, to_cbor, unix_ms,
+    invalid, keep_certificates, keep_earlier_identity, meta_get, meta_put, not_found, random,
+    to_cbor, unix_ms,
 };
 use crate::protocol::b64;
 use crate::{DirectMessage, Error, Tx};
@@ -178,9 +180,22 @@ pub(crate) fn rotate_keys(
         .clone()
         .ok_or_else(|| Error::Internal("the device has the identity but no certificate".into()))?;
     let kept = kept_keys(tx, own.user)?;
+    keep_earlier_identity(tx, own.user, &held)?;
     let (created, backup_key) = new_identity(tx, &own, staying)?;
     keep_previous(tx, own.user, &backup_key, &kept)?;
     let transfers = hand_over(tx, &own, &keys, &sender, &backup_key, &kept)?;
+    // The new identity's certificates of the user's devices, this one's and those that stay.
+    let certified = tx
+        .own_device()?
+        .certificate
+        .ok_or_else(|| Error::Internal("the new identity isn't stored".into()))?;
+    let staying = transfers.iter().map(|handed| handed.certificate.as_slice());
+    keep_certificates(
+        tx,
+        own.user,
+        iter::once(certified.as_slice()).chain(staying),
+        true,
+    )?;
     all_groups_due(tx)?;
     Ok(Rotated { created, transfers })
 }
@@ -420,6 +435,13 @@ pub(crate) fn receive_rotation(
     meta_put(tx, DEVICE_LIST, &transfer.device_list)?;
     meta_put(tx, BACKUP_KEY, &*transfer.backup_key)?;
     keep_previous(tx, own.user, &*transfer.backup_key, &kept)?;
+    keep_earlier_identity(tx, own.user, &held)?;
+    keep_certificates(
+        tx,
+        own.user,
+        iter::once(transfer.certificate.as_slice()),
+        true,
+    )?;
     all_groups_due(tx)?;
     Ok(Transferred {
         identity_key: identity.public.to_vec(),

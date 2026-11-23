@@ -58,12 +58,21 @@ CREATE TABLE contacts (
     updated_at INTEGER NOT NULL
 );
 
--- The identities a contact had before their current one.
+-- The identities a contact had before their current one, and those this device's own user had.
 CREATE TABLE contact_identities (
     user_id BLOB NOT NULL,
     identity_key BLOB NOT NULL,
     replaced_at INTEGER NOT NULL,
     PRIMARY KEY (user_id, identity_key)
+);
+
+-- Each user's devices' certificates (this device's own user's too), as observe_user and rotations
+-- bring them: only ever ones the identity this device pins or holds for the user signed.
+CREATE TABLE certificates (
+    user_id BLOB NOT NULL,
+    device_id BLOB NOT NULL,
+    certificate BLOB NOT NULL,
+    PRIMARY KEY (user_id, device_id)
 );
 
 -- The users a refused commit or welcome (by its SHA-256) asked the client to observe anew, with

@@ -1172,3 +1172,94 @@ fn a_device_signed_off_the_list_leaves_without_the_server() {
         BTreeSet::from([a1.id, b1.id])
     );
 }
+
+/// `observed` (an `observe_user` command) with `device`'s certificate in place of `certificate`.
+fn serving(mut observed: Value, device: Uuid, certificate: &[u8]) -> Value {
+    for served in observed["certificates"].as_array_mut().unwrap() {
+        if DeviceCertificate::read_unverified(&bytes(served))
+            .unwrap()
+            .device
+            == device
+        {
+            *served = json!(b64(certificate));
+        }
+    }
+    observed
+}
+
+#[test]
+fn a_device_set_up_before_the_change_keeps_its_groups() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let mut a1 = server.device(a);
+    let mut a2 = server.device(a);
+    let mut b1 = server.device(b);
+    let mut c1 = server.device(c);
+    meet(&mut server, &mut [&mut a1, &mut a2, &mut b1, &mut c1]);
+    let group = new_id();
+    server.conversation(group, Kind::Group, Some(b), &[b, a, c], false);
+    start(&mut server, &mut b1, group);
+    server.deliver_all(&mut [&mut a1, &mut a2, &mut b1, &mut c1]);
+
+    // B1 and C1 are away from now on. A sets up a replacement phone, A3, under the identity A has
+    // (as an approval or a recovery gives it), and it joins the group by external commit.
+    let mut a3 = server.device(a);
+    server.introduce(&mut a3);
+    let join = joining(&server, group);
+    server.commit(&mut a3, group, join).unwrap();
+    let (observed, _) = take_queue(&server, &mut a2, group);
+    assert_eq!(observed, [json!("same")]);
+
+    // Then A1 is lost: A2 changes the keys without it, and A3 takes its transfer. Both renew their
+    // leaves, with the server's removal of A1.
+    let rotated = ok(&mut a2.core, rotating(&server, a, &[a1.id]));
+    let new_key = key(&rotated["identity_key"]);
+    server.take_identity(a, &rotated);
+    let transfer = server.inbox(a3.id).remove(0);
+    ok(&mut a3.core, receiving(&transfer, &new_key));
+    server.remove_device(group, a1.id);
+    for device in [&mut a2, &mut a3] {
+        take_queue(&server, device, group);
+        server
+            .commit(device, group, command("refresh", group))
+            .unwrap();
+    }
+    take_queue(&server, &mut a2, group);
+
+    // B1 comes back, observes A under the new identity first, then takes the whole queue. A3's
+    // join, made under the identity before, applies: the new identity certifies the same device
+    // with the same key. Nothing blocks.
+    assert_eq!(ok(&mut b1.core, server.observed(a))["state"], "changed");
+    let (observed, reply) = take_queue(&server, &mut b1, group);
+    assert_eq!(observed, Vec::<Value>::new());
+    assert!(
+        outcomes(&reply).iter().all(|outcome| outcome == "applied"),
+        "{reply}"
+    );
+    assert_eq!(b1.group(group)["blocked"], false);
+    let state = same_group(&mut [&mut a2, &mut a3, &mut b1], group);
+    assert_eq!(
+        devices(&state).into_iter().collect::<BTreeSet<_>>(),
+        BTreeSet::from([a2.id, a3.id, b1.id, c1.id])
+    );
+
+    // C1 comes back to a server that serves, for A3, a certificate the new identity signed for
+    // other keys. A3's join, under the identity before, isn't that device then, and it's refused as
+    // before: C1 asks about A once, then the same knowledge blocks the group.
+    let (_, new_secret) = opened(a, &rotated);
+    let other_keys = DeviceCertificate::new(a, a3.id, [1; 32], [2; 32], 1)
+        .sign(&signer(&new_secret))
+        .unwrap();
+    let served = serving(server.observed(a), a3.id, &other_keys);
+    assert_eq!(ok(&mut c1.core, served.clone())["state"], "changed");
+    let entries = server.entries(group);
+    let asked = error(&mut c1.core, apply(group, &entries));
+    assert_eq!(
+        (&asked["code"], &asked["users"]),
+        (&json!("needs_identities"), &json!([a.to_string()]))
+    );
+    assert_eq!(ok(&mut c1.core, served)["state"], "same");
+    let refused = ok(&mut c1.core, apply(group, &entries));
+    assert!(outcomes(&refused).contains(&json!("rejected")), "{refused}");
+    assert_eq!(c1.group(group)["blocked"], true);
+}

@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::{DEVICE_LIST, from_cbor, invalid, meta_put, not_found, stored_key, to_cbor};
+use super::{
+    DEVICE_LIST, from_cbor, invalid, keep_certificates, meta_put, not_found, stored_key, to_cbor,
+};
 use crate::protocol::b64;
 use crate::{Error, Tx};
 
@@ -63,6 +65,7 @@ pub(crate) fn observe_user(
             "the device list is malformed",
         )
     })?;
+    let signed = || certificates.iter().map(Vec::as_slice);
     let certificates = certificates
         .iter()
         .map(|certificate| {
@@ -130,6 +133,7 @@ pub(crate) fn observe_user(
                 tx.now()
             ],
         )?;
+        keep_certificates(tx, user, signed(), true)?;
         return Ok(Observation {
             state: State::New,
             verified: false,
@@ -153,6 +157,7 @@ pub(crate) fn observe_user(
                 params![user.as_bytes().as_slice(), device_list, version, tx.now()],
             )?;
         }
+        keep_certificates(tx, user, signed(), false)?;
         return Ok(Observation {
             state: State::Same,
             verified,
@@ -189,6 +194,7 @@ pub(crate) fn observe_user(
             tx.now()
         ],
     )?;
+    keep_certificates(tx, user, signed(), true)?;
     Ok(Observation {
         state: State::Changed,
         verified: false,

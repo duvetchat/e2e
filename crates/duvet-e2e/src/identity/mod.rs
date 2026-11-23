@@ -2,6 +2,7 @@
 //! other users' identities this device pinned, and the key packages it hands out.
 
 mod approval;
+mod certificates;
 mod contacts;
 mod device;
 // The plan's layout: create_identity and sign_device_list are in identity/identity.rs.
@@ -17,6 +18,7 @@ pub(crate) use approval::{
     approval_check, approval_confirm, approval_from_qr, approval_offer, approval_receive,
     approval_reveal, receive_transfer,
 };
+pub(crate) use certificates::{keep_certificates, keep_earlier_identity};
 pub(crate) use contacts::{observe_user, safety_number, verify_user};
 pub(crate) use device::{create_device, key_packages};
 pub(crate) use identity::{create_identity, sign_device_list};

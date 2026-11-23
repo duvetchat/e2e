@@ -604,6 +604,40 @@ pub(crate) fn skip_unchanged_leaves(change: &mut MembershipChange) {
     });
 }
 
+/// For each leaf another device's commit brings, added or updated, whose certificate an identity its
+/// user had before signed, not the one this device pins now: the certificate the identity pinned
+/// signed for the same device, in its place for the rules, when this device keeps one. Such a leaf
+/// was made before the change (a device set up then, joining its groups), and the identity pinned
+/// now vouches for the same device; the rules then hold the leaf's signature key to that
+/// certificate's. A leaf that identity hasn't certified, or certified with other keys, is refused,
+/// and so is one of an identity this device hasn't seen yet, which it asks about first. The
+/// validator, which checks each commit as it comes, holds every leaf to its own certificate.
+pub(crate) fn certify_by_pinned(tx: &Tx<'_>, change: &mut MembershipChange) -> Result<(), Error> {
+    let updated = change.updated.iter_mut().map(|(_, leaf)| leaf);
+    for leaf in change.added.iter_mut().chain(updated) {
+        let Ok(claimed) = DeviceCertificate::read_unverified(&leaf.credential) else {
+            continue;
+        };
+        let Some(pinned) = tx.identity_of(claimed.user)? else {
+            continue;
+        };
+        if DeviceCertificate::verify(&leaf.credential, &pinned).is_ok() {
+            continue;
+        }
+        let made_before = tx
+            .earlier_identities_of(claimed.user)?
+            .iter()
+            .any(|key| DeviceCertificate::verify(&leaf.credential, key).is_ok());
+        if !made_before {
+            continue;
+        }
+        if let Some(current) = tx.certificate_of(claimed.user, claimed.device)? {
+            leaf.credential = current;
+        }
+    }
+    Ok(())
+}
+
 /// What the rules go by for a commit beyond its users' identities and lists.
 #[derive(Default)]
 pub(crate) struct Extra {
