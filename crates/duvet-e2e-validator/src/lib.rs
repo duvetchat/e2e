@@ -773,9 +773,12 @@ fn key32(bytes: &[u8], what: &str) -> Result<[u8; 32], Refusal> {
         .map_err(|_| Refusal::new(BAD_REQUEST, format!("{what} isn't 32 bytes")))
 }
 
-/// Exactly one CBOR value: anything after it, like anything that isn't one, is `None`.
+/// Exactly one CBOR value, nested `CBOR_DEPTH` levels at most: anything after it, like anything
+/// that isn't one, is `None`.
 fn decode<T: DeserializeOwned>(mut bytes: &[u8]) -> Option<T> {
-    let value = ciborium::from_reader(&mut bytes).ok()?;
+    let value =
+        ciborium::de::from_reader_with_recursion_limit(&mut bytes, duvet_e2e_rules::CBOR_DEPTH)
+            .ok()?;
     bytes.is_empty().then_some(value)
 }
 

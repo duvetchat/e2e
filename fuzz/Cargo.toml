@@ -12,6 +12,7 @@ ciborium = "0.2.2"
 duvet-e2e = { path = "../crates/duvet-e2e", features = ["fuzzing"] }
 duvet-e2e-rules = { path = "../crates/duvet-e2e-rules" }
 duvet-e2e-validator = { path = "../crates/duvet-e2e-validator" }
+ed25519-dalek = "2"
 libfuzzer-sys = "0.4"
 openmls_basic_credential = "=0.6.0"
 openmls_rust_crypto = "=0.6.0"
@@ -67,6 +68,13 @@ bench = false
 [[bin]]
 name = "signed"
 path = "fuzz_targets/signed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "member_list"
+path = "fuzz_targets/member_list.rs"
 test = false
 doc = false
 bench = false

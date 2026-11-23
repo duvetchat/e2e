@@ -1,18 +1,22 @@
-//! Each version of the core opens the database the version before it left. `fixtures/db-v1.sqlite`
-//! is a device's database as the first version wrote it, migration v1, made once and frozen: from
-//! then on the schema changes in migrations v2 and on, and this test, run by every later version,
-//! opens it and goes on talking.
+//! Each version of the core opens the databases the versions before it left. `fixtures/db-vN.*` are
+//! a device's database as the core of schema version N wrote it, made once and frozen. A migration
+//! vN ships its own `db-vN.*`, written by its own core (`write_db`, which names them by the schema it
+//! writes), and this test opens every version's fixtures there are, then goes on talking.
 //!
-//! Beside it, what the test needs that the server would hold: `db-v1-peer.sqlite`, the other device
-//! of its conversations, and `db-v1.json`, the entries of each queue the first device hadn't applied
-//! yet, each queue's next number, and what the first device showed then. Both databases open with
-//! the tests' key, `[1; 32]`. `write_db_v1` made them, and refuses to write them again.
+//! Each version's fixtures are three files: `db-vN.sqlite`, device A1's database; `db-vN-peer.sqlite`,
+//! B1's, the other device of its conversations; and `db-vN.json`, what the server held for them.
+//! Both databases open with the tests' key, `[1; 32]`. They hold what a migration must carry, in
+//! flight: in A1's, its own message encrypted and not yet `sent`, its own commit waiting for its
+//! `commit_result`, a waiting message, a member noted as without devices, backup days uploaded and
+//! due, an approval under way, and its queues half applied; in B1's, a kept proposal and a share's
+//! key not yet imported. The test checks each survives the open and, where a command completes it,
+//! completes.
 //!
 //! Nothing here depends on the date it runs. The core's clock is set to a minute after the fixtures
 //! were made. OpenMLS checks lifetimes against the system's clock, but only a key package's (as a
 //! device joins or is added) and the one a leaf keeps from its key package: every leaf in the
-//! fixtures' groups is one a commit brought, which has none (`write_db_v1` checks it), and the test
-//! joins no group and adds no one. It applies messages and commits, and sends them.
+//! fixtures' groups is one a commit brought, which has none (`write_db` checks it), and the test
+//! joins no group and adds no one.
 
 mod support;
 
@@ -42,24 +46,30 @@ fn fresh_id() -> Uuid {
     Uuid::from_u64_pair(0x0193_0000_0015_7000, NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
+fn id(value: &Value) -> Uuid {
+    value.as_str().unwrap().parse().unwrap()
+}
+
 /// The messages `core` shows of `conversation`: each one's ID and text.
 fn shown(core: &mut Core, conversation: Uuid) -> Vec<Value> {
-    let page = ok(
-        core,
-        json!({"cmd": "messages", "conversation_id": conversation, "limit": 100}),
-    );
-    page["messages"]
-        .as_array()
-        .unwrap()
+    messages(core, conversation)
         .iter()
         .map(|message| json!([message["message_id"], message["text"]]))
         .collect()
 }
 
+fn messages(core: &mut Core, conversation: Uuid) -> Vec<Value> {
+    let page = ok(
+        core,
+        json!({"cmd": "messages", "conversation_id": conversation, "limit": 100}),
+    );
+    page["messages"].as_array().unwrap().clone()
+}
+
 fn texts(core: &mut Core, conversation: Uuid) -> Vec<Value> {
-    shown(core, conversation)
+    messages(core, conversation)
         .into_iter()
-        .map(|message| message[1].clone())
+        .map(|message| message["text"].clone())
         .collect()
 }
 
@@ -78,7 +88,7 @@ impl Queue {
         let entries = fixture["pending"].as_array().unwrap().clone();
         let next = fixture["next"].as_u64().unwrap();
         Queue {
-            conversation: fixture["id"].as_str().unwrap().parse().unwrap(),
+            conversation: id(&fixture["id"]),
             a1: entries
                 .first()
                 .map_or(next, |entry| entry["seq"].as_u64().unwrap()),
@@ -100,9 +110,9 @@ impl Queue {
         seq
     }
 
-    /// The device that applies from `from` (A1's or B1's number) applies what it hasn't yet: each
-    /// entry's result.
-    fn deliver(&self, core: &mut Core, from: &mut u64) -> Vec<Value> {
+    /// The device that applies from `from` applies what it hasn't yet: each entry's result, which
+    /// must be one taken: applied, or the device's own.
+    fn deliver(&self, core: &mut Core, from: &mut u64) {
         let entries: Vec<&Value> = self
             .entries
             .iter()
@@ -112,8 +122,24 @@ impl Queue {
             core,
             json!({"cmd": "apply", "conversation_id": self.conversation, "entries": entries}),
         );
+        for result in reply["results"].as_array().unwrap() {
+            let taken = ["applied", "own"].contains(&result["result"].as_str().unwrap());
+            assert!(taken, "{result}");
+        }
         *from = self.next;
-        reply["results"].as_array().unwrap().clone()
+    }
+
+    /// `core` commits its pending change (`command`'s commit), and the server takes it.
+    fn commit(&mut self, core: &mut Core, command: Value) {
+        let committed = ok(core, command);
+        let seq = self.post("commit", &bytes(&committed["commit"]), json!({}));
+        let accepted = json!({
+            "cmd": "commit_result",
+            "conversation_id": self.conversation,
+            "accepted": true,
+            "seq": seq,
+        });
+        ok(core, accepted);
     }
 
     /// `core`, the device `device` of `user`, sends `text`, and hears the server took it.
@@ -151,86 +177,205 @@ impl Queue {
 
 #[test]
 fn opens_the_previous_version_db() {
-    let fixture: Value =
-        serde_json::from_str(&std::fs::read_to_string(fixtures().join("db-v1.json")).unwrap())
-            .unwrap();
-    let id = |value: &Value| -> Uuid { value.as_str().unwrap().parse().unwrap() };
+    let mut versions: Vec<PathBuf> = std::fs::read_dir(fixtures())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect();
+    versions.sort();
+    assert!(!versions.is_empty(), "no fixtures");
+    for version in versions {
+        let name = version.file_stem().unwrap().to_str().unwrap().to_owned();
+        opens(
+            &name,
+            &serde_json::from_str(&std::fs::read_to_string(&version).unwrap()).unwrap(),
+        );
+    }
+}
+
+/// Opens the fixtures of `name` (`db-vN`), which `fixture` describes, and goes on with them.
+fn opens(name: &str, fixture: &Value) {
     let (a, a1_id) = (id(&fixture["a"]["user"]), id(&fixture["a"]["device"]));
     let (b, b1_id) = (id(&fixture["b"]["user"]), id(&fixture["b"]["device"]));
     let clock = FakeClock::at(fixture["made"].as_i64().unwrap() + MINUTE);
     // Copies: opening the fixtures in place would migrate them, in a later version.
     let dir = tempfile::tempdir().unwrap();
-    let open = |name: &str| {
-        let path = dir.path().join(name);
-        std::fs::copy(fixtures().join(name), &path).unwrap();
+    let open = |file: &str| {
+        let path = dir.path().join(file);
+        std::fs::copy(fixtures().join(file), &path).unwrap();
         Core::open(OpenConfig {
             clock: Box::new(clock.clone()),
             ..OpenConfig::new(path, KEY)
         })
         .unwrap()
     };
-    let (mut a1, mut b1) = (open("db-v1.sqlite"), open("db-v1-peer.sqlite"));
+    let mut a1 = open(&format!("{name}.sqlite"));
+    let mut b1 = open(&format!("{name}-peer.sqlite"));
 
-    // Each device is who it was.
+    // Each device is who it was, and A1 shows what it showed, the waiting message among it.
     for (core, user, device) in [(&mut a1, a, a1_id), (&mut b1, b, b1_id)] {
         let status = ok(core, json!({"cmd": "status"}));
-        assert_eq!(status["user_id"], json!(user));
-        assert_eq!(status["device_id"], json!(device));
-        assert_eq!(status["has_identity"], true);
+        assert_eq!(status["user_id"], json!(user), "{name}");
+        assert_eq!(status["device_id"], json!(device), "{name}");
+        assert_eq!(status["has_identity"], true, "{name}");
     }
-
-    for conversation in fixture["conversations"].as_array().unwrap() {
-        let mut queue = Queue::of(conversation);
-        let id = queue.conversation;
-        // What A1 showed is still there, and its search finds it.
-        assert_eq!(json!(shown(&mut a1, id)), conversation["shown"]);
+    let conversations = fixture["conversations"].as_array().unwrap();
+    for conversation in conversations {
+        let id = id(&conversation["id"]);
+        assert_eq!(json!(shown(&mut a1, id)), conversation["shown"], "{name}");
         let word = conversation["word"].as_str().unwrap();
         let found = ok(
             &mut a1,
             json!({"cmd": "search", "text": word, "conversation_id": id, "limit": 10, "offset": 0}),
         );
-        assert_eq!(found["total"], 1, "{word}: {found}");
+        assert_eq!(found["total"], 1, "{name}: {word}: {found}");
+    }
+    let waiting = &fixture["waiting"];
+    let held = messages(&mut a1, id(&waiting["conversation"]));
+    let kept = held
+        .iter()
+        .find(|message| message["message_id"] == waiting["message_id"]);
+    assert_eq!(
+        kept.map(|message| &message["status"]),
+        Some(&json!("waiting"))
+    );
 
-        // A1 applies what B1 sent while it was away: messages, and B1's renewed leaf in the group.
+    // The backup days due are the ones that were, and each goes up.
+    let due = ok(&mut a1, json!({"cmd": "backup_due"}))["segments"].clone();
+    assert_eq!(due, fixture["backup_due"], "{name}");
+    for day in due.as_array().unwrap() {
+        let (conversation, day) = (&day["conversation_id"], &day["day"]);
+        let built = ok(
+            &mut a1,
+            json!({"cmd": "backup_segment", "conversation_id": conversation, "day": day}),
+        );
+        let uploaded = json!({
+            "cmd": "backup_uploaded",
+            "conversation_id": conversation,
+            "day": day,
+            "complete": built["complete"],
+            "version": built["version"],
+        });
+        ok(&mut a1, uploaded);
+    }
+    assert_eq!(
+        ok(&mut a1, json!({"cmd": "backup_due"}))["segments"],
+        json!([])
+    );
+
+    // The approval under way ends: A1 checks the new device's reveal, and confirms its code.
+    let checked = ok(
+        &mut a1,
+        json!({"cmd": "approval_check", "reveal": fixture["approval"]["reveal"]}),
+    );
+    let confirmed = ok(
+        &mut a1,
+        json!({"cmd": "approval_confirm", "code": checked["code"]}),
+    );
+    assert!(confirmed["transfer"].is_string(), "{name}");
+
+    // The member A1 noted as without devices has one again: A1 catches them up.
+    let deviceless = &fixture["deviceless"];
+    let conversation = &deviceless["conversation"];
+    ok(
+        &mut a1,
+        json!({"cmd": "without_devices", "conversation_id": conversation, "users": []}),
+    );
+    let caught_up = ok(
+        &mut a1,
+        json!({
+            "cmd": "catch_up",
+            "conversation_id": conversation,
+            "user_id": deviceless["user"],
+            "devices": [fixture["b"]["certificate"]],
+        }),
+    );
+    let delivered = json!({
+        "cmd": "catch_up_delivered",
+        "conversation_id": conversation,
+        "user_id": deviceless["user"],
+        "share_id": caught_up["share_id"],
+    });
+    ok(&mut a1, delivered);
+
+    // B1 imports the share whose key it took, which uses the key up.
+    let share = &fixture["share"];
+    let import =
+        json!({"cmd": "history_import", "share_id": share["share_id"], "parts": share["parts"]});
+    ok(&mut b1, import.clone());
+    let used = error(&mut b1, import);
+    assert_eq!(used["code"], "not_found", "{name}: {used}");
+
+    // A1 hears the answers it never heard: its message was sent, and its commit taken.
+    let outbox = &fixture["outbox"];
+    let sent = json!({
+        "cmd": "sent",
+        "conversation_id": outbox["conversation"],
+        "nonce": outbox["nonce"],
+        "message_id": outbox["message_id"],
+        "seq": outbox["seq"],
+    });
+    ok(&mut a1, sent);
+    let commit = &fixture["commit"];
+    let answer = json!({
+        "cmd": "commit_result",
+        "conversation_id": commit["conversation"],
+        "accepted": true,
+        "seq": commit["seq"],
+    });
+    ok(&mut a1, answer);
+
+    for conversation in conversations {
+        let mut queue = Queue::of(conversation);
+        let id = queue.conversation;
         let (mut a1_from, mut b1_from) = (queue.a1, queue.b1);
-        let results = queue.deliver(&mut a1, &mut a1_from);
-        assert!(!results.is_empty());
-        for result in &results {
-            assert_eq!(result["result"], "applied", "{result}");
-        }
+        // A1 applies what came while it was away: its own message and commit among them.
+        queue.deliver(&mut a1, &mut a1_from);
         let missed = conversation["missed"].as_str().unwrap();
-        assert!(texts(&mut a1, id).contains(&json!(missed)), "{missed}");
+        assert!(
+            texts(&mut a1, id).contains(&json!(missed)),
+            "{name}: {missed}"
+        );
+
+        // B1 commits the removal it kept.
+        if fixture["proposal"]["conversation"] == json!(id) {
+            queue.commit(
+                &mut b1,
+                json!({"cmd": "commit_pending", "conversation_id": id}),
+            );
+            queue.deliver(&mut b1, &mut b1_from);
+            queue.deliver(&mut a1, &mut a1_from);
+        }
 
         // And they go on: A1 renews its leaf, then each writes and reads the other.
-        let committed = ok(&mut a1, json!({"cmd": "refresh", "conversation_id": id}));
-        let seq = queue.post("commit", &bytes(&committed["commit"]), json!({}));
-        ok(
-            &mut a1,
-            json!({"cmd": "commit_result", "conversation_id": id, "accepted": true, "seq": seq}),
-        );
-        for result in queue.deliver(&mut b1, &mut b1_from) {
-            assert_eq!(result["result"], "applied", "{result}");
-        }
+        queue.commit(&mut a1, json!({"cmd": "refresh", "conversation_id": id}));
+        queue.deliver(&mut a1, &mut a1_from);
+        queue.deliver(&mut b1, &mut b1_from);
         let [state_a, state_b] =
             [&mut a1, &mut b1].map(|core| ok(core, json!({"cmd": "group", "conversation_id": id})));
         for field in ["generation", "epoch", "members", "devices", "authenticator"] {
-            assert_eq!(state_a[field], state_b[field], "{field}");
+            assert_eq!(state_a[field], state_b[field], "{name}: {field}");
         }
-
         queue.send(&mut a1, a, a1_id, "back again", clock.now_ms());
         queue.deliver(&mut b1, &mut b1_from);
-        assert!(texts(&mut b1, id).contains(&json!("back again")));
+        assert!(texts(&mut b1, id).contains(&json!("back again")), "{name}");
         queue.send(&mut b1, b, b1_id, "welcome back", clock.now_ms());
         queue.deliver(&mut a1, &mut a1_from);
-        assert!(texts(&mut a1, id).contains(&json!("welcome back")));
+        assert!(
+            texts(&mut a1, id).contains(&json!("welcome back")),
+            "{name}"
+        );
     }
 }
 
-/// Makes the fixtures, once, with the core of migration v1. Run again, a later core would write
-/// its own version's databases: it refuses to overwrite them.
+/// Makes the fixtures of the schema this core writes, `db-vN.*`, once: they're frozen, and it refuses
+/// to overwrite them.
 #[test]
-#[ignore = "made db-v1's fixtures once: they're frozen"]
-fn write_db_v1() {
+#[ignore = "made this schema's fixtures once: they're frozen"]
+fn write_db() {
     let mut server = FakeServer::new();
     let (a, b) = (new_id(), new_id());
     let (mut a1, mut b1) = (server.device(a), server.device(b));
@@ -240,17 +385,31 @@ fn write_db_v1() {
     server.introduce(&mut b1);
     let (dm, group) = (new_id(), new_id());
     server.conversation(dm, Kind::Dm, None, &[a, b], false);
-    server.conversation(group, Kind::Group, Some(a), &[a, b], false);
-    for conversation in [dm, group] {
-        let create = server.create_group(conversation);
-        server.commit(&mut a1, conversation, create).unwrap();
-        server.deliver_all(&mut [&mut a1, &mut b1]);
-        // Each device renews its leaf, so none keeps its key package's lifetime.
-        refresh(&mut server, &mut b1, conversation);
-        server.deliver_all(&mut [&mut a1, &mut b1]);
-        refresh(&mut server, &mut a1, conversation);
-        server.deliver_all(&mut [&mut a1, &mut b1]);
+    let create = server.create_group(dm);
+    server.commit(&mut a1, dm, create).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    // Each device renews its leaf, so none keeps its key package's lifetime.
+    refresh(&mut server, &mut b1, dm);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    refresh(&mut server, &mut a1, dm);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    // B's second device, in the group alone, which B takes off its list later.
+    let mut b2 = server.device(b);
+    server.publish(&mut b2);
+    for device in [&mut a1, &mut b1, &mut b2] {
+        server.introduce(device);
     }
+    server.conversation(group, Kind::Group, Some(a), &[a, b], false);
+    let create = server.create_group(group);
+    server.commit(&mut a1, group, create).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
+    refresh(&mut server, &mut b2, group);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
+    refresh(&mut server, &mut b1, group);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
+    refresh(&mut server, &mut a1, group);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
 
     // Messages both ways: one edited, one deleted, one with a file, one mentioning A.
     let hello = send(&mut server, &mut a1, dm, json!({"text": "hello"}), &[]);
@@ -269,18 +428,100 @@ fn write_db_v1() {
     });
     let plan = json!({"text": "the plan", "attachments": [file]});
     send(&mut server, &mut a1, group, plan, &[]);
+    let good = json!({"text": "looks good"});
+    send(&mut server, &mut b1, group, good, &[a]);
+    // A message too large to read, which both keep waiting.
+    let waiting = new_id();
+    let chat = server.chats.get_mut(&dm).unwrap();
+    let mut meta = serde_json::Map::new();
+    meta.insert("message_id".into(), json!(waiting));
+    meta.insert("sender_user".into(), json!(b));
+    meta.insert("sender_device".into(), json!(b1.id));
+    meta.insert("sent_at".into(), json!(server.clock.now_ms()));
+    chat.queue.push(QueueEntry {
+        seq: chat.queue.len() as u64 + 1,
+        kind: "message",
+        data: vec![0x55; 33 * 1024],
+        statement: None,
+        meta,
+    });
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
+
+    // A day later (by the core's clock, never moved back: key packages are live from the system's
+    // time on), the first day is due for backup, and A1 uploads the DM's.
+    server.clock.advance(DAY_MS);
+    let due = ok(&mut a1.core, json!({"cmd": "backup_due"}))["segments"].clone();
+    let day = due
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|day| day["conversation_id"] == json!(dm))
+        .unwrap()["day"]
+        .clone();
+    let built = ok(
+        &mut a1.core,
+        json!({"cmd": "backup_segment", "conversation_id": dm, "day": day}),
+    );
+    let uploaded = json!({
+        "cmd": "backup_uploaded",
+        "conversation_id": dm,
+        "day": day,
+        "complete": built["complete"],
+        "version": built["version"],
+    });
+    ok(&mut a1.core, uploaded);
+
+    // A1 takes B as without devices in the group: its next message there is noted for B.
+    let without = json!({"cmd": "without_devices", "conversation_id": group, "users": [b]});
+    ok(&mut a1.core, without);
     send(
         &mut server,
-        &mut b1,
+        &mut a1,
         group,
-        json!({"text": "looks good"}),
-        &[a],
+        json!({"text": "for later"}),
+        &[],
     );
-    server.deliver_all(&mut [&mut a1, &mut b1]);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
 
-    // A1 goes quiet: B1 writes in both, and renews its leaf in the group, and A1 hears none of it.
+    // A new device of A's, whose approval A1 has under way.
+    let mut a2 = server.bare_device(a);
+    let begun = ok(&mut a2.core, json!({"cmd": "approval_begin"}));
+    let offered = ok(
+        &mut a1.core,
+        json!({"cmd": "approval_offer", "commitment": begun["commitment"]}),
+    );
+    let revealed = ok(
+        &mut a2.core,
+        json!({"cmd": "approval_reveal", "offer": offered["offer"]}),
+    );
+
+    // A1's share of the DM for B, whose key B1 takes and doesn't use yet.
+    let devices: Vec<String> = certificates(&server, b).iter().map(|c| b64(c)).collect();
+    let shared = ok(
+        &mut a1.core,
+        json!({"cmd": "history_share", "conversation_id": dm, "to_user": b, "range": "all", "devices": devices}),
+    );
+    let key = shared["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|key| key["device_id"] == json!(b1.id))
+        .unwrap();
+    let from = certificate(&server, a, a1.id);
+    let taken =
+        json!({"cmd": "receive_direct", "message": key["message"], "from_certificate": from});
+    ok(&mut b1.core, taken);
+
+    // A1 goes quiet. In the DM, the server takes A1's message, whose answer A1 never hears, and
+    // B1 writes.
     let applied = [dm, group].map(|conversation| server.chats[&conversation].queue.len());
-    let shown_then = [dm, group].map(|conversation| shown(&mut a1.core, conversation));
+    let nonce = new_id().to_string();
+    let encrypted = ok(
+        &mut a1.core,
+        json!({"cmd": "encrypt", "conversation_id": dm, "nonce": nonce, "envelope": {"text": "sent as it fell"}}),
+    );
+    let (unsent, unsent_seq) =
+        server.post_message(&a1, dm, &nonce, bytes(&encrypted["ciphertext"]), &[]);
     send(
         &mut server,
         &mut b1,
@@ -288,10 +529,26 @@ fn write_db_v1() {
         json!({"text": "are you there?"}),
         &[],
     );
-    refresh(&mut server, &mut b1, group);
-    let ping = json!({"text": "ping after my renewal"});
-    send(&mut server, &mut b1, group, ping, &[a]);
+    // In the group, the server takes A1's renewal, whose answer A1 never hears; B1 writes; then B
+    // takes B2 off its list, and the server proposes B2's leaf out, which B1 keeps.
+    let renewal = ok(
+        &mut a1.core,
+        json!({"cmd": "refresh", "conversation_id": group}),
+    );
+    let renewal_seq = server.take_unanswered(&mut a1, group, &renewal);
     server.deliver(&mut b1);
+    let ping = json!({"text": "ping after your renewal"});
+    send(&mut server, &mut b1, group, ping, &[a]);
+    let list = ok(
+        &mut b1.core,
+        json!({"cmd": "sign_device_list", "remove": [b2.id]}),
+    );
+    server.take_list(b, &list["device_list"]);
+    server.introduce(&mut a1);
+    server.introduce(&mut b1);
+    server.remove_device(group, b2.id);
+    server.deliver(&mut b1);
+    let shown_now = [dm, group].map(|conversation| shown(&mut a1.core, conversation));
 
     // No leaf keeps a key package's lifetime, on either device: each one a commit brought.
     for device in [&mut a1, &mut b1] {
@@ -311,6 +568,12 @@ fn write_db_v1() {
         }
     }
 
+    let backup_due = ok(&mut a1.core, json!({"cmd": "backup_due"}))["segments"].clone();
+    let version: i64 = a1.rolled_back(|tx| {
+        Ok(tx
+            .conn()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?)
+    });
     let conversation = |id: Uuid, at: usize, shown: &[Value], word: &str, missed: &str| {
         json!({
             "id": id,
@@ -324,14 +587,22 @@ fn write_db_v1() {
     let fixture = json!({
         "made": server.clock.now_ms(),
         "a": {"user": a, "device": a1.id},
-        "b": {"user": b, "device": b1.id},
+        "b": {"user": b, "device": b1.id, "certificate": certificate(&server, b, b1.id)},
         "conversations": [
-            conversation(dm, 0, &shown_then[0], "how", "are you there?"),
-            conversation(group, 1, &shown_then[1], "plan", "ping after my renewal"),
+            conversation(dm, 0, &shown_now[0], "how", "are you there?"),
+            conversation(group, 1, &shown_now[1], "plan", "ping after your renewal"),
         ],
+        "outbox": {"conversation": dm, "nonce": nonce, "message_id": unsent, "seq": unsent_seq},
+        "commit": {"conversation": group, "seq": renewal_seq},
+        "proposal": {"conversation": group},
+        "waiting": {"conversation": dm, "message_id": waiting},
+        "deviceless": {"conversation": group, "user": b},
+        "backup_due": backup_due,
+        "share": {"share_id": shared["share_id"], "parts": shared["parts"]},
+        "approval": {"reveal": revealed["reveal"]},
     });
     std::fs::create_dir_all(fixtures()).unwrap();
-    let write = |name: &str, bytes: &[u8]| {
+    let write = |name: String, bytes: &[u8]| {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -339,10 +610,16 @@ fn write_db_v1() {
             .expect("a fixture not written yet: they're frozen");
         std::io::Write::write_all(&mut file, bytes).unwrap();
     };
-    write("db-v1.sqlite", &std::fs::read(a1.db_path()).unwrap());
-    write("db-v1-peer.sqlite", &std::fs::read(b1.db_path()).unwrap());
+    write(
+        format!("db-v{version}.sqlite"),
+        &std::fs::read(a1.db_path()).unwrap(),
+    );
+    write(
+        format!("db-v{version}-peer.sqlite"),
+        &std::fs::read(b1.db_path()).unwrap(),
+    );
     let json = serde_json::to_string_pretty(&fixture).unwrap() + "\n";
-    write("db-v1.json", json.as_bytes());
+    write(format!("db-v{version}.json"), json.as_bytes());
 }
 
 fn refresh(server: &mut FakeServer, device: &mut TestDevice, conversation: Uuid) {

@@ -1269,6 +1269,37 @@ impl TestDevice {
     }
 }
 
+impl FakeServer {
+    /// The server takes the commit `device` made (`reply`), and the device hears nothing: the
+    /// answer is still on its way. The commit's number.
+    pub fn take_unanswered(
+        &mut self,
+        device: &mut TestDevice,
+        conversation: Uuid,
+        reply: &Value,
+    ) -> u64 {
+        self.take(device, conversation, reply)
+            .expect("the server takes it")
+    }
+
+    /// The validator's request for `commit` on `conversation`'s state, in CBOR, as `check` builds
+    /// it: a seed for the fuzz target of the validator's input.
+    pub fn commit_request(&self, conversation: Uuid, commit: &[u8], group_info: &[u8]) -> Vec<u8> {
+        let chat = &self.chats[&conversation];
+        let request = Request {
+            state: chat.state.clone(),
+            message: Some(ByteBuf::from(commit.to_vec())),
+            new_group_info: Some(ByteBuf::from(group_info.to_vec())),
+            identities: self.identities(),
+            device_lists: self.device_lists(),
+            ..Request::new(Op::Commit, conversation, chat.generation.unwrap())
+        };
+        let mut out = Vec::new();
+        ciborium::into_writer(&request, &mut out).unwrap();
+        out
+    }
+}
+
 // A history package's import, for the tests that bound what an import holds (history_memory.rs,
 // hostile.rs).
 

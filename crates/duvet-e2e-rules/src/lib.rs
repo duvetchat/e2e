@@ -33,6 +33,11 @@ pub const SUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256
 /// The past epochs a group keeps secrets for, so a message that arrives late still opens.
 pub const MAX_PAST_EPOCHS: usize = 5;
 
+/// The deepest any CBOR this workspace reads may nest. Duvet's formats nest 4 levels at most (an
+/// envelope's file's thumbnail reference); a hostile nesting stops here, within the stack of any
+/// thread that reads it (a web worker's, a Dart isolate's, the validator's under wazero).
+pub const CBOR_DEPTH: usize = 32;
+
 /// A conversation's MLS group ID: its 16 bytes, then its generation (u32, big-endian).
 pub fn group_id(conversation: Uuid, generation: u32) -> GroupId {
     let mut id = conversation.as_bytes().to_vec();

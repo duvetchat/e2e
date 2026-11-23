@@ -288,8 +288,11 @@ fn hostile_inputs_are_bounded() {
     assert_eq!(result["reason"], "too_large", "{reply}");
 
     // A package of 1 MiB whose one record inflates to 1 GiB, as dense as DEFLATE makes it: refused
-    // once the record passes what a record can be. The bombs are DEFLATE streams made by hand: a
-    // check first that one inflates as meant.
+    // once the record passes what a record can be. The other shape, records each as big as a
+    // message's, is bounded by task 13's `MAX_RECORDS` instead, 256 MiB inflated and one record held
+    // at a time (`decompression_bomb_is_too_large`, `history_memory`), not by one second: each
+    // record is imported until then. The bombs are DEFLATE streams made by hand: a check first that
+    // one inflates as meant.
     assert_eq!(
         miniz_oxide::inflate::decompress_to_vec(&dense_bomb(b"xy", 2)).unwrap(),
         [b"xy".as_slice(), &[0; 2 << 20]].concat()

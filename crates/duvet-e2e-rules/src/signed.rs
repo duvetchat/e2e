@@ -57,12 +57,32 @@ pub(crate) fn encode(value: &impl Serialize) -> Vec<u8> {
     out
 }
 
-/// Decodes exactly one CBOR value: anything after it is malformed.
+/// Decodes exactly one CBOR value, nested `CBOR_DEPTH` levels at most: anything after it is
+/// malformed.
 pub(crate) fn decode<T: DeserializeOwned>(mut bytes: &[u8]) -> Result<T, RuleViolation> {
-    let value = ciborium::from_reader(&mut bytes).map_err(|_| RuleViolation::Malformed)?;
+    let value = ciborium::de::from_reader_with_recursion_limit(&mut bytes, crate::CBOR_DEPTH)
+        .map_err(|_| RuleViolation::Malformed)?;
     if bytes.is_empty() {
         Ok(value)
     } else {
         Err(RuleViolation::Malformed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CBOR_DEPTH;
+
+    /// `depth` arrays, each in the one before.
+    fn nested(depth: usize) -> Vec<u8> {
+        [vec![0x81; depth - 1], vec![0x80]].concat()
+    }
+
+    #[test]
+    fn nesting_past_the_limit_is_malformed() {
+        assert!(decode::<ciborium::Value>(&nested(CBOR_DEPTH)).is_ok());
+        let deeper = decode::<ciborium::Value>(&nested(CBOR_DEPTH + 1));
+        assert!(matches!(deeper, Err(RuleViolation::Malformed)));
     }
 }

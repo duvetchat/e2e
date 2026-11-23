@@ -22,10 +22,16 @@ const LABELS: [&str; 5] = [
     HISTORY_SHARE,
 ];
 
+// The signer the seeds in `fuzz/seeds/signed/` were made with (`write_fuzz_seeds`, in
+// `crates/duvet-e2e/tests/seeds.rs`): the Ed25519 key from the seed `[0x5e; 32]`.
 thread_local! {
     static SIGNER: (SignatureKeyPair, [u8; 32]) = {
-        let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
-        let public = signer.public().try_into().unwrap();
+        let seed = [0x5e; 32];
+        let public = ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+        let signer =
+            SignatureKeyPair::from_raw(SignatureScheme::ED25519, seed.to_vec(), public.to_vec());
         (signer, public)
     };
 }

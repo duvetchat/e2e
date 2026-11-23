@@ -515,6 +515,7 @@ dependencies = [
  "duvet-e2e",
  "duvet-e2e-rules",
  "duvet-e2e-validator",
+ "ed25519-dalek",
  "libfuzzer-sys",
  "openmls_basic_credential",
  "openmls_rust_crypto",

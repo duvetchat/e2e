@@ -14,8 +14,12 @@ use openmls_traits::crypto::OpenMlsCrypto;
 use openmls_traits::types::{HpkeKeyPair, SignatureScheme};
 use uuid::Uuid;
 
+// The devices and keys the seeds in `fuzz/seeds/direct/` were made with (`write_fuzz_seeds`, in
+// `crates/duvet-e2e/tests/seeds.rs`): this device's HPKE key derived from `[3; 32]`, the sending
+// device's Ed25519 key from the seed `[0x5e; 32]`.
 const OWN: Uuid = Uuid::from_bytes([1; 16]);
 const FROM: Uuid = Uuid::from_bytes([2; 16]);
+const SIGNER: [u8; 32] = [0x5e; 32];
 
 /// This device's keys, and the key of the device that signs.
 struct Keys {
@@ -32,8 +36,11 @@ thread_local! {
             .crypto()
             .derive_hpke_keypair(SUITE.hpke_config(), &[3; 32])
             .unwrap();
-        let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
-        let public = signer.public().try_into().unwrap();
+        let public = ed25519_dalek::SigningKey::from_bytes(&SIGNER)
+            .verifying_key()
+            .to_bytes();
+        let signer =
+            SignatureKeyPair::from_raw(SignatureScheme::ED25519, SIGNER.to_vec(), public.to_vec());
         Keys { provider, hpke, signer, public }
     };
 }

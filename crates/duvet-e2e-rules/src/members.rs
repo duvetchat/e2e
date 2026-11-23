@@ -60,7 +60,12 @@ impl MemberList {
             .extensions()
             .unknown(MEMBER_LIST_EXTENSION)
             .ok_or(RuleViolation::Malformed)?;
-        let list: Self = decode(&extension.0)?;
+        Self::read(&extension.0)
+    }
+
+    /// The list in its extension's bytes.
+    pub fn read(bytes: &[u8]) -> Result<Self, RuleViolation> {
+        let list: Self = decode(bytes)?;
         if list.v == 1 {
             Ok(list)
         } else {

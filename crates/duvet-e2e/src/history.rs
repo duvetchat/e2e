@@ -27,7 +27,7 @@ use std::io::{self, Read};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use duvet_e2e_rules::{DeviceCertificate, HISTORY_SHARE, RuleViolation, sign, verify};
+use duvet_e2e_rules::{CBOR_DEPTH, DeviceCertificate, HISTORY_SHARE, RuleViolation, sign, verify};
 use miniz_oxide::deflate::core::{CompressorOxide, create_comp_flags_from_zip_params};
 use miniz_oxide::deflate::stream::deflate;
 use miniz_oxide::inflate::stream::{InflateState, inflate};
@@ -1247,7 +1247,8 @@ pub(crate) fn read_records(
     let mut imported = 0;
     for _ in 0..count {
         let mut capped = (&mut inflater).take(MAX_RECORD as u64);
-        let read: Result<Record, _> = ciborium::from_reader(&mut capped);
+        let read: Result<Record, _> =
+            ciborium::de::from_reader_with_recursion_limit(&mut capped, CBOR_DEPTH);
         let cut = capped.limit() == 0;
         let record = read.map_err(|_| {
             if cut && !inflater.over {

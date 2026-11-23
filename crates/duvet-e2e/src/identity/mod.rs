@@ -254,9 +254,11 @@ pub(crate) fn to_cbor(value: &impl Serialize) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
-/// Exactly one CBOR value, and nothing after it.
+/// Exactly one CBOR value, nested `CBOR_DEPTH` levels at most, and nothing after it.
 pub(crate) fn from_cbor<T: DeserializeOwned>(mut bytes: &[u8]) -> Option<T> {
-    let value = ciborium::from_reader(&mut bytes).ok()?;
+    let value =
+        ciborium::de::from_reader_with_recursion_limit(&mut bytes, duvet_e2e_rules::CBOR_DEPTH)
+            .ok()?;
     bytes.is_empty().then_some(value)
 }
 
