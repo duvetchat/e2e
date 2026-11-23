@@ -2045,6 +2045,113 @@ fn a_shared_edit_counts_on_its_sharers_copy_until_the_authors_own_comes() {
     assert_eq!(shown[0]["shared_by"], json!(c));
 }
 
+/// `device` edits `message` to `text`, and posts the edit.
+fn edit_and_post(
+    server: &mut FakeServer,
+    device: &mut TestDevice,
+    conversation: Uuid,
+    message: Uuid,
+    text: &str,
+) {
+    let edited = ok(
+        &mut device.core,
+        json!({
+            "cmd": "edit",
+            "conversation_id": conversation,
+            "message_id": message,
+            "text": text,
+        }),
+    );
+    let ciphertext = bytes(&edited["ciphertext"]);
+    server.post_change(device, conversation, "edit", message, ciphertext);
+}
+
+#[test]
+fn a_sharers_later_dated_edit_hides_none_of_the_authors() {
+    let mut server = FakeServer::new();
+    let (a, b, c, d) = (new_id(), new_id(), new_id(), new_id());
+    let (conversation, [mut a1, mut b1]) = group_of(&mut server, [a, b]);
+
+    // B writes, and edits it two days later.
+    let message = say(&mut server, &mut b1, conversation, "lo que B escribió");
+    server.clock.advance(2 * DAY_MS);
+    edit_and_post(
+        &mut server,
+        &mut b1,
+        conversation,
+        message,
+        "lo que B corrigió",
+    );
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    // C comes in after, and A's share brings both. A then shares C an edit B never made, dated 30
+    // days ahead: on A's copy, with nothing on B's own word yet, it shows.
+    let mut c1 = added(&mut server, &mut a1, &mut [&mut b1], conversation, c);
+    share_all(&mut server, &mut a1, &mut c1, conversation);
+    let invented = Record {
+        kind: RecordKind::Edit,
+        id: message,
+        seq: 1_000_000,
+        user: b,
+        device: b1.id,
+        sent: (server.clock.now_ms() + 30 * DAY_MS) as u64,
+        envelope: Envelope::Edit {
+            message_id: message,
+            text: "lo que A le hace decir".into(),
+        }
+        .encode()
+        .unwrap(),
+        shared_by: None,
+        reply_to: None,
+    };
+    let deflated = miniz_oxide::deflate::compress_to_vec(&cbor(&vec![invented]), 6);
+    let command = package_of(&mut server, &mut a1, &mut c1, conversation, &deflated);
+    ok(&mut c1.core, command);
+    let text = |device: &mut TestDevice| messages_of(device, conversation)[0]["text"].clone();
+    assert_eq!(text(&mut c1), "lo que A le hace decir");
+
+    // B's own package brings B's edit without the message, older than its day: B's word outranks
+    // A's date.
+    let shared = ok(
+        &mut b1.core,
+        json!({
+            "cmd": "history_share",
+            "conversation_id": conversation,
+            "to_user": c,
+            "range": "day",
+            "devices": certificates(&server, c),
+        }),
+    );
+    let from = certificate(&server, b, b1.id);
+    assert_eq!(take_package(&mut server, &mut c1, &from, &shared), 1);
+    assert_eq!(text(&mut c1), "lo que B corrigió");
+
+    // B edits it again, and C1 takes that from the queue: B's latest shows.
+    server.clock.advance(60 * 60 * 1000);
+    edit_and_post(
+        &mut server,
+        &mut b1,
+        conversation,
+        message,
+        "lo que B dice ahora",
+    );
+    server.deliver(&mut c1);
+    assert_eq!(text(&mut c1), "lo que B dice ahora");
+
+    // D comes in after, and C1's share carries what C1 shows: B's edits, not A's.
+    let mut d1 = added(
+        &mut server,
+        &mut a1,
+        &mut [&mut b1, &mut c1],
+        conversation,
+        d,
+    );
+    share_all(&mut server, &mut c1, &mut d1, conversation);
+    let shown = messages_of(&mut d1, conversation);
+    assert_eq!(shown[0]["text"], "lo que B dice ahora");
+    assert_eq!(shown[0]["shared_by"], json!(c));
+}
+
 fn cbor(value: &impl serde::Serialize) -> Vec<u8> {
     let mut out = Vec::new();
     ciborium::into_writer(value, &mut out).unwrap();

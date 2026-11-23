@@ -455,7 +455,8 @@ pub(crate) fn echo_edit(
 /// the text it was sent with when it has none. An edit to no text leaves none. An edit counts when
 /// this device has it itself, when it came in its author's own package, or when the member who
 /// shared this copy of the message shared it too: once the author's own copy replaces theirs, their
-/// edits no longer count.
+/// edits no longer count. The first two are on the author's word, and outrank the third whatever
+/// its date: a sharer's edit shows only while the message has none on its author's word.
 pub(crate) fn refresh_text(tx: &Tx<'_>, id: i64) -> Result<(), Error> {
     let row = by_id(tx, id)?;
     let (Some(message_id), Some(envelope), false) = (row.message_id, &row.envelope, row.deleted)
@@ -467,7 +468,7 @@ pub(crate) fn refresh_text(tx: &Tx<'_>, id: i64) -> Result<(), Error> {
         .query_row(
             "SELECT text, sent_at FROM edits WHERE conversation_id = ?1 AND message_id = ?2 \
              AND user_id = ?3 AND (shared_by IS NULL OR shared_by = ?3 OR shared_by IS ?4) \
-             ORDER BY sent_at DESC, id DESC LIMIT 1",
+             ORDER BY (shared_by IS NULL OR shared_by = ?3) DESC, sent_at DESC, id DESC LIMIT 1",
             params![
                 row.conversation.as_bytes().as_slice(),
                 message_id.as_bytes().as_slice(),
@@ -658,7 +659,8 @@ pub(crate) enum Scope {
 /// time, oldest or newest first, in a package's order (by time, then number: every entry of a
 /// conversation's queue has its own), until it answers false: what a package carries, read
 /// without holding all of it. The records `records_for` and `noted_records` give, but of the edits
-/// only those that count on this device (`refresh_text`): a package carries what it shows.
+/// only those that count on this device (`refresh_text`), a sharer's only while the message has
+/// none on its author's word: a package carries what it shows.
 ///
 /// The indexes `messages_by_time` and `edits_by_time` give that order, so SQLite sorts nothing:
 /// it reads no more rows than `each` takes, never the whole range at once.
@@ -694,7 +696,10 @@ pub(crate) fn each_record(
          e.shared_by, NULL FROM edits e JOIN messages m ON m.message_id = e.message_id \
          AND m.conversation_id = e.conversation_id AND m.user_id = e.user_id \
          WHERE {edits} AND e.seq IS NOT NULL AND m.deleted = 0 AND m.status = 'ok' \
-         AND (e.shared_by IS NULL OR e.shared_by = m.user_id OR e.shared_by IS m.shared_by) \
+         AND (e.shared_by IS NULL OR e.shared_by = m.user_id OR (e.shared_by IS m.shared_by \
+         AND NOT EXISTS (SELECT 1 FROM edits a WHERE a.message_id = e.message_id \
+         AND a.conversation_id = e.conversation_id AND a.user_id = m.user_id \
+         AND (a.shared_by IS NULL OR a.shared_by = m.user_id)))) \
          AND e.sent_at >= ?3 \
          ORDER BY 6 {order}, 3 {order}"
     ))?;
@@ -841,9 +846,10 @@ pub fn import(
 /// them: as [`import`] does, but a message that waits takes only a record whose user is its sender
 /// as the API named them, a message record from its own author's package (`sharer` is its user)
 /// replaces a copy another member shared of that author's message, and another member's edit counts
-/// only on a copy that same member shared, whose text is already on their word and marked so. On a
-/// message this device read itself, or another sharer's copy, it's dropped: it could put any text
-/// in its author's name. Whether it changed something.
+/// only on a copy that same member shared, whose text is already on their word and marked so, and
+/// only while the message has no edit on its author's word (`refresh_text`). On a message this
+/// device read itself, or another sharer's copy, it's dropped: it could put any text in its
+/// author's name. Whether it changed something.
 pub fn import_shared(
     tx: &Tx<'_>,
     conversation: Uuid,

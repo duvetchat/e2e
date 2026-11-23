@@ -19,7 +19,8 @@
 //! most and one record at most a message's size, and imports them as shared by its user
 //! ([`crate::messages::import_shared`]): a message that waits takes only its sender's record, a
 //! copy another member shared gives way to its author's own, another member's edit counts only on
-//! a copy they shared, and nothing else a device has is overwritten.
+//! a copy they shared and only while no edit on its author's word is here, and nothing else a
+//! device has is overwritten.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
