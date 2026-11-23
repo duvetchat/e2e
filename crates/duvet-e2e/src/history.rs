@@ -311,7 +311,21 @@ pub fn catch_up_within(
     limit: usize,
 ) -> Result<Shared, Error> {
     let own = sharing_with(tx, conversation, user, "user_id")?;
-    let records = noted_records(tx, conversation, user)?;
+    // While the client still counts them as without a device, they're due nothing: the key would
+    // go to devices that may never come, and the package's delivery would forget its notes.
+    let without: bool = tx.conn().query_row(
+        "SELECT EXISTS (SELECT 1 FROM deviceless_users WHERE conversation_id = ?1 AND user_id = ?2)",
+        params![
+            conversation.as_bytes().as_slice(),
+            user.as_bytes().as_slice()
+        ],
+        |row| row.get(0),
+    )?;
+    let records = if without {
+        Vec::new()
+    } else {
+        noted_records(tx, conversation, user)?
+    };
     if records.is_empty() {
         return Err(not_found("catch_up"));
     }

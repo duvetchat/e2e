@@ -831,6 +831,20 @@ fn catch_up_delivers_what_was_missed() {
 }
 
 #[test]
+fn no_catch_up_while_the_member_has_no_device() {
+    let mut server = FakeServer::new();
+    let (conversation, [_, b], mut a1) = deviceless_b(&mut server);
+    say(&mut server, &mut a1, conversation, "para después");
+
+    // B sets up a device, which hasn't entered the group: A1's client still counts B as without
+    // one, so nothing is sealed to a device that may never come.
+    let _b1 = server.device(b);
+    server.introduce(&mut a1);
+    let refused = error(&mut a1.core, catch_up_command(&server, conversation, b));
+    assert_eq!(refusal(&refused), json!(["not_found", "catch_up"]));
+}
+
+#[test]
 fn a_lost_catch_up_is_made_again() {
     let mut server = FakeServer::new();
     let (conversation, [a, b], mut a1) = deviceless_b(&mut server);
