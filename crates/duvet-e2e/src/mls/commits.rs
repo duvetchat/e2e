@@ -343,7 +343,7 @@ pub(crate) fn join_external(tx: &Tx<'_>, request: JoinExternal) -> Result<Commit
     certify_leaves_by_pinned(tx, &mut leaves)?;
     let mut ctx = rule_context(tx, leaves.values().map(|leaf| leaf.user))?;
     if let Some(record) = &request.expected {
-        record.hold(&mut ctx, request.generation, false, row.is_some());
+        record.hold(&mut ctx, request.generation, false);
     }
     check_joined_state(&ctx, context, &leaves).map_err(violation)?;
 

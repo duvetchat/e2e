@@ -1395,9 +1395,9 @@ fn legacy_creator_moving_itself_first_is_rejected() {
 
 #[test]
 fn joined_list_keeps_to_the_record() {
-    // A device's record of a conversation from before the cutover, O its owner, and the lists of
-    // groups it joins past the founding: the founders still listed (entered at epoch 0) must be the
-    // record's, in its order, and O, while one of them, the owner. Who entered later is the rules'.
+    // A device's record of a group from before the cutover, O its owner, and the lists of groups
+    // it joins past the founding: every user listed must be the record's, in any order and whatever
+    // their entries say, and O, while listed, the owner.
     let (o, a, b, x) = (new_id(), new_id(), new_id(), new_id());
     let list = |kind, owner, users: &[(Uuid, u64)]| {
         let users = users
@@ -1416,20 +1416,23 @@ fn joined_list_keeps_to_the_record() {
     };
     assert!(keeps(o, &[(o, 0), (a, 0), (b, 0)]), "the record");
     assert!(keeps(o, &[(o, 0), (b, 0), (a, 4)]), "A added back");
-    assert!(keeps(o, &[(o, 0), (a, 0), (b, 0), (x, 2)]), "X added later");
+    assert!(keeps(o, &[(o, 0), (b, 0), (a, 0)]), "in another order");
     assert!(keeps(a, &[(a, 0), (b, 0)]), "O gone, A its successor");
     assert!(
-        keeps(a, &[(a, 0), (b, 0), (o, 5)]),
-        "O back, A still the owner"
+        !keeps(o, &[(o, 0), (a, 0), (b, 0), (x, 2)]),
+        "X added later"
     );
-    assert!(!keeps(o, &[(o, 0), (a, 0), (b, 0), (x, 0)]), "X a founder");
     assert!(
-        !keeps(o, &[(o, 0), (b, 0), (a, 0)]),
-        "the founders reordered"
+        !keeps(o, &[(o, 0), (a, 0), (b, 0), (x, 0)]),
+        "X entered first"
     );
     assert!(
         !keeps(a, &[(o, 0), (a, 0), (b, 0)]),
-        "A the owner, O a founder"
+        "A the owner, O listed"
+    );
+    assert!(
+        !keeps(a, &[(a, 0), (b, 0), (o, 5)]),
+        "O added back, A still the owner"
     );
     let dm = list(Kind::Dm, None, &[(o, 0), (a, 0)]);
     assert!(!keeps_record(&dm, &record), "a DM");

@@ -398,25 +398,29 @@ fn sender_key(sender: &ExternalSender) -> Result<Vec<u8>, RuleViolation> {
     Ok(key.as_slice().to_vec())
 }
 
-/// Whether `list`, a group's well-formed member list, keeps to `record`, a device's record of the
-/// conversation from before the cutover, as a group it joins past the founding must: the same kind;
-/// the users still listed who entered at the generation's start, its founders, all in the record
-/// and in its order; and the record's owner, while a founder, still the owner, as only their
-/// leaving hands the group on. A user who entered later, a member added back among them, was added
-/// by the owner, under the rules.
+/// Whether `list`, the member list of a group a device joins past the founding, keeps to `record`,
+/// the device's record of the conversation from before the cutover: the same kind and, in a group,
+/// every user listed the record's, in any order, and the record's owner, while listed, the owner.
+/// A group's entries are whatever the last commit's maker wrote, so only who is listed counts: a
+/// user the owner added since the cutover is refused too, as nothing in the list tells that
+/// addition from a planted one. In a DM, the users listed as entered at the generation's start are
+/// the record's, in its order.
 pub fn keeps_record(list: &MemberList, record: &MemberList) -> bool {
-    let founder = |user: Uuid| list.entry(user).is_some_and(|entry| entry.epoch == 0);
-    let mut recorded = record.users.iter().map(|entry| entry.user);
-    let founders_in_order = list
-        .users
-        .iter()
-        .filter(|entry| entry.epoch == 0)
-        .all(|entry| recorded.any(|user| user == entry.user));
+    let users_kept = match record.kind {
+        Kind::Group => list.users.iter().all(|entry| record.contains(entry.user)),
+        Kind::Dm => {
+            let mut recorded = record.users.iter().map(|entry| entry.user);
+            list.users
+                .iter()
+                .filter(|entry| entry.epoch == 0)
+                .all(|entry| recorded.any(|user| user == entry.user))
+        }
+    };
     let owner_kept = record
         .owner
-        .filter(|&owner| founder(owner))
+        .filter(|&owner| list.contains(owner))
         .is_none_or(|owner| list.owner == Some(owner));
-    list.kind == record.kind && founders_in_order && owner_kept
+    list.kind == record.kind && users_kept && owner_kept
 }
 
 /// A member list as Duvet keeps it: at most 20 users, each once, entered in this generation and by

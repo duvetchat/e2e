@@ -42,8 +42,9 @@ pub(crate) struct Entry {
     pub(crate) data: Vec<u8>,
     /// On the welcome of a conversation from before the cutover: its owner and members as this
     /// device's client showed them then, from the client's own record (the API never gives it).
-    /// The founding welcome must have that list, and a later join keep its founders to it
-    /// ([`Expected::hold`]).
+    /// The founding welcome must have that list, and any other join keep to it
+    /// ([`Expected::hold`]), but a reset's welcome to a device that holds the group, which goes by
+    /// the members it had.
     #[serde(default)]
     pub(crate) expected: Option<Expected>,
     /// On the server's proposal to remove a leaf of a user who leaves: their signed statement, for
@@ -102,22 +103,14 @@ impl Expected {
         entered_at_start(kind, self.owner, &self.members, generation)
     }
 
-    /// Holds a group this device joins at `generation` to this record, in `ctx`. The founding
-    /// welcome, the first commit's at generation 0, must have the record's list. Any later join at
-    /// generation 0, and a join at a later generation by a device with no row for the conversation
-    /// (it never joined), must keep its founders to it (`keeps_record`). A device with a row joins
-    /// a later generation by the reset's expectation alone.
-    pub(crate) fn hold(
-        &self,
-        ctx: &mut RuleContext,
-        generation: u32,
-        founding: bool,
-        has_row: bool,
-    ) {
+    /// Holds a group this device joins at `generation` to this record, in `ctx`: the founding
+    /// welcome, the first commit's at generation 0, to the record's list exactly; any other join,
+    /// at any generation, with a row for the conversation or without, to `keeps_record`.
+    pub(crate) fn hold(&self, ctx: &mut RuleContext, generation: u32, founding: bool) {
         let list = self.list(generation);
         if founding {
             ctx.expected_initial = Some(list);
-        } else if generation == 0 || !has_row {
+        } else {
             ctx.record = Some(list);
         }
     }
@@ -445,11 +438,16 @@ impl EntryHandler for Welcomes {
         let context = staged.group_context();
         let epoch = context.epoch().as_u64();
         let mut ctx = rule_context(tx, leaves.values().map(|leaf| leaf.user))?;
-        ctx.expected_initial = reset;
-        if let Some(record) = &entry.expected {
-            // The founding welcome is the first commit's, at generation 0.
-            let founding = (generation, epoch) == (0, 1);
-            record.hold(&mut ctx, generation, founding, at.row.is_some());
+        match (reset, &entry.expected) {
+            // A reset's welcome to a device that holds the group goes by the members it had: they
+            // carry the legitimate changes since the cutover, which the record doesn't.
+            (Some(members), _) => ctx.expected_initial = Some(members),
+            (None, Some(record)) => {
+                // The founding welcome is the first commit's, at generation 0.
+                let founding = (generation, epoch) == (0, 1);
+                record.hold(&mut ctx, generation, founding);
+            }
+            (None, None) => {}
         }
         if let Err(violation) = check_joined_state(&ctx, context, &leaves) {
             welcome_asks_first(tx, &digest(&entry.data), &ctx, &leaves, violation)?;
