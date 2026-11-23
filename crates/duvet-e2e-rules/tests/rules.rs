@@ -1441,7 +1441,8 @@ fn joined_list_keeps_to_the_record() {
 #[test]
 fn joined_dm_keeps_to_the_record() {
     // A device's record of a DM from before the cutover, and the lists of DMs it joins past the
-    // founding: a DM's users never change, so they must be the record's, whatever the entries say.
+    // founding: a DM's users never change, so they must be the record's, in any order, whatever the
+    // entries say.
     let (o, a, x) = (new_id(), new_id(), new_id());
     let dm = |users: &[(Uuid, u64)]| {
         let users = users
@@ -1465,7 +1466,7 @@ fn joined_dm_keeps_to_the_record() {
         "X in A's place"
     );
     assert!(
-        !keeps_record(&dm(&[(a, 0), (o, 0)]), &record),
+        keeps_record(&dm(&[(a, 0), (o, 0)]), &record),
         "the users the other way round"
     );
 }

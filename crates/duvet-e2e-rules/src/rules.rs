@@ -89,11 +89,20 @@ pub struct RuleContext {
     pub enforce_pending: bool,
     /// The list epoch 0 must have, when any member may make it: a conversation from before the cutover.
     pub expected_initial: Option<MemberList>,
-    /// A device's record of a conversation from before the cutover, which a group it joins past the
-    /// founding must keep to ([`keeps_record`]).
-    pub record: Option<MemberList>,
+    /// A device's record of a conversation from before the cutover, and how the group it joins is
+    /// held to it.
+    pub record: Option<Record>,
     /// The API's signature key, the group's one external sender; not compared when unknown.
     pub external_sender: Option<Vec<u8>>,
+}
+
+/// A device's record of a conversation from before the cutover, as a group it joins is held to it.
+#[derive(Clone, Debug)]
+pub enum Record {
+    /// The group's founding welcome, which must have the record's members ([`is_record`]).
+    Founding(MemberList),
+    /// Any other join, which must keep to the record ([`keeps_record`]).
+    Joined(MemberList),
 }
 
 /// Whether a commit keeps every rule. Checked in this order, so a commit breaking several gets the
@@ -275,7 +284,7 @@ pub fn unlisted_candidates(change: &MembershipChange) -> impl Iterator<Item = Uu
 }
 
 /// Whether a group's state, as a device finds it, is one Duvet makes: Duvet's context, a
-/// well-formed member list (exactly `expected_initial`, and keeping to `record`, when given), and
+/// well-formed member list (exactly `expected_initial`, and held to `record`, when given), and
 /// every leaf certified for its own key, its device on its user's latest list, its user a member.
 /// Checked in this order. Where a state enters through no commit, this is what checks it:
 /// `check_change` from epoch 0 and the validator's `create`.
@@ -332,11 +341,12 @@ fn state(
             return Err(MemberListMismatch);
         }
     }
-    if ctx
-        .record
-        .as_ref()
-        .is_some_and(|record| !keeps_record(&list, record))
-    {
+    let kept = match &ctx.record {
+        Some(Record::Founding(record)) => is_record(&list, record),
+        Some(Record::Joined(record)) => keeps_record(&list, record),
+        None => true,
+    };
+    if !kept {
         return Err(MemberListMismatch);
     }
 
@@ -399,8 +409,8 @@ fn sender_key(sender: &ExternalSender) -> Result<Vec<u8>, RuleViolation> {
 }
 
 /// Whether `list` is `record`, a device's record of a conversation from before the cutover, as a
-/// group the device founds must be: the same kind and owner, and the same users, in any order, as a
-/// record keeps none.
+/// group the device founds, and a founding welcome it takes, must be: the same kind and owner, and
+/// the same users, in any order, as a record keeps none.
 pub fn is_record(list: &MemberList, record: &MemberList) -> bool {
     let users = |list: &MemberList| {
         list.users
@@ -414,26 +424,21 @@ pub fn is_record(list: &MemberList, record: &MemberList) -> bool {
 /// Whether `list`, the member list of a group a device joins past the founding, keeps to `record`,
 /// the device's record of the conversation from before the cutover. The list's entries are
 /// whatever the last commit's maker wrote, so only its kind and who it lists count. A DM's two
-/// users never change: they're the record's, in its order. In a group, every user listed is the
+/// users never change: the list is the record ([`is_record`]). In a group, every user listed is the
 /// record's, in any order, and the record's owner, while listed, is the owner: a user the owner
 /// added since the cutover is refused too, as nothing in the list tells that addition from a
 /// planted one.
 pub fn keeps_record(list: &MemberList, record: &MemberList) -> bool {
-    let users = |list: &MemberList| {
-        list.users
-            .iter()
-            .map(|entry| entry.user)
-            .collect::<Vec<_>>()
-    };
-    let users_kept = match record.kind {
-        Kind::Dm => users(list) == users(record),
-        Kind::Group => list.users.iter().all(|entry| record.contains(entry.user)),
-    };
+    if record.kind == Kind::Dm {
+        return is_record(list, record);
+    }
     let owner_kept = record
         .owner
         .filter(|&owner| list.contains(owner))
         .is_none_or(|owner| list.owner == Some(owner));
-    list.kind == record.kind && users_kept && owner_kept
+    list.kind == record.kind
+        && list.users.iter().all(|entry| record.contains(entry.user))
+        && owner_kept
 }
 
 /// A member list as Duvet keeps it: at most 20 users, each once, entered in this generation and by

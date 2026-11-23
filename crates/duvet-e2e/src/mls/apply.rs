@@ -4,8 +4,9 @@
 //! Each kind of entry has its handler ([`EntryHandler`]); the order is this module's alone.
 
 use duvet_e2e_rules::{
-    Entry as ListEntry, Kind, LeaveStatement, MemberList, Place, RuleContext, RuleViolation,
-    check_joined_state, extract_change, group_id_parts, join_config, leaves, statement_user,
+    Entry as ListEntry, Kind, LeaveStatement, MemberList, Place, Record, RuleContext,
+    RuleViolation, check_joined_state, extract_change, group_id_parts, join_config, leaves,
+    statement_user,
 };
 use openmls::prelude::tls_codec::DeserializeBytes as _;
 use openmls::prelude::{
@@ -42,9 +43,9 @@ pub(crate) struct Entry {
     pub(crate) data: Vec<u8>,
     /// On the welcome of a conversation from before the cutover: its owner and members as this
     /// device's client showed them then, from the client's own record (the API never gives it).
-    /// The founding welcome must have that list, and any other join keep to it
-    /// ([`Expected::hold`]), but a reset's welcome to a device that holds the group, which goes by
-    /// the members it had.
+    /// The founding welcome must have its users, in any order, kind and owner, and any other join
+    /// keep to it ([`Expected::hold`]), but a reset's welcome to a device that holds the group,
+    /// which goes by the members it had.
     #[serde(default)]
     pub(crate) expected: Option<Expected>,
     /// On the server's proposal to remove a leaf of a user who leaves: their signed statement, for
@@ -104,15 +105,16 @@ impl Expected {
     }
 
     /// Holds a group this device joins at `generation` to this record, in `ctx`: the founding
-    /// welcome, the first commit's at generation 0, to the record's list exactly; any other join,
-    /// at any generation, with a row for the conversation or without, to `keeps_record`.
+    /// welcome, the first commit's at generation 0, to the record's members (`is_record`); any
+    /// other join, at any generation, with a row for the conversation or without, to
+    /// `keeps_record`.
     pub(crate) fn hold(&self, ctx: &mut RuleContext, generation: u32, founding: bool) {
         let list = self.list(generation);
-        if founding {
-            ctx.expected_initial = Some(list);
+        ctx.record = Some(if founding {
+            Record::Founding(list)
         } else {
-            ctx.record = Some(list);
-        }
+            Record::Joined(list)
+        });
     }
 }
 

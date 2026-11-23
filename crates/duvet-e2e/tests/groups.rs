@@ -478,6 +478,44 @@ fn legacy_welcome_is_held_to_the_devices_own_record() {
 }
 
 #[test]
+fn founding_welcome_takes_the_record_in_any_order() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut b1] = new_devices(&mut server, [a, b]);
+    // B's client keeps its record of a group and of a DM with B first, the API with A first: a
+    // record keeps no order, and B1 takes each founding welcome.
+    for (kind, owner) in [(Kind::Group, Some(a)), (Kind::Dm, None)] {
+        let conversation = new_id();
+        server.conversation(conversation, kind, owner, &[a, b], true);
+        b1.remember(conversation, owner, &[b, a]);
+        start(&mut server, &mut a1, conversation);
+        let taken = server.deliver(&mut b1);
+        assert_eq!(
+            results(&taken),
+            [json!([2, "welcome", "applied", null])],
+            "{kind:?}"
+        );
+    }
+}
+
+#[test]
+fn dm_join_takes_the_record_in_any_order() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut b1] = new_devices(&mut server, [a, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Dm, None, &[a, b], true);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    // B's new device joins the DM by external commit, with B's record of it, B first.
+    let [mut b2] = new_devices(&mut server, [b]);
+    let mut join = joining(&server, conversation);
+    join["expected"] = json!({"owner": null, "members": [b, a]});
+    server.commit(&mut b2, conversation, join).unwrap();
+}
+
+#[test]
 fn create_group_keeps_to_the_record() {
     let mut server = FakeServer::new();
     let (a, b, x) = (new_id(), new_id(), new_id());
