@@ -17,7 +17,7 @@ use super::members::Committed;
 use super::{
     ConversationId, Extra, GroupRow, Pending, REFRESH_AFTER_MS, can_commit, delete_group, digest,
     draft, load_group, openmls_error, own_merged, rule_context, stage, storage_error, stored_state,
-    tls, violation,
+    tls, unlisted_own_leaves, violation,
 };
 use crate::identity::{invalid, not_found, stored_uuid};
 use crate::protocol::b64;
@@ -166,13 +166,14 @@ pub(crate) fn commit_result(tx: &Tx<'_>, request: CommitResult) -> Result<Epoch,
     })
 }
 
-/// Commits the removals the server proposed, with the leave statements that came with them: what
-/// `encrypt` asks for first when it answers `pending_proposals`. Nothing pending is `not_found`
-/// (`proposals`).
+/// Commits the removals the server proposed, with the leave statements that came with them, and
+/// takes out the leaves of this device's own user whose devices are off the user's latest list:
+/// what `encrypt` asks for first when it answers `pending_proposals`. Nothing pending is
+/// `not_found` (`proposals`).
 pub(crate) fn commit_pending(tx: &Tx<'_>, request: ConversationId) -> Result<Committed, Error> {
     let (group, row) = load_group(tx, request.conversation_id)?;
     can_commit(&group, &row)?;
-    if !group.has_pending_proposals() {
+    if !group.has_pending_proposals() && unlisted_own_leaves(tx, &group)?.is_empty() {
         return Err(not_found("proposals"));
     }
     own_commit(tx, group, row)

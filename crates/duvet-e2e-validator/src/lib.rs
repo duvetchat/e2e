@@ -17,6 +17,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use duvet_e2e_rules::{
     DeviceCertificate, DeviceList, Entry, Kind, LeaveStatement, MemberList, MembershipChange,
     RuleContext, RuleViolation, SUITE, check_change, extract_change, group_id, leaves,
+    unlisted_candidates,
 };
 use openmls::messages::group_info::VerifiableGroupInfo;
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
@@ -575,7 +576,8 @@ fn rule_context(
 }
 
 /// The users whose identity and device list the rules read for `change`: those of the leaves it
-/// brings and of its members' leave statements, and at epoch 0 those of every leaf it starts from.
+/// brings, of its members' leave statements and of the leaves a member removes from users who stay
+/// ([`unlisted_candidates`]), and at epoch 0 those of every leaf it starts from.
 fn needed_users(change: &MembershipChange) -> BTreeSet<Uuid> {
     let brought = change
         .added
@@ -595,6 +597,7 @@ fn needed_users(change: &MembershipChange) -> BTreeSet<Uuid> {
             .map(|statement| statement.user)
             .filter(|user| change.before.contains(*user)),
     );
+    users.extend(unlisted_candidates(change));
     if change.epoch == 0 {
         users.extend(change.leaves.values().map(|leaf| leaf.user));
     }

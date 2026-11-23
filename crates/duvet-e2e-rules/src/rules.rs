@@ -43,7 +43,9 @@ pub enum RuleViolation {
         "the member list isn't well formed or the expected one, or isn't the previous one without the users who left and with the new ones at its end"
     )]
     MemberListMismatch,
-    #[error("a leaf goes without its user leaving or being removed, or the server removing it")]
+    #[error(
+        "a leaf goes without its user leaving or being removed, the server removing it, or its device leaving its user's list"
+    )]
     LeafRemovedWithoutReason,
     #[error("a signature doesn't verify")]
     InvalidSignature,
@@ -235,18 +237,38 @@ pub fn check_change(ctx: &RuleContext, change: &MembershipChange) -> Result<(), 
         return Err(UserNotMember);
     }
 
-    // A leaf goes when its user does, when the server proposes it, or when its own device rejoins
-    // (checked above for external commits).
+    // A leaf goes when its user does, when the server proposes it, when its own device rejoins
+    // (checked above for external commits), or when its device is off its user's latest list as
+    // the checker holds it, by any member's commit: a device taken off its list stops reading what
+    // comes next, whether or not the server proposes its removal.
     for removal in &change.removed {
         let leaf = change.leaves.get(&removal.index).ok_or(Malformed)?;
+        let unlisted = ctx
+            .device_lists
+            .get(&leaf.user)
+            .is_some_and(|list| !list.contains(leaf.device));
         let cause = removal.by_server
             || removed_users.contains(&leaf.user)
-            || matches!(change.committer, Committer::NewMember);
+            || matches!(change.committer, Committer::NewMember)
+            || unlisted;
         if !cause {
             return Err(LeafRemovedWithoutReason);
         }
     }
     Ok(())
+}
+
+/// The users whose latest lists say whether `change` may take out the leaves it removes: those of
+/// the leaves a member removes, without the server proposing it, from users who stay. The rules
+/// read their lists only for that.
+pub fn unlisted_candidates(change: &MembershipChange) -> impl Iterator<Item = Uuid> + '_ {
+    change
+        .removed
+        .iter()
+        .filter(|removal| !removal.by_server)
+        .filter_map(|removal| change.leaves.get(&removal.index))
+        .map(|leaf| leaf.user)
+        .filter(|user| change.after.contains(*user))
 }
 
 /// Whether a group's state, as a device finds it, is one Duvet makes: Duvet's context, a

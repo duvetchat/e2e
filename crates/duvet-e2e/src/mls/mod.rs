@@ -19,6 +19,7 @@ use duvet_e2e_rules::{
     CommitAad, Committer, DeviceCertificate, Entry, Kind, LeaveStatement, Leaves,
     MEMBER_LIST_EXTENSION, MemberList, MembershipChange, Place, RuleContext, RuleViolation, SUITE,
     certified, check_change, extract_change, group_id, leaves, signed_for, statement_user,
+    unlisted_candidates,
 };
 use openmls::prelude::tls_codec::{DeserializeBytes as _, Serialize as _};
 use openmls::prelude::{
@@ -263,15 +264,36 @@ pub fn load_group(tx: &Tx<'_>, conversation: Uuid) -> Result<(MlsGroup, GroupRow
 /// encrypts. What stops it from committing stops it from sending: its own commit waiting for
 /// `commit_result` or the queue (`pending_commit`), a blocked group (`rule_violation`,
 /// `group_blocked`), and its own removal proposed (`not_found`, `membership`). Beyond those, a
-/// removal the server proposed waits for its commit first, `pending_proposals`: then
-/// `commit_pending` makes it, so no message reaches a device on its way out.
+/// removal the server proposed waits for its commit first, `pending_proposals`, and so does a leaf
+/// of this device's own user whose device is off the user's latest list, whose removal the server
+/// may never propose: then `commit_pending` makes them, so no message reaches a device on its way
+/// out.
 pub fn ready_to_send(tx: &Tx<'_>, conversation: Uuid) -> Result<(), Error> {
     let (group, row) = load_group(tx, conversation)?;
     can_commit(&group, &row)?;
-    if group.has_pending_proposals() {
+    if group.has_pending_proposals() || !unlisted_own_leaves(tx, &group)?.is_empty() {
         return Err(Error::PendingProposals);
     }
     Ok(())
+}
+
+/// The leaves in `group` of this device's own user whose devices are off the user's latest list
+/// as this device holds it (removed from it, or left out of a rotation), this device's own aside.
+fn unlisted_own_leaves(tx: &Tx<'_>, group: &MlsGroup) -> Result<Vec<LeafNodeIndex>, Error> {
+    let (Some(user), own) = (tx.own_user()?, group.own_leaf_index()) else {
+        return Ok(Vec::new());
+    };
+    let Some(list) = tx.device_list_of(user)? else {
+        return Ok(Vec::new());
+    };
+    Ok(leaves(group.members())
+        .map_err(|_| stored_state())?
+        .into_iter()
+        .filter(|(index, leaf)| {
+            *index != own.u32() && leaf.user == user && !list.contains(leaf.device)
+        })
+        .map(|(index, _)| LeafNodeIndex::new(index))
+        .collect())
 }
 
 /// Whether this device can commit in its group now: not while its own commit waits for
@@ -362,8 +384,9 @@ pub(crate) fn rule_context(
     }
 }
 
-/// The users whose identities and lists the rules read for `change`: those of the leaves it brings
-/// and of its members' leave statements, and at epoch 0 those of every leaf it starts from.
+/// The users whose identities and lists the rules read for `change`: those of the leaves it brings,
+/// of its members' leave statements and of the leaves a member removes from users who stay
+/// ([`unlisted_candidates`]), and at epoch 0 those of every leaf it starts from.
 fn needed_users(change: &MembershipChange) -> BTreeSet<Uuid> {
     let brought = change
         .added
@@ -383,6 +406,7 @@ fn needed_users(change: &MembershipChange) -> BTreeSet<Uuid> {
             .map(|statement| statement.user)
             .filter(|user| change.before.contains(*user)),
     );
+    users.extend(unlisted_candidates(change));
     if change.epoch == 0 {
         users.extend(change.leaves.values().map(|leaf| leaf.user));
     }
@@ -393,9 +417,11 @@ fn needed_users(change: &MembershipChange) -> BTreeSet<Uuid> {
 /// own knowledge may be what refuses it, the users it refuses for are to be observed anew first,
 /// `needs_identities` ([`ask_first`]). Those are the users of the leaves the commit brings that
 /// this device can't certify (`device_not_listed`, `leaf_not_signed`: a member that hasn't seen a
-/// user's newest list or identity refuses their new device), and the users whose leave statement
-/// is missing or doesn't verify (`leave_without_statement`: a statement signed by a device this
-/// device doesn't know as listed).
+/// user's newest list or identity refuses their new device), the users whose leave statement is
+/// missing or doesn't verify (`leave_without_statement`: a statement signed by a device this
+/// device doesn't know as listed), and the users of the leaves a member removes
+/// (`leaf_removed_without_reason`: a member that hasn't seen a user's newest list doesn't know the
+/// device is off it).
 pub(crate) fn commit_asks_first(
     tx: &Tx<'_>,
     entry: &[u8],
@@ -414,6 +440,7 @@ pub(crate) fn commit_asks_first(
             uncertified(&ctx, &brought, true)
         }
         RuleViolation::LeaveWithoutStatement => unconfirmed_leavers(tx, change)?,
+        RuleViolation::LeafRemovedWithoutReason => unlisted_candidates(change).collect(),
         _ => return Ok(()),
     };
     ask_first(tx, entry, users)
@@ -612,9 +639,10 @@ pub(crate) struct Draft {
 
 /// This device's next commit in `group`: the key packages it adds and the users it adds and
 /// removes, and what goes with any commit of this epoch. The removals the server proposed go in
-/// (OpenMLS takes them from the proposal store), and with them the leave statements of the users
-/// whose leaves all go, who leave the list, a leaving owner handing over to the first user to have
-/// entered of those who stay.
+/// (OpenMLS takes them from the proposal store), and so do the leaves of this device's own user
+/// whose devices are off the user's latest list, proposed or not; with them, the leave statements
+/// of the users whose leaves all go, who leave the list, a leaving owner handing over to the first
+/// user to have entered of those who stay.
 pub(crate) fn draft(
     tx: &Tx<'_>,
     group: &MlsGroup,
@@ -626,7 +654,7 @@ pub(crate) fn draft(
     let list = MemberList::from_group_context(group.public_group().group_context())
         .map_err(|_| stored_state())?;
     let leaves = leaves(group.members()).map_err(|_| stored_state())?;
-    let removes: Vec<LeafNodeIndex> = leaves
+    let mut removes: Vec<LeafNodeIndex> = leaves
         .iter()
         .filter(|(_, leaf)| users_removed.contains(&leaf.user))
         .map(|(&index, _)| LeafNodeIndex::new(index))
@@ -639,6 +667,11 @@ pub(crate) fn draft(
             _ => None,
         })
         .collect();
+    for unlisted in unlisted_own_leaves(tx, group)? {
+        if !going.contains(&unlisted.u32()) && !removes.contains(&unlisted) {
+            removes.push(unlisted);
+        }
+    }
     going.extend(removes.iter().map(|leaf| leaf.u32()));
 
     let place = Place {

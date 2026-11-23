@@ -1452,6 +1452,35 @@ fn leaf_removed_without_reason_is_rejected() {
 }
 
 #[test]
+fn a_device_off_its_list_goes_by_any_members_commit() {
+    // The owner takes its second device off its list, and the server proposes nothing.
+    let mut s = Scene::group();
+    let stale = s.world.context();
+    let mut ctx = s.world.context();
+    let owner = &s.world.users[O];
+    let list = DeviceList::new(
+        owner.id,
+        public(&owner.identity),
+        2,
+        vec![owner.devices[0].id],
+    );
+    ctx.device_lists.insert(owner.id, list);
+    let removing_it = || Commit {
+        removes: vec![(O, 1)],
+        ..Commit::default()
+    };
+
+    // Any member's commit takes that device's leaf out, another user's as well as its own user's.
+    assert_eq!(s.verdict((B, 0), removing_it(), &ctx), Ok(()));
+    assert_eq!(s.verdict((O, 0), removing_it(), &ctx), Ok(()));
+    // Not while the list the checker holds still has the device.
+    assert_eq!(
+        s.verdict((B, 0), removing_it(), &stale),
+        Err(RuleViolation::LeafRemovedWithoutReason)
+    );
+}
+
+#[test]
 fn leave_with_statement_at_entry_epoch_passes() {
     let mut s = Scene::group();
     let ctx = s.world.context();

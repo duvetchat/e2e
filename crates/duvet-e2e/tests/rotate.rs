@@ -7,11 +7,14 @@ mod support;
 
 use std::collections::BTreeSet;
 
-use duvet_e2e::{Clock, Core, DirectMessage, FakeClock, OpenConfig, recovery};
+use duvet_e2e::{Clock, Core, DirectMessage, Error, FakeClock, OpenConfig, mls, recovery};
 use duvet_e2e_rules::{DeviceCertificate, DeviceList, Kind};
 use ed25519_dalek::SigningKey;
-use openmls::prelude::tls_codec::DeserializeBytes as _;
-use openmls::prelude::{BasicCredential, KeyPackageIn, ProtocolVersion, SignatureScheme};
+use openmls::prelude::tls_codec::{DeserializeBytes as _, Serialize as _};
+use openmls::prelude::{
+    BasicCredential, KeyPackageIn, MlsMessageIn, ProcessedMessageContent, ProtocolVersion,
+    SignatureScheme,
+};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
 use serde::Serialize;
@@ -1101,4 +1104,130 @@ fn a_device_takes_only_a_transfer_that_holds_up() {
     assert_eq!(identity_key(&mut a3.core), new_key);
     let again = error(&mut a3.core, receiving(&to_a3, &new_key));
     assert_eq!(again["code"], "exists");
+}
+
+/// What `encrypt` checks before it encrypts: whether the device may send now.
+fn ready(device: &mut TestDevice, conversation: Uuid) -> Result<(), Value> {
+    device
+        .core
+        .transaction(|tx| mls::ready_to_send(tx, conversation))
+        .map_err(|error| error.to_reply()["error"].clone())
+}
+
+/// An application message `device` sends in its group of `conversation`.
+fn send(device: &mut TestDevice, conversation: Uuid, text: &[u8]) -> Vec<u8> {
+    device
+        .core
+        .transaction(|tx| {
+            let (mut group, _) = mls::load_group(tx, conversation)?;
+            let own = tx.own_device()?;
+            let message = group
+                .create_message(tx.provider(), &own.signer, text)
+                .map_err(|error| Error::Internal(error.to_string()))?;
+            Ok(message.tls_serialize_detached().unwrap())
+        })
+        .unwrap()
+}
+
+/// What an application message says, as `device` decrypts it in its group of `conversation`, when
+/// it can.
+fn read(device: &mut TestDevice, conversation: Uuid, message: &[u8]) -> Result<Vec<u8>, Error> {
+    device.core.transaction(|tx| {
+        let (mut group, _) = mls::load_group(tx, conversation)?;
+        let message = MlsMessageIn::tls_deserialize_exact_bytes(message)
+            .unwrap()
+            .try_into_protocol_message()
+            .unwrap();
+        let processed = group
+            .process_message(tx.provider(), message)
+            .map_err(|error| Error::Internal(error.to_string()))?;
+        match processed.into_content() {
+            ProcessedMessageContent::ApplicationMessage(message) => Ok(message.into_bytes()),
+            _ => Err(Error::Internal("not an application message".into())),
+        }
+    })
+}
+
+#[test]
+fn a_lost_device_leaves_the_groups_without_the_server() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let mut a1 = server.device(a);
+    let mut a2 = server.device(a);
+    let mut b1 = server.device(b);
+    let mut b2 = server.device(b);
+    meet(&mut server, &mut [&mut a1, &mut a2, &mut b1, &mut b2]);
+    let group = new_id();
+    server.conversation(group, Kind::Group, Some(b), &[b, a], false);
+    start(&mut server, &mut b1, group);
+    server.deliver_all(&mut [&mut a1, &mut a2, &mut b1, &mut b2]);
+    assert_eq!(ready(&mut a1, group), Ok(()));
+
+    // A loses A2 and changes its keys without it. The server takes the new identity and list, but
+    // proposes no removal.
+    let rotated = ok(&mut a1.core, rotate(&[a2.id]));
+    server.take_identity(a, &rotated);
+
+    // A1 sends nothing while A2's leaf is in the group: it commits A2's removal first, which the
+    // server's validator takes, as A's latest list doesn't have A2.
+    let wait = ready(&mut a1, group).unwrap_err();
+    assert_eq!(wait["code"], "pending_proposals");
+    server
+        .commit(&mut a1, group, command("commit_pending", group))
+        .unwrap();
+    assert_eq!(ready(&mut a1, group), Ok(()));
+    assert!(!devices(&a1.group(group)).contains(&a2.id));
+
+    // What A1 sends next, A2 can't read. B's devices take the commit, once they observe A anew, and
+    // read it.
+    let next = send(&mut a1, group, b"after the change");
+    assert!(read(&mut a2, group, &next).is_err());
+    for device in [&mut b1, &mut b2] {
+        let (observed, reply) = take_queue(&server, device, group);
+        assert_eq!(observed, [json!("changed")]);
+        assert_eq!(outcomes(&reply), [json!("applied")]);
+        assert_eq!(read(device, group, &next).unwrap(), b"after the change");
+    }
+    let state = same_group(&mut [&mut a1, &mut b1, &mut b2], group);
+    assert_eq!(
+        devices(&state).into_iter().collect::<BTreeSet<_>>(),
+        BTreeSet::from([a1.id, b1.id, b2.id])
+    );
+}
+
+#[test]
+fn a_device_signed_off_the_list_leaves_without_the_server() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let mut a1 = server.device(a);
+    let mut a2 = server.device(a);
+    let mut b1 = server.device(b);
+    meet(&mut server, &mut [&mut a1, &mut a2, &mut b1]);
+    let group = new_id();
+    server.conversation(group, Kind::Group, Some(a), &[a, b], false);
+    start(&mut server, &mut a1, group);
+    server.deliver_all(&mut [&mut a1, &mut a2, &mut b1]);
+
+    // A1 takes A2 off A's list, which the server takes; it proposes no removal. A1 commits it.
+    let list = ok(
+        &mut a1.core,
+        json!({"cmd": "sign_device_list", "remove": [a2.id]}),
+    );
+    server.take_list(a, &list["device_list"]);
+    let wait = ready(&mut a1, group).unwrap_err();
+    assert_eq!(wait["code"], "pending_proposals");
+    server
+        .commit(&mut a1, group, command("commit_pending", group))
+        .unwrap();
+    assert_eq!(ready(&mut a1, group), Ok(()));
+
+    // B1, whose copy of A's list still has A2, asks to observe A first, then takes the commit.
+    let (observed, reply) = take_queue(&server, &mut b1, group);
+    assert_eq!(observed, [json!("same")]);
+    assert_eq!(outcomes(&reply), [json!("applied")]);
+    let state = same_group(&mut [&mut a1, &mut b1], group);
+    assert_eq!(
+        devices(&state).into_iter().collect::<BTreeSet<_>>(),
+        BTreeSet::from([a1.id, b1.id])
+    );
 }
