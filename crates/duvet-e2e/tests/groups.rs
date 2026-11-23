@@ -478,6 +478,62 @@ fn legacy_welcome_is_held_to_the_devices_own_record() {
 }
 
 #[test]
+fn create_group_keeps_to_the_record() {
+    let mut server = FakeServer::new();
+    let (a, b, x) = (new_id(), new_id(), new_id());
+    let [mut a1, _b1, _x1] = new_devices(&mut server, [a, b, x]);
+
+    // The API lists X, whom A's client never showed, beside A, the owner, and B. A1 makes the
+    // group with its record beside the API's list, and refuses: X is no user of the record.
+    let planted = new_id();
+    server.conversation(planted, Kind::Group, Some(a), &[a, b, x], true);
+    let mut create = server.create_group(planted);
+    create["expected"] = json!({"owner": a, "members": [a, b]});
+    let refused = error(&mut a1.core, create);
+    assert_eq!(
+        (&refused["code"], &refused["rule"]),
+        (&json!("rule_violation"), &json!("member_list_mismatch"))
+    );
+    assert_eq!(a1.no_group(planted)["what"], "group");
+
+    // The record's users, whatever order it keeps them in, make the group.
+    for members in [[a, b], [b, a]] {
+        let conversation = new_id();
+        server.conversation(conversation, Kind::Group, Some(a), &[a, b], true);
+        let mut create = server.create_group(conversation);
+        create["expected"] = json!({"owner": a, "members": members});
+        assert_eq!(ok(&mut a1.core, create)["generation"], 0);
+    }
+}
+
+#[test]
+fn reset_without_the_group_is_refused() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut b1] = new_devices(&mut server, [a, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], true);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    // A2, a device of the owner that never held the group, can't make its next generation: a reset
+    // takes its members from the group it holds, so it has none to found the group with, whatever
+    // record its client passes.
+    let [mut a2] = new_devices(&mut server, [a]);
+    let reset = json!({
+        "cmd": "reset_group",
+        "conversation_id": conversation,
+        "key_packages": server.claim(&[b]),
+        "expected": {"owner": a, "members": [a, b]},
+    });
+    let refused = error(&mut a2.core, reset);
+    assert_eq!(
+        (&refused["code"], &refused["what"]),
+        (&json!("not_found"), &json!("group"))
+    );
+}
+
+#[test]
 fn reset_welcome_goes_by_the_reset_not_the_record() {
     let mut server = FakeServer::new();
     let (a, b, c) = (new_id(), new_id(), new_id());

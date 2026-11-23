@@ -3,13 +3,15 @@
 
 use std::collections::BTreeMap;
 
-use duvet_e2e_rules::{Entry, Kind, MemberList, group_config, group_id};
+use duvet_e2e_rules::{Entry, Kind, MemberList, RuleViolation, group_config, group_id, is_record};
 use openmls::prelude::{BasicCredential, ExternalSender, MlsGroup, OpenMlsProvider};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::apply::Expected;
 use super::{
-    Draft, Extra, GroupRow, Pending, Skipped, Staged, choose, load_group, openmls_error, stage, tls,
+    Draft, Extra, GroupRow, Pending, Skipped, Staged, choose, load_group, openmls_error, stage,
+    tls, violation,
 };
 use crate::identity::invalid;
 use crate::protocol::b64;
@@ -35,6 +37,10 @@ pub(crate) struct CreateGroup {
     /// A conversation from before the cutover, whose epoch 0 any member may make.
     #[serde(default)]
     legacy: bool,
+    /// For a conversation from before the cutover: the client's own record of it, as a welcome
+    /// entry's `expected`, which the members given must be.
+    #[serde(default)]
+    expected: Option<Expected>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,7 +69,7 @@ pub(crate) struct Created {
 /// A new conversation's group: epoch 0, with the members and owner the API gives, and the first
 /// commit, which brings in every device on their signed lists with a valid key package, waiting
 /// for `commit_result`. The owner makes it, but in a DM or a conversation from before the cutover,
-/// whose list must then be the API's.
+/// whose list must then be the API's, and the client's record of it when it passes one.
 pub(crate) fn create_group(tx: &Tx<'_>, request: CreateGroup) -> Result<Created, Error> {
     let conversation = request.conversation_id;
     if GroupRow::read(tx, conversation)?.is_some() {
@@ -86,6 +92,13 @@ pub(crate) fn create_group(tx: &Tx<'_>, request: CreateGroup) -> Result<Created,
         })
         .collect();
     let list = MemberList::new(request.kind, request.owner, entries);
+    // The group this device founds holds its members to the client's record, as the founding
+    // welcome holds every other member's device to theirs.
+    if let Some(record) = &request.expected
+        && !is_record(&list, &record.list(0))
+    {
+        return Err(violation(RuleViolation::MemberListMismatch));
+    }
     let api = ExternalSender::new(
         key.as_slice().into(),
         BasicCredential::new(API_CREDENTIAL.to_vec()).into(),
@@ -123,7 +136,8 @@ pub(crate) fn create_group(tx: &Tx<'_>, request: CreateGroup) -> Result<Created,
 /// The conversation's group again, at its next generation: epoch 0 with the members it has, and a
 /// first commit, as a new conversation's. The way out of a group a commit that broke the rules
 /// blocked: its owner makes it (in a DM, either member), and the members take it as an epoch 0
-/// with their list. The current generation's group stays until the server takes the new one.
+/// with their list. The current generation's group stays until the server takes the new one. A
+/// device without the group can't reset it (`not_found`): it has no members to found it with.
 pub(crate) fn reset_group(tx: &Tx<'_>, request: ResetGroup) -> Result<Created, Error> {
     let conversation = request.conversation_id;
     let (group, mut row) = load_group(tx, conversation)?;

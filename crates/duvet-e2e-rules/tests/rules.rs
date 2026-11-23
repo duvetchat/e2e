@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use duvet_e2e_rules::{
     CommitAad, DeviceCertificate, DeviceList, Entry, Kind, LeaveStatement, MEMBER_LIST_EXTENSION,
     MemberList, MembershipChange, Removed, RuleContext, RuleViolation, SUITE, check_change,
-    check_joined_state, check_state, extract_change, group_config, group_id, join_config,
-    keeps_record, leaf_capabilities, leaves,
+    check_joined_state, check_state, extract_change, group_config, group_id, is_record,
+    join_config, keeps_record, leaf_capabilities, leaves,
 };
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
@@ -1468,6 +1468,34 @@ fn joined_dm_keeps_to_the_record() {
         !keeps_record(&dm(&[(a, 0), (o, 0)]), &record),
         "the users the other way round"
     );
+}
+
+#[test]
+fn founded_list_is_the_record() {
+    // A device's record of a conversation from before the cutover, O its owner, and the lists a
+    // group the device founds may have: the record's users in any order, with its kind and owner.
+    let (o, a, b, x) = (new_id(), new_id(), new_id(), new_id());
+    let list = |kind, owner, users: &[Uuid]| {
+        let users = users
+            .iter()
+            .map(|&user| Entry {
+                user,
+                generation: 0,
+                epoch: 0,
+            })
+            .collect();
+        MemberList::new(kind, owner, users)
+    };
+    let group = |users: &[Uuid]| list(Kind::Group, Some(o), users);
+    let record = group(&[o, a, b]);
+    assert!(is_record(&group(&[o, a, b]), &record), "the record");
+    assert!(is_record(&group(&[b, o, a]), &record), "in another order");
+    assert!(!is_record(&group(&[o, a, b, x]), &record), "X too");
+    assert!(!is_record(&group(&[o, a]), &record), "B left out");
+    let owned_by_a = list(Kind::Group, Some(a), &[o, a, b]);
+    assert!(!is_record(&owned_by_a, &record), "another owner");
+    let dm = list(Kind::Dm, None, &[o, a]);
+    assert!(!is_record(&dm, &group(&[o, a])), "a DM for a group");
 }
 
 #[test]

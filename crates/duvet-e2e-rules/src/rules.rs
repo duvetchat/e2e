@@ -398,6 +398,19 @@ fn sender_key(sender: &ExternalSender) -> Result<Vec<u8>, RuleViolation> {
     Ok(key.as_slice().to_vec())
 }
 
+/// Whether `list` is `record`, a device's record of a conversation from before the cutover, as a
+/// group the device founds must be: the same kind and owner, and the same users, in any order, as a
+/// record keeps none.
+pub fn is_record(list: &MemberList, record: &MemberList) -> bool {
+    let users = |list: &MemberList| {
+        list.users
+            .iter()
+            .map(|entry| entry.user)
+            .collect::<BTreeSet<_>>()
+    };
+    (list.kind, list.owner) == (record.kind, record.owner) && users(list) == users(record)
+}
+
 /// Whether `list`, the member list of a group a device joins past the founding, keeps to `record`,
 /// the device's record of the conversation from before the cutover. The list's entries are
 /// whatever the last commit's maker wrote, so only its kind and who it lists count. A DM's two

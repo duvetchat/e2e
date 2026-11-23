@@ -94,7 +94,7 @@ pub(crate) struct Expected {
 impl Expected {
     /// The record as a list at `generation`'s start: a group's when there's an owner, a DM's when
     /// there isn't.
-    fn list(&self, generation: u32) -> MemberList {
+    pub(crate) fn list(&self, generation: u32) -> MemberList {
         let kind = if self.owner.is_some() {
             Kind::Group
         } else {
