@@ -305,18 +305,18 @@ fn history_share_week() {
     assert_eq!(received["conversation_id"], json!(conversation));
     assert_eq!(received["user_id"], json!(a));
     let imported = ok(&mut b1.core, import(&shared));
-    assert_eq!(imported["imported"], 3);
+    assert_eq!(imported["imported"], 2);
 
-    // B1 has the week as A1 had it, C's edit included, each message marked as shared by A, and
-    // nothing from before the week.
+    // B1 has the week's messages as A1 had them, each marked as shared by A, and nothing from
+    // before the week. C's edit isn't applied: an edit counts only from its author's own package.
     let shown = messages_of(&mut b1, conversation);
     assert_eq!(ids(&shown), [yesterday, five]);
     assert!(!ids(&shown).contains(&old));
     assert_eq!(shown[0]["user_id"], json!(a));
     assert_eq!(shown[0]["text"], "ayer");
     assert_eq!(shown[1]["user_id"], json!(c));
-    assert_eq!(shown[1]["text"], "hace cinco días, editado");
-    assert!(shown[1]["edited_at"].is_i64());
+    assert_eq!(shown[1]["text"], "hace cinco días");
+    assert_eq!(shown[1]["edited_at"], Value::Null);
     for message in &shown {
         assert_eq!(message["shared_by"], json!(a));
         assert_eq!(message["status"], "ok");
@@ -1524,18 +1524,18 @@ fn a_package_goes_only_to_devices_its_sender_can_check() {
     }
 }
 
-/// A1's package of `records` (what deflate gives, or not) for B, sealed to B's devices, whose key
-/// B1 takes: the import of it.
+/// `sharer`'s package of `records` (what deflate gives, or not) for `recipient`'s user, sealed to
+/// that user's devices, whose key `recipient` takes: the import of it.
 fn package_of(
     server: &mut FakeServer,
-    a1: &mut TestDevice,
-    b1: &mut TestDevice,
+    sharer: &mut TestDevice,
+    recipient: &mut TestDevice,
     conversation: Uuid,
     records: &[u8],
 ) -> Value {
-    let b = b1.user;
+    let b = recipient.user;
     let devices = certificate_bytes(server, b);
-    let sealed = a1
+    let sealed = sharer
         .core
         .transaction(|tx| {
             let own = tx.own_device()?;
@@ -1552,8 +1552,8 @@ fn package_of(
         .unwrap();
     let shared = serde_json::to_value(&sealed).unwrap();
     post_keys(server, &shared);
-    let from = certificate(server, a1.user, a1.id);
-    let taken = take_inbox(server, b1, &from);
+    let from = certificate(server, sharer.user, sharer.id);
+    let taken = take_inbox(server, recipient, &from);
     assert!(taken[0].get("ok").is_some(), "{}", taken[0]);
     import(&shared)
 }
@@ -1699,6 +1699,49 @@ fn a_delivery_after_the_member_lost_their_devices_forgets_nothing() {
     let from = certificate(&server, a, a1.id);
     assert_eq!(take_package(&mut server, &mut b2, &from, &next), 1);
     assert_eq!(ids(&messages_of(&mut b2, conversation)), [missed]);
+}
+
+#[test]
+fn an_edit_from_another_members_share_leaves_the_text() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1, mut b1, mut c1] = new_devices(&mut server, [a, b, c]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b, c], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1]);
+
+    // A writes, and B1 reads it itself.
+    let message = say(&mut server, &mut a1, conversation, "lo que A escribió");
+    server.deliver_all(&mut [&mut b1, &mut c1]);
+
+    // C shares B an edit of A's message, as A's, dated after anything A could send.
+    let edit = Record {
+        kind: RecordKind::Edit,
+        id: message,
+        seq: 1_000_000,
+        user: a,
+        device: a1.id,
+        sent: i64::MAX as u64,
+        envelope: Envelope::Edit {
+            message_id: message,
+            text: "inventado".into(),
+        }
+        .encode()
+        .unwrap(),
+        shared_by: None,
+        reply_to: None,
+    };
+    let deflated = miniz_oxide::deflate::compress_to_vec(&cbor(&vec![edit]), 6);
+    let command = package_of(&mut server, &mut c1, &mut b1, conversation, &deflated);
+    let imported = ok(&mut b1.core, command)["imported"].clone();
+
+    // B1 shows A's message as it was: an edit counts only from its author's own package.
+    let shown = messages_of(&mut b1, conversation);
+    assert_eq!(shown[0]["text"], "lo que A escribió");
+    assert_eq!(shown[0]["edited_at"], Value::Null);
+    assert_eq!(shown[0]["shared_by"], Value::Null);
+    assert_eq!(imported, 0);
 }
 
 fn cbor(value: &impl serde::Serialize) -> Vec<u8> {

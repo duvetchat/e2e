@@ -832,8 +832,10 @@ pub fn import(
 
 /// Brings in one `record` of `conversation` from a package `sharer` shared, marked as shared by
 /// them: as [`import`] does, but a message that waits takes only a record whose user is its sender
-/// as the API named them, and a record from its own author's package (`sharer` is its user)
-/// replaces a copy another member shared. Whether it changed something.
+/// as the API named them, a message record from its own author's package (`sharer` is its user)
+/// replaces a copy another member shared, and an edit counts only from its author's own package.
+/// One another member shares could put any text in its author's name, on a message this device
+/// may have read itself, so it's dropped. Whether it changed something.
 pub fn import_shared(
     tx: &Tx<'_>,
     conversation: Uuid,
@@ -842,6 +844,7 @@ pub fn import_shared(
 ) -> Result<bool, Error> {
     match record.kind {
         RecordKind::Message => import_message(tx, conversation, record, Some(sharer), Some(sharer)),
+        RecordKind::Edit if record.user != sharer => Ok(false),
         RecordKind::Edit => import_edit(tx, conversation, record, Some(sharer)),
     }
 }
