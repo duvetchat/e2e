@@ -10,6 +10,7 @@ use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use zeroize::Zeroizing;
 
+use super::rotate::{keep_previous, opened_previous};
 use super::{
     BACKUP_KEY, DEVICE_LIST, IDENTITY_KEY, IDENTITY_SECRET, Identity, invalid, meta_put, recovery,
     unix_ms,
@@ -31,6 +32,11 @@ pub(crate) struct Recover {
     /// The user's latest device list, as the server serves it.
     #[serde(with = "b64")]
     device_list: Vec<u8>,
+    /// The backup keys from before the current one, sealed with it, which the server keeps beside
+    /// the wrapped backup key once the user changed keys (`rotate_keys`): with them, this device
+    /// opens the backup's segments those keys encrypted.
+    #[serde(default, with = "b64::option")]
+    wrapped_previous_backup_keys: Option<Vec<u8>>,
 }
 
 #[derive(Serialize)]
@@ -43,8 +49,9 @@ pub(crate) struct Recovered {
 
 /// This device takes the user's identity with the recovery key, certifies itself with it, and signs
 /// the next version of the user's list with itself added: the certificate and the list are for the
-/// server. A key that doesn't open what the server keeps, or a list the identity didn't sign,
-/// changes nothing.
+/// server. It keeps the backup keys from before the current one, when the server gives them. A key
+/// that doesn't open what the server keeps, earlier keys that don't open with the backup key for
+/// this user, or a list the identity didn't sign, change nothing.
 pub(crate) fn recover(tx: &mut Tx<'_>, request: Recover) -> Result<Recovered, Error> {
     let own = tx.own_device()?;
     if tx.own_identity_key()?.is_some() {
@@ -56,6 +63,11 @@ pub(crate) fn recover(tx: &mut Tx<'_>, request: Recover) -> Result<Recovered, Er
     let backup_key =
         recovery::unwrap_backup_key(&recovery_key, own.user, &request.wrapped_backup_key)?;
     let secret = recovery::decrypt_identity(&backup_key, own.user, &request.encrypted_identity)?;
+    let previous = request
+        .wrapped_previous_backup_keys
+        .as_deref()
+        .map(|sealed| opened_previous(sealed, own.user, &backup_key))
+        .transpose()?;
     let identity = Identity::from_secret(&secret);
 
     let current =
@@ -97,6 +109,9 @@ pub(crate) fn recover(tx: &mut Tx<'_>, request: Recover) -> Result<Recovered, Er
         &device_list,
         &backup_key,
     )?;
+    if let Some(keys) = &previous {
+        keep_previous(tx, own.user, &*backup_key, keys)?;
+    }
     Ok(Recovered {
         certificate,
         device_list,

@@ -3,9 +3,11 @@
 //! The core has no network of its own. Clients hand it what the server sent and send what it returns,
 //! through one entry point that takes and returns JSON: [`Core::handle`].
 
+mod backup;
 mod direct;
 mod envelope;
 mod error;
+pub mod history;
 mod identity;
 pub mod messages;
 pub mod mls;

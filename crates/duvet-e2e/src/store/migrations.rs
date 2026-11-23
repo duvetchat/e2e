@@ -111,7 +111,9 @@ CREATE TABLE groups (
 );
 
 -- Messages as decrypted, with their edits applied. message_id is the API's, unknown while one is being sent.
--- envelope is the message as it was sent, text its author's latest; a deleted message keeps neither.
+-- envelope is the message as it was sent, text its author's latest edit that counts here
+-- (refresh_text), else the envelope's; a deleted message keeps neither. shared_by is the member
+-- whose package brought this copy, none for one this device read itself.
 -- reply_to is the message it answers, as the API gives it: replies go in the clear.
 CREATE TABLE messages (
     id INTEGER PRIMARY KEY,
@@ -153,8 +155,11 @@ CREATE TRIGGER messages_fts_update AFTER UPDATE OF text ON messages BEGIN
     INSERT INTO messages_fts (rowid, text) VALUES (new.id, new.text);
 END;
 
--- Each edit of a message as it came: a message's text is its author's latest. An edit of a message
--- this device can't read yet (waiting, or not here at all) waits here for it.
+-- Each edit of a message as it came, shared_by the member whose package brought it (none for one
+-- this device holds itself: from the queue, or its own). A message's text is its author's latest
+-- edit that counts (refresh_text): one on the author's word (held here, or from the author's own
+-- package) outranks any another member shared, which counts only on that member's copy. An edit of
+-- a message this device can't read yet (waiting, or not here at all) waits here for it.
 CREATE TABLE edits (
     id INTEGER PRIMARY KEY,
     conversation_id BLOB NOT NULL,
@@ -188,12 +193,14 @@ CREATE TABLE outbox (
 );
 
 -- What was sent while a member had no device, for their catch-up, with the identity this device had
--- pinned for them then (none when it had none).
+-- pinned for them then (none when it had none). `taken` counts the times the note was taken again
+-- (an edit while they had no device), so a catch-up made before forgets only what it carried.
 CREATE TABLE deviceless (
     conversation_id BLOB NOT NULL,
     user_id BLOB NOT NULL,
     message INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
     identity_key BLOB,
+    taken INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (conversation_id, user_id, message)
 );
 
@@ -204,15 +211,108 @@ CREATE TABLE deviceless_users (
     PRIMARY KEY (conversation_id, user_id)
 );
 
--- The backup's days: which are complete, and which to upload (again).
+-- The keys of the history packages other devices sent this one (shares and catch-ups), by package:
+-- whose they are, of which conversation, and the sending device's signature key, which must have
+-- signed the package.
+CREATE TABLE history_keys (
+    share_id BLOB PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('share', 'catch_up')),
+    conversation_id BLOB NOT NULL,
+    user_id BLOB NOT NULL,
+    device_id BLOB NOT NULL,
+    signature_key BLOB NOT NULL,
+    key BLOB NOT NULL,
+    received_at INTEGER NOT NULL
+);
+
+-- The messages each catch-up this device made carried, by package, with their notes' `taken` then,
+-- until its client says it delivered it (catch_up_delivered): then those notes go, unless they were
+-- taken again since.
+CREATE TABLE catch_ups (
+    share_id BLOB NOT NULL,
+    conversation_id BLOB NOT NULL,
+    user_id BLOB NOT NULL,
+    message INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
+    taken INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (share_id, message)
+);
+
+-- The devices each catch-up this device made was sealed to: its delivery forgets notes only while
+-- one of them is on the member's list.
+CREATE TABLE catch_up_devices (
+    share_id BLOB NOT NULL,
+    device_id BLOB NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (share_id, device_id)
+);
+
+-- A conversation's messages and edits by time, then number: the order a history package carries
+-- them in, which a share or a catch-up reads without a sort, and a backup's day by its times.
+CREATE INDEX messages_by_time ON messages (conversation_id, sent_at, seq);
+CREATE INDEX edits_by_time ON edits (conversation_id, sent_at, seq);
+
+-- The backup's days: a row for each conversation and UTC day (YYYY-MM-DD) this device holds anything
+-- of, or the server holds a segment of as far as it knows. `dirty` while what the device holds of the
+-- day changed since the server last held the same; `version` counts the day's changes, so that
+-- backup_uploaded takes as the day only the build of its current version; `uploaded` what the server
+-- holds: none it knows of, an incomplete copy (0) or a complete one (1); `held` once the device
+-- imported a complete copy of the day, which it then holds whole.
 CREATE TABLE segments (
     conversation_id BLOB NOT NULL,
     day TEXT NOT NULL,
-    complete INTEGER NOT NULL DEFAULT 0,
     dirty INTEGER NOT NULL DEFAULT 1,
-    uploaded_at INTEGER,
+    version INTEGER NOT NULL DEFAULT 0,
+    uploaded INTEGER CHECK (uploaded IN (0, 1)),
+    held INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (conversation_id, day)
 );
+-- A conversation and a time written here mark that UTC day's segment changed.
+CREATE VIEW segment_changes (conversation_id, at) AS SELECT NULL, NULL WHERE 0;
+CREATE TRIGGER segment_changed INSTEAD OF INSERT ON segment_changes BEGIN
+    INSERT OR IGNORE INTO segments (conversation_id, day)
+        VALUES (new.conversation_id, strftime('%Y-%m-%d', new.at / 1000.0, 'unixepoch'));
+    UPDATE segments SET dirty = 1, version = version + 1
+        WHERE conversation_id = new.conversation_id
+        AND day = strftime('%Y-%m-%d', new.at / 1000.0, 'unixepoch');
+END;
+-- A message or an edit written, dropped, or changed in what a segment carries of it (not its shown
+-- text) changes its day, and the day it had: a deletion, the message's day and its edits'.
+CREATE TRIGGER segments_message_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO segment_changes VALUES (new.conversation_id, new.sent_at);
+END;
+CREATE TRIGGER segments_message_update AFTER UPDATE OF message_id, conversation_id, seq, user_id,
+    device_id, sent_at, envelope, deleted, status, shared_by, reply_to ON messages BEGIN
+    INSERT INTO segment_changes VALUES (old.conversation_id, old.sent_at);
+    INSERT INTO segment_changes VALUES (new.conversation_id, new.sent_at);
+END;
+CREATE TRIGGER segments_message_delete AFTER DELETE ON messages BEGIN
+    INSERT INTO segment_changes VALUES (old.conversation_id, old.sent_at);
+END;
+CREATE TRIGGER segments_edit_insert AFTER INSERT ON edits BEGIN
+    INSERT INTO segment_changes VALUES (new.conversation_id, new.sent_at);
+END;
+CREATE TRIGGER segments_edit_update AFTER UPDATE OF conversation_id, message_id, seq, user_id,
+    device_id, sent_at, text, shared_by ON edits BEGIN
+    INSERT INTO segment_changes VALUES (old.conversation_id, old.sent_at);
+    INSERT INTO segment_changes VALUES (new.conversation_id, new.sent_at);
+END;
+CREATE TRIGGER segments_edit_delete AFTER DELETE ON edits BEGIN
+    INSERT INTO segment_changes VALUES (old.conversation_id, old.sent_at);
+END;
+
+-- When this device was in each conversation's group, for the backup's complete days: from when it
+-- entered to the latest time it knows it was still in (the newest entry it applied there, or the
+-- commit that took it out). A row each time it enters; `open` while it's in. A stay whose start only
+-- the device's own clock knew (an external join, a welcome without the API's time) begins at the
+-- first time the API gives after it: both are NULL until then.
+CREATE TABLE memberships (
+    conversation_id BLOB NOT NULL,
+    entered_at INTEGER,
+    seen_until INTEGER,
+    open INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX memberships_by_conversation ON memberships (conversation_id);
 
 -- The key packages this device handed out, to know when to make more.
 CREATE TABLE key_packages (

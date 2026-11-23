@@ -2,9 +2,10 @@
 //! the group carries meanwhile. This device notes for them what it sends in that time, under the
 //! identity it had pinned for them then (none, if it had none). Once a device of theirs enters the
 //! group (another device's commit brings its leaf), or the client no longer counts them as without
-//! one, they're due a catch-up with what was noted, which `apply` names (`catch_up_due`) until the
-//! catch-up empties the note. A catch-up goes only to the identity the note was made for, or to any
-//! when none was pinned then: a new identity of theirs gets none of what was sent before it.
+//! one, they're due a catch-up with what was noted, which `apply` names (`catch_up_due`) until a
+//! delivered catch-up (`catch_up_delivered`) carried every note. A catch-up goes only to the
+//! identity the note was made for, or to any when none was pinned then: a new identity of theirs
+//! gets none of what was sent before it.
 
 use std::collections::BTreeSet;
 
@@ -20,7 +21,7 @@ use crate::mls::GroupRow;
 use crate::{Error, Tx};
 
 /// The noted messages whose identity is the one now pinned for their user, or none.
-const NOTED: &str = "SELECT d.message FROM deviceless d LEFT JOIN contacts c ON c.user_id = d.user_id \
+pub(crate) const NOTED: &str = "SELECT d.message FROM deviceless d LEFT JOIN contacts c ON c.user_id = d.user_id \
      WHERE d.conversation_id = ?1 AND d.user_id = ?2 \
      AND (d.identity_key IS NULL OR d.identity_key = c.identity_key)";
 
@@ -73,6 +74,20 @@ pub(crate) fn note(tx: &Tx<'_>, conversation: Uuid, message: i64) -> Result<(), 
         "INSERT OR IGNORE INTO deviceless (conversation_id, user_id, message, identity_key) \
          SELECT u.conversation_id, u.user_id, ?2, c.identity_key FROM deviceless_users u \
          LEFT JOIN contacts c ON c.user_id = u.user_id WHERE u.conversation_id = ?1",
+        params![conversation.as_bytes().as_slice(), message],
+    )?;
+    Ok(())
+}
+
+/// Notes again the message `message` of `conversation`, which this device just edited, for every
+/// member without a device there now: a note it has already is taken again (`taken` counts it), so
+/// a catch-up made before the edit doesn't forget it as it's delivered.
+pub(crate) fn note_again(tx: &Tx<'_>, conversation: Uuid, message: i64) -> Result<(), Error> {
+    tx.conn().execute(
+        "INSERT INTO deviceless (conversation_id, user_id, message, identity_key) \
+         SELECT u.conversation_id, u.user_id, ?2, c.identity_key FROM deviceless_users u \
+         LEFT JOIN contacts c ON c.user_id = u.user_id WHERE u.conversation_id = ?1 \
+         ON CONFLICT (conversation_id, user_id, message) DO UPDATE SET taken = taken + 1",
         params![conversation.as_bytes().as_slice(), message],
     )?;
     Ok(())
@@ -157,9 +172,11 @@ pub fn noted_records(tx: &Tx<'_>, conversation: Uuid, user: Uuid) -> Result<Vec<
     Ok(records)
 }
 
-/// Empties what this device noted for `user` in `conversation` that a catch-up can carry, once
-/// their catch-up is made: they're no longer due one. A message still waiting for the API's
-/// answer, which no catch-up had, keeps its note for the next.
+/// Tests only: empties what this device noted for `user` in `conversation` that a catch-up can
+/// carry, as if a catch-up had carried all of it. The core never forgets a note but by a delivered
+/// catch-up that carried it (`catch_up_delivered`), so nothing else calls this: a caller would lose
+/// messages a member never got. A message still waiting for the API's answer keeps its note.
+#[cfg(feature = "test-hooks")]
 pub fn forget_noted(tx: &Tx<'_>, conversation: Uuid, user: Uuid) -> Result<(), Error> {
     tx.conn().execute(
         &format!(

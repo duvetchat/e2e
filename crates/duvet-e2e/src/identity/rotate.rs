@@ -34,6 +34,7 @@ use super::{
     invalid, keep_certificates, keep_earlier_identity, meta_get, meta_put, not_found, random,
     to_cbor, unix_ms,
 };
+use crate::backup::Day;
 use crate::protocol::b64;
 use crate::{DirectMessage, Error, Tx};
 
@@ -47,10 +48,10 @@ const TRANSFER_FIXED: usize = 256;
 /// A rotation's transfer to a device that stays: `{v: 1, identity, backup_key,
 /// previous_backup_keys, certificate, device_list, previous_list, sender}`. `identity` is the new
 /// identity's 32-byte secret, `backup_key` the new backup key, `previous_backup_keys` those before
-/// it (32 bytes each, oldest first), `certificate` the receiving device's from the new identity,
-/// `device_list` the new list. `previous_list` and `sender` are of the identity before, which the
-/// receiving device still holds: the user's list as the sending device had it, and the sending
-/// device's certificate.
+/// it (each with the day it was replaced on, oldest first), `certificate` the receiving device's from
+/// the new identity, `device_list` the new list. `previous_list` and `sender` are of the identity
+/// before, which the receiving device still holds: the user's list as the sending device had it,
+/// and the sending device's certificate.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Transfer {
@@ -59,8 +60,7 @@ struct Transfer {
     identity: Zeroizing<[u8; 32]>,
     #[serde(with = "secret")]
     backup_key: Zeroizing<[u8; 32]>,
-    #[serde(with = "secret")]
-    previous_backup_keys: Zeroizing<Vec<u8>>,
+    previous_backup_keys: Vec<EarlierKey>,
     #[serde(with = "serde_bytes")]
     certificate: Vec<u8>,
     #[serde(with = "serde_bytes")]
@@ -71,11 +71,15 @@ struct Transfer {
     sender: Vec<u8>,
 }
 
-/// What `rotate_keys` answers: `create_identity`'s reply, and the devices that stay.
+/// What `rotate_keys` answers: `create_identity`'s reply, the backup keys from before sealed with
+/// the new one, for the server to keep beside the wrapped backup key (none when this device kept
+/// none, as it held no backup key), and the devices that stay.
 #[derive(Serialize)]
 pub(crate) struct Rotated {
     #[serde(flatten)]
     created: CreatedIdentity,
+    #[serde(with = "b64::option", skip_serializing_if = "Option::is_none")]
+    wrapped_previous_backup_keys: Option<Vec<u8>>,
     transfers: Vec<Handed>,
 }
 
@@ -110,10 +114,27 @@ const STALE_LEAF: i64 = i64::MIN;
 const PREVIOUS_KEYS_AAD: &[u8] = b"duvet previous backup keys v1";
 const KEY: usize = 32;
 const NONCE: usize = 12;
+/// Room for an earlier key in CBOR: its 32 bytes, its day and their names.
+const EARLIER_KEY_ROOM: usize = 64;
+
+/// A backup key from before the current one, and the UTC day it was replaced on (`YYYY-MM-DD`): it
+/// opens only the backup's segments of the days before that one, so whoever kept it (the lost device
+/// a rotation is for) can't seal segments of later days that devices would take.
+///
+/// Its key is wiped where it lies as it drops, so a list of them is sized before keys go in, read by
+/// reference, and sorted in place: a list that grows, or hands its keys out by value, leaves copies
+/// in the blocks it frees.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EarlierKey {
+    #[serde(with = "secret")]
+    pub(crate) key: Zeroizing<[u8; 32]>,
+    pub(crate) until: Day,
+}
 
 /// The backup keys before the current one, sealed with it (AES-256-GCM, with
-/// "duvet previous backup keys v1" || user_id as associated data): `{v: 1, nonce, ct}`, `ct` their
-/// 32 bytes each, oldest first.
+/// "duvet previous backup keys v1" || user_id as associated data): `{v: 1, nonce, ct}`, `ct` the CBOR
+/// list of the keys (`EarlierKey`: `{key, until}`), oldest first.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PreviousKeys {
@@ -185,12 +206,14 @@ pub(crate) fn rotate_keys(
         .certificate
         .clone()
         .ok_or_else(|| Error::Internal("the device has the identity but no certificate".into()))?;
-    let kept = kept_keys(tx, own.user)?;
+    let kept = kept_keys(tx, own.user, 0)?;
     let previous_list = meta_get(tx, DEVICE_LIST)?
         .ok_or_else(|| Error::Internal("the identity has no device list".into()))?;
     keep_earlier_identity(tx, own.user, &held)?;
     let (created, backup_key) = new_identity(tx, &own, staying)?;
     keep_previous(tx, own.user, &backup_key, &kept)?;
+    // What a device recovered with the new recovery key takes, to open the segments of those keys.
+    let wrapped_previous_backup_keys = meta_get(tx, PREVIOUS_BACKUP_KEYS)?;
     let before = Before {
         sender: &sender,
         list: &previous_list,
@@ -210,7 +233,11 @@ pub(crate) fn rotate_keys(
         true,
     )?;
     all_groups_due(tx)?;
-    Ok(Rotated { created, transfers })
+    Ok(Rotated {
+        created,
+        wrapped_previous_backup_keys,
+        transfers,
+    })
 }
 
 /// A device that stays but the rotating one, with its keys as its certificate has them.
@@ -272,7 +299,7 @@ fn staying_keys(
 struct Before<'a> {
     sender: &'a [u8],
     list: &'a [u8],
-    backup_keys: &'a [u8],
+    backup_keys: &'a [EarlierKey],
 }
 
 /// For each device of `keys`: a certificate of its keys from the new identity, which this device
@@ -310,7 +337,7 @@ fn hand_over(
                 v: 1,
                 identity: secret_array(&secret)?,
                 backup_key: secret_array(backup_key)?,
-                previous_backup_keys: Zeroizing::new(previous.to_vec()),
+                previous_backup_keys: previous.to_vec(),
                 certificate: certificate.clone(),
                 device_list: list.clone(),
                 previous_list: before.list.to_vec(),
@@ -321,7 +348,7 @@ fn hand_over(
                 + list.len()
                 + before.list.len()
                 + sender.len()
-                + previous.len();
+                + previous.len() * EARLIER_KEY_ROOM;
             let mut payload = Zeroizing::new(Vec::with_capacity(capacity));
             ciborium::into_writer(&transfer, &mut *payload)
                 .map_err(|_| Error::Internal("a CBOR value couldn't be written".into()))?;
@@ -451,20 +478,23 @@ pub(crate) fn receive_rotation(
         return Err(rule("wrong_device"));
     }
 
-    // The backup keys from before: this device's own, then the transfer's it hasn't, each once.
-    if transfer.previous_backup_keys.len() % KEY != 0 {
-        return Err(unreadable());
-    }
-    let own_kept = kept_keys(tx, own.user)?;
-    let mut kept = Zeroizing::new(Vec::with_capacity(
-        own_kept.len() + transfer.previous_backup_keys.len(),
-    ));
-    kept.extend_from_slice(&own_kept);
-    for key in transfer.previous_backup_keys.chunks(KEY) {
-        if !own_kept.chunks(KEY).any(|kept| kept == key) {
-            kept.extend_from_slice(key);
+    // The backup keys from before: this device's own, then the transfer's it hasn't, each once, with
+    // the earliest day either says it was replaced on (this device's current key, replaced now as it
+    // takes the transfer, was replaced when the rotation was made).
+    let mut kept = kept_keys(tx, own.user, transfer.previous_backup_keys.len())?;
+    let replaced = kept.len().checked_sub(1);
+    for earlier in &transfer.previous_backup_keys {
+        match kept.iter_mut().find(|kept| *kept.key == *earlier.key) {
+            Some(kept) => kept.until = kept.until.min(earlier.until),
+            None => kept.push(earlier.clone()),
         }
     }
+    // What this device sealed under its own key of the days from the one it was replaced on no
+    // longer opens: those days are built again, under the new key.
+    if let Some(replaced) = replaced {
+        crate::backup::rebuild_from(tx, kept[replaced].until)?;
+    }
+    kept.sort_unstable_by_key(|kept| kept.until);
 
     tx.conn().execute(
         "UPDATE device SET certificate = ?1",
@@ -526,12 +556,20 @@ impl Tx<'_> {
     /// The backup keys before the current one, oldest first: what the rotations kept, so the
     /// backup's segments they encrypted still open. None without a backup key.
     pub fn previous_backup_keys(&self) -> Result<Vec<Zeroizing<[u8; 32]>>, Error> {
+        Ok(self
+            .earlier_backup_keys()?
+            .iter()
+            .map(|earlier| earlier.key.clone())
+            .collect())
+    }
+
+    /// The backup keys before the current one, oldest first, each with the UTC day it was replaced
+    /// on. None without a backup key.
+    pub(crate) fn earlier_backup_keys(&self) -> Result<Vec<EarlierKey>, Error> {
         let (Some(user), Some(current)) = (self.own_user()?, backup_key(self)?) else {
             return Ok(Vec::new());
         };
-        let keys = previous_keys(self, user, &current)?;
-        let (keys, _) = keys.as_chunks::<KEY>();
-        Ok(keys.iter().map(|key| Zeroizing::new(*key)).collect())
+        previous_keys(self, user, &current)
     }
 }
 
@@ -560,16 +598,20 @@ fn all_groups_due(tx: &Tx<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-/// The backup keys a rotation keeps: those before the current one, then the current one, 32 bytes
-/// each, oldest first. None while the device has no backup key.
-fn kept_keys(tx: &Tx<'_>, user: Uuid) -> Result<Zeroizing<Vec<u8>>, Error> {
+/// The backup keys a rotation keeps: those before the current one, then the current one, replaced
+/// today, oldest first; none while the device has no backup key. The list has room for `more`, so
+/// it never grows.
+fn kept_keys(tx: &Tx<'_>, user: Uuid, more: usize) -> Result<Vec<EarlierKey>, Error> {
     let Some(current) = backup_key(tx)? else {
-        return Ok(Zeroizing::new(Vec::new()));
+        return Ok(Vec::with_capacity(more));
     };
     let previous = previous_keys(tx, user, &current)?;
-    let mut kept = Zeroizing::new(Vec::with_capacity(previous.len() + KEY));
-    kept.extend_from_slice(&previous);
-    kept.extend_from_slice(&*current);
+    let mut kept = Vec::with_capacity(previous.len() + 1 + more);
+    kept.extend(previous.iter().cloned());
+    kept.push(EarlierKey {
+        key: current,
+        until: Day::of(tx.now()),
+    });
     Ok(kept)
 }
 
@@ -586,16 +628,51 @@ fn backup_key(tx: &Tx<'_>) -> Result<Option<Zeroizing<[u8; 32]>>, Error> {
     Ok(Some(key))
 }
 
-/// The backup keys before `current`, which seals them: 32 bytes each, oldest first.
-fn previous_keys(tx: &Tx<'_>, user: Uuid, current: &[u8; 32]) -> Result<Zeroizing<Vec<u8>>, Error> {
+/// The backup keys before `current`, which seals them, oldest first.
+fn previous_keys(tx: &Tx<'_>, user: Uuid, current: &[u8; 32]) -> Result<Vec<EarlierKey>, Error> {
     let Some(stored) = meta_get(tx, PREVIOUS_BACKUP_KEYS)? else {
-        return Ok(Zeroizing::new(Vec::new()));
+        return Ok(Vec::new());
     };
-    let sealed: PreviousKeys = from_cbor(&stored)
-        .filter(|sealed: &PreviousKeys| sealed.v == 1 && sealed.nonce.len() == NONCE)
-        .ok_or_else(malformed)?;
-    let keys = Zeroizing::new(
-        cipher(current)?
+    let sealed = read_previous(&stored).ok_or_else(malformed)?;
+    unseal_previous(&sealed, user, current).ok_or_else(malformed)
+}
+
+/// The backup keys before `backup_key` that the server keeps for `user`, as `rotate_keys` handed
+/// them out (`wrapped_previous_backup_keys`), which a device recovered with the recovery key or
+/// approved after a rotation takes, oldest first. What isn't such a blob is `bad_command`; one that
+/// doesn't open with `backup_key` for `user` (another user's, or altered), `decrypt_failed`
+/// (`previous_backup_keys`).
+pub(super) fn opened_previous(
+    sealed: &[u8],
+    user: Uuid,
+    backup_key: &[u8; 32],
+) -> Result<Vec<EarlierKey>, Error> {
+    let sealed = read_previous(sealed).ok_or_else(|| {
+        invalid(
+            "wrapped_previous_backup_keys",
+            "the earlier backup keys are malformed",
+        )
+    })?;
+    unseal_previous(&sealed, user, backup_key).ok_or_else(|| Error::DecryptFailed {
+        kind: "previous_backup_keys".into(),
+    })
+}
+
+/// Backup keys from before, sealed: `{v: 1, nonce, ct}`.
+fn read_previous(bytes: &[u8]) -> Option<PreviousKeys> {
+    from_cbor(bytes).filter(|sealed: &PreviousKeys| sealed.v == 1 && sealed.nonce.len() == NONCE)
+}
+
+/// The keys `sealed` holds, opened with `backup_key` for `user`, oldest first. Read through a scratch
+/// buffer that's wiped after.
+fn unseal_previous(
+    sealed: &PreviousKeys,
+    user: Uuid,
+    backup_key: &[u8; 32],
+) -> Option<Vec<EarlierKey>> {
+    let plain = Zeroizing::new(
+        cipher(backup_key)
+            .ok()?
             .decrypt(
                 Nonce::from_slice(&sealed.nonce),
                 Payload {
@@ -603,28 +680,37 @@ fn previous_keys(tx: &Tx<'_>, user: Uuid, current: &[u8; 32]) -> Result<Zeroizin
                     aad: &associated(user),
                 },
             )
-            .map_err(|_| malformed())?,
+            .ok()?,
     );
-    if keys.len() % KEY != 0 {
-        return Err(malformed());
-    }
-    Ok(keys)
+    let mut scratch = Zeroizing::new([0u8; 4096]);
+    let mut bytes = plain.as_slice();
+    let keys: Vec<EarlierKey> =
+        ciborium::de::from_reader_with_buffer(&mut bytes, &mut scratch[..]).ok()?;
+    bytes.is_empty().then_some(keys)
 }
 
 /// Keeps `keys`, the backup keys before `backup_key`, the current one, sealed with it; with none
 /// to keep, no row.
-fn keep_previous(tx: &Tx<'_>, user: Uuid, backup_key: &[u8], keys: &[u8]) -> Result<(), Error> {
+pub(super) fn keep_previous(
+    tx: &Tx<'_>,
+    user: Uuid,
+    backup_key: &[u8],
+    keys: &[EarlierKey],
+) -> Result<(), Error> {
     if keys.is_empty() {
         tx.conn()
             .execute("DELETE FROM meta WHERE key = ?1", [PREVIOUS_BACKUP_KEYS])?;
         return Ok(());
     }
+    let mut plain = Zeroizing::new(Vec::with_capacity(keys.len() * EARLIER_KEY_ROOM));
+    ciborium::into_writer(&keys, &mut *plain)
+        .map_err(|_| Error::Internal("a CBOR value couldn't be written".into()))?;
     let nonce = random(tx.provider().rand(), NONCE)?.to_vec();
     let ct = cipher(backup_key)?
         .encrypt(
             Nonce::from_slice(&nonce),
             Payload {
-                msg: keys,
+                msg: &plain,
                 aad: &associated(user),
             },
         )

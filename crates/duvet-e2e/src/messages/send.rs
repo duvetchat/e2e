@@ -273,7 +273,7 @@ pub(crate) fn edit(tx: &Tx<'_>, request: Edit) -> Result<Changed, Error> {
         },
     )?;
     store::refresh_text(tx, row.id)?;
-    deviceless::note(tx, conversation, row.id)?;
+    deviceless::note_again(tx, conversation, row.id)?;
     Ok(sealed.changed())
 }
 

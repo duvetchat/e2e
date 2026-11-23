@@ -255,6 +255,46 @@ fn leave_mark(
     Ok(applied)
 }
 
+/// The messages of `conversation` the API saw deleted (`message_ids`), each one this device holds as
+/// it was: it goes as its author's deletion takes it, and one this device couldn't read leaves the
+/// mark of its deletion, by the sender the API gave. One deleted here already, or of another
+/// conversation, stays as it is. The server can only make a device hold less this way.
+pub(crate) fn erase_deleted<'a>(
+    tx: &Tx<'_>,
+    conversation: Uuid,
+    message_ids: impl IntoIterator<Item = &'a Uuid>,
+) -> Result<(), Error> {
+    for &message_id in message_ids {
+        match store::by_message_id(tx, message_id)? {
+            Some(row) if row.conversation != conversation || row.deleted => {}
+            Some(row) if row.status == Status::Waiting => {
+                store::forget(tx, &row)?;
+                store::insert(
+                    tx,
+                    NewRow {
+                        message_id: Some(message_id),
+                        nonce: None,
+                        conversation,
+                        seq: None,
+                        user: row.user,
+                        device: row.device,
+                        sent_at: row.sent_at,
+                        opened: None,
+                        status: Status::Ok,
+                        deleted: true,
+                        shared_by: None,
+                        reply_to: None,
+                    },
+                )?;
+                store::forget_edits(tx, conversation, message_id)?;
+            }
+            Some(row) => store::erase(tx, &row)?,
+            None => {}
+        }
+    }
+    Ok(())
+}
+
 /// An entry this device can't open. A message is kept as waiting, with the ID, the sender and the
 /// time the API gives, unless the device has it already.
 fn undecryptable(

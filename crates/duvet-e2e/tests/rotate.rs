@@ -907,8 +907,8 @@ struct TransferPayload {
     identity: Vec<u8>,
     #[serde(with = "serde_bytes")]
     backup_key: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    previous_backup_keys: Vec<u8>,
+    /// The earlier backup keys, `[{key, until}]`: none here.
+    previous_backup_keys: Vec<()>,
     #[serde(with = "serde_bytes")]
     certificate: Vec<u8>,
     #[serde(with = "serde_bytes")]
