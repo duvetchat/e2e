@@ -64,6 +64,9 @@ pub(crate) struct Entry {
     /// The users a message mentions, as its sender listed them for the API.
     #[serde(default)]
     pub(crate) mentions: Vec<Uuid>,
+    /// The message a message answers, as the API gives it: replies go in the clear.
+    #[serde(default)]
+    pub(crate) reply_to: Option<Uuid>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

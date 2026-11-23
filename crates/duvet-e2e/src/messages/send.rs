@@ -46,6 +46,9 @@ pub(crate) struct Sent {
     message_id: Uuid,
     /// The message's number in the conversation's queue.
     seq: u64,
+    /// The message it answers, as the client gave it to the API: replies go in the clear.
+    #[serde(default)]
+    reply_to: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,6 +128,7 @@ pub(crate) fn encrypt(tx: &Tx<'_>, request: Encrypt) -> Result<Encrypted, Error>
             status: Status::Pending,
             deleted: false,
             shared_by: None,
+            reply_to: None,
         },
     )?;
     // Noted as it leaves, for whoever has no device now: by the API's answer, the client may have
@@ -211,7 +215,8 @@ pub(crate) fn sent(tx: &Tx<'_>, request: Sent) -> Result<Empty, Error> {
         .ok_or_else(|| not_found("message"))?;
     match row.message_id {
         None => {
-            if !store::bind(tx, &row, Some(request.message_id), request.seq, None, &[])? {
+            let id = Some(request.message_id);
+            if !store::bind(tx, &row, id, request.seq, None, &[], request.reply_to)? {
                 return Err(invalid("message_id", "another message has this ID"));
             }
         }

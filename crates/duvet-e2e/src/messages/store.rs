@@ -17,7 +17,7 @@ use crate::{Attachment, Envelope, Error, Tx};
 
 /// The columns `Row::read` takes, in its order.
 const COLUMNS: &str = "id, message_id, nonce, conversation_id, seq, user_id, device_id, \
-    sent_at, envelope, text, edited_at, deleted, status, shared_by";
+    sent_at, envelope, text, edited_at, deleted, status, shared_by, reply_to";
 
 /// Whether a message can be shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -69,6 +69,8 @@ pub(crate) struct Row {
     pub(crate) deleted: bool,
     pub(crate) status: Status,
     pub(crate) shared_by: Option<Uuid>,
+    /// The message it answers, as the API gives it.
+    pub(crate) reply_to: Option<Uuid>,
 }
 
 impl Row {
@@ -89,6 +91,7 @@ impl Row {
             deleted: row.get(11)?,
             status: row.get(12)?,
             shared_by: row.get(13)?,
+            reply_to: row.get(14)?,
         })
     }
 
@@ -120,6 +123,7 @@ struct Columns {
     deleted: bool,
     status: String,
     shared_by: Option<Vec<u8>>,
+    reply_to: Option<Vec<u8>>,
 }
 
 impl Columns {
@@ -143,6 +147,7 @@ impl Columns {
             deleted: self.deleted,
             status: Status::from_name(&self.status)?,
             shared_by: uuid(self.shared_by)?,
+            reply_to: uuid(self.reply_to)?,
         })
     }
 }
@@ -224,14 +229,15 @@ pub(crate) struct NewRow<'a> {
     pub(crate) status: Status,
     pub(crate) deleted: bool,
     pub(crate) shared_by: Option<Uuid>,
+    pub(crate) reply_to: Option<Uuid>,
 }
 
 /// Keeps a message: its row's ID.
 pub(crate) fn insert(tx: &Tx<'_>, new: NewRow<'_>) -> Result<i64, Error> {
     tx.conn().execute(
         "INSERT INTO messages (message_id, nonce, conversation_id, seq, user_id, device_id, \
-         sent_at, envelope, text, deleted, status, shared_by, has) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         sent_at, envelope, text, deleted, status, shared_by, has, reply_to) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             new.message_id.map(|id| id.as_bytes().to_vec()),
             new.nonce,
@@ -246,6 +252,7 @@ pub(crate) fn insert(tx: &Tx<'_>, new: NewRow<'_>) -> Result<i64, Error> {
             new.status.name(),
             new.shared_by.map(|user| user.as_bytes().to_vec()),
             new.opened.and_then(|opened| opened.has.as_deref()),
+            new.reply_to.map(|id| id.as_bytes().to_vec()),
         ],
     )?;
     Ok(tx.conn().last_insert_rowid())
@@ -260,13 +267,15 @@ pub(crate) struct Filled<'a> {
     pub(crate) sent_at: i64,
     pub(crate) opened: &'a Opened,
     pub(crate) shared_by: Option<Uuid>,
+    /// What it answers, if this content says; else what the row knew stays.
+    pub(crate) reply_to: Option<Uuid>,
 }
 
 pub(crate) fn fill(tx: &Tx<'_>, id: i64, filled: Filled<'_>) -> Result<(), Error> {
     tx.conn().execute(
         "UPDATE messages SET seq = ?2, user_id = ?3, device_id = ?4, sent_at = ?5, envelope = ?6, \
-         text = ?7, has = ?8, edited_at = NULL, deleted = 0, status = 'ok', shared_by = ?9 \
-         WHERE id = ?1",
+         text = ?7, has = ?8, edited_at = NULL, deleted = 0, status = 'ok', shared_by = ?9, \
+         reply_to = COALESCE(?10, reply_to) WHERE id = ?1",
         params![
             id,
             filled.seq.map(stored_seq).transpose()?,
@@ -277,15 +286,16 @@ pub(crate) fn fill(tx: &Tx<'_>, id: i64, filled: Filled<'_>) -> Result<(), Error
             filled.opened.text.as_deref(),
             filled.opened.has.as_deref(),
             filled.shared_by.map(|user| user.as_bytes().to_vec()),
+            filled.reply_to.map(|id| id.as_bytes().to_vec()),
         ],
     )?;
     Ok(())
 }
 
-/// This device's own message once the API has it: its ID and its number, and from the queue's copy
-/// the time the API took it and whom it mentions. Another row with that ID gives way only when it
-/// stands for this same message (`takes_over`). Anything else, or another ID than the one bound
-/// already, leaves every row as it is: false.
+/// This device's own message once the API has it: its ID and its number, what it answers, and from
+/// the queue's copy the time the API took it and whom it mentions. Another row with that ID gives
+/// way only when it stands for this same message (`takes_over`). Anything else, or another ID than
+/// the one bound already, leaves every row as it is: false.
 pub(crate) fn bind(
     tx: &Tx<'_>,
     row: &Row,
@@ -293,6 +303,7 @@ pub(crate) fn bind(
     seq: u64,
     sent_at: Option<i64>,
     mentions: &[Uuid],
+    reply_to: Option<Uuid>,
 ) -> Result<bool, Error> {
     let mut deleted = row.deleted;
     if let Some(message_id) = message_id {
@@ -312,12 +323,14 @@ pub(crate) fn bind(
     }
     tx.conn().execute(
         "UPDATE messages SET message_id = COALESCE(?2, message_id), seq = ?3, \
-         sent_at = COALESCE(?4, sent_at), status = 'ok' WHERE id = ?1",
+         sent_at = COALESCE(?4, sent_at), reply_to = COALESCE(?5, reply_to), status = 'ok' \
+         WHERE id = ?1",
         params![
             row.id,
             message_id.map(|id| id.as_bytes().to_vec()),
             stored_seq(seq)?,
             sent_at,
+            reply_to.map(|id| id.as_bytes().to_vec()),
         ],
     )?;
     if deleted {
@@ -470,7 +483,7 @@ pub(crate) fn refresh_text(tx: &Tx<'_>, id: i64) -> Result<(), Error> {
 pub(crate) fn erase(tx: &Tx<'_>, row: &Row) -> Result<(), Error> {
     tx.conn().execute(
         "UPDATE messages SET envelope = NULL, text = NULL, has = NULL, edited_at = NULL, \
-         deleted = 1 WHERE id = ?1",
+         reply_to = NULL, deleted = 1 WHERE id = ?1",
         [row.id],
     )?;
     if let Some(message_id) = row.message_id {
@@ -544,6 +557,8 @@ pub(crate) struct Shown {
     text: Option<String>,
     attachments: Vec<File>,
     shared_by: Option<Uuid>,
+    /// The message it answers.
+    reply_to: Option<Uuid>,
 }
 
 impl Shown {
@@ -562,6 +577,7 @@ impl Shown {
             text: row.text,
             attachments,
             shared_by: row.shared_by,
+            reply_to: row.reply_to,
         })
     }
 }
@@ -629,6 +645,7 @@ pub(super) fn message_record(row: &Row) -> Option<Record> {
         sent: u64::try_from(row.sent_at).unwrap_or(0),
         envelope: row.envelope.clone()?,
         shared_by: row.shared_by,
+        reply_to: row.reply_to,
     })
 }
 
@@ -678,6 +695,7 @@ pub(super) fn edit_records(
                 }
                 .encode()?,
                 shared_by: shared_by.as_deref().map(stored_uuid).transpose()?,
+                reply_to: None,
             })
         })
         .collect()
@@ -743,6 +761,7 @@ fn import_message(
                 status: Status::Ok,
                 deleted: false,
                 shared_by,
+                reply_to: record.reply_to,
             },
         )?,
         Some(row) if row.conversation != conversation => return Ok(false),
@@ -759,6 +778,7 @@ fn import_message(
                     sent_at,
                     opened: &opened,
                     shared_by,
+                    reply_to: record.reply_to,
                 },
             )?;
             row.id

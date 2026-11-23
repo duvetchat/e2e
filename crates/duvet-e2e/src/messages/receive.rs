@@ -128,6 +128,7 @@ fn keep_message(
                 sent_at: from.sent_at,
                 opened,
                 shared_by: None,
+                reply_to: entry.reply_to,
             },
         )
     };
@@ -146,6 +147,7 @@ fn keep_message(
                 status: Status::Ok,
                 deleted: false,
                 shared_by: None,
+                reply_to: entry.reply_to,
             },
         )?,
         Some(row) if row.conversation != from.conversation => return Ok(rejected("wrong_group")),
@@ -246,6 +248,7 @@ fn leave_mark(
             status: Status::Ok,
             deleted: true,
             shared_by: None,
+            reply_to: None,
         },
     )?;
     store::forget_edits(tx, from.conversation, message_id)?;
@@ -278,6 +281,7 @@ fn undecryptable(
                 status: Status::Waiting,
                 deleted: false,
                 shared_by: None,
+                reply_to: entry.reply_to,
             },
         )?;
         store::set_mentions(tx, id, &entry.mentions)?;
@@ -307,6 +311,7 @@ fn own_echo(tx: &Tx<'_>, conversation: Uuid, entry: &Entry) -> Result<Option<App
                 entry.seq,
                 entry.sent_at,
                 &entry.mentions,
+                entry.reply_to,
             )?;
         }
         tx.conn()

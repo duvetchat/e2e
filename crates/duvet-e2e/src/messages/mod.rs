@@ -55,6 +55,9 @@ pub struct Record {
     /// Who shared it with this device, when a history share brought it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_by: Option<Uuid>,
+    /// The message a message answers, when it's a reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<Uuid>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

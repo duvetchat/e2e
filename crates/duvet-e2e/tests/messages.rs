@@ -133,11 +133,19 @@ fn rows_in(device: &mut TestDevice, table: &str) -> i64 {
     })
 }
 
+/// What the server says of the entry `seq` of `conversation`'s queue, beside its MLS message.
+fn meta(
+    server: &mut FakeServer,
+    conversation: Uuid,
+    seq: u64,
+) -> &mut serde_json::Map<String, Value> {
+    let queue = &mut server.chats.get_mut(&conversation).unwrap().queue;
+    &mut queue[usize::try_from(seq).unwrap() - 1].meta
+}
+
 /// The server labels the entry `seq` of `conversation`'s queue as the message `message_id`.
 fn label(server: &mut FakeServer, conversation: Uuid, seq: u64, message_id: Uuid) {
-    let queue = &mut server.chats.get_mut(&conversation).unwrap().queue;
-    let entry = &mut queue[usize::try_from(seq).unwrap() - 1];
-    entry.meta.insert("message_id".into(), json!(message_id));
+    meta(server, conversation, seq).insert("message_id".into(), json!(message_id));
 }
 
 /// `device` writes `text` to `conversation`: the message's ID.
@@ -1162,6 +1170,74 @@ fn search_finds_words_without_accents() {
     for device in [&mut a1, &mut b2] {
         assert_eq!(found(device, json!({"text": "canción"})), [photo, reply]);
         assert_eq!(found(device, json!({"mentions": [b]})), Vec::<Uuid>::new());
+    }
+}
+
+#[test]
+fn a_reply_keeps_the_message_it_answers() {
+    let (mut server, conversation, [a, _], [mut a1, mut a2, mut b1, mut b2]) = group_of_four();
+    let asked = say(&mut server, &mut a1, conversation, "¿quién viene?");
+
+    // B1 answers it. The API takes what a reply answers beside its message, and its answer says
+    // so too.
+    let (nonce, answer, seq) = posted(
+        &mut server,
+        &mut b1,
+        conversation,
+        json!({"text": "yo voy"}),
+        &[],
+    );
+    meta(&mut server, conversation, seq).insert("reply_to".into(), json!(asked));
+    let mut answered = sent_command(conversation, &nonce, answer, seq);
+    answered["reply_to"] = json!(asked);
+    ok(&mut b1.core, answered);
+    assert_eq!(
+        message(&mut b1, conversation, answer).unwrap()["reply_to"],
+        json!(asked)
+    );
+
+    // B2 answers too, and hears it from its copy in the queue alone.
+    let (_, also, seq) = posted(
+        &mut server,
+        &mut b2,
+        conversation,
+        json!({"text": "yo también"}),
+        &[],
+    );
+    meta(&mut server, conversation, seq).insert("reply_to".into(), json!(asked));
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
+
+    // Every device shows what each one answers, in its history and in the search.
+    for device in [&mut a1, &mut b1, &mut b2] {
+        for reply in [answer, also] {
+            assert_eq!(
+                message(device, conversation, reply).unwrap()["reply_to"],
+                json!(asked)
+            );
+        }
+        assert_eq!(
+            message(device, conversation, asked).unwrap()["reply_to"],
+            Value::Null
+        );
+        let hits = search(device, json!({"text": "voy"}));
+        assert_eq!(hits["messages"][0]["reply_to"], json!(asked));
+    }
+
+    // A backup or a history share carries it, and an import keeps it.
+    let records = a1
+        .core
+        .transaction(|tx| messages::records_for(tx, conversation, 0, i64::MAX))
+        .unwrap();
+    let replies: Vec<Option<Uuid>> = records.iter().map(|record| record.reply_to).collect();
+    assert_eq!(replies, [None, Some(asked), Some(asked)]);
+    a2.core
+        .transaction(|tx| messages::import(tx, conversation, &records, Some(a)))
+        .unwrap();
+    for reply in [answer, also] {
+        assert_eq!(
+            message(&mut a2, conversation, reply).unwrap()["reply_to"],
+            json!(asked)
+        );
     }
 }
 

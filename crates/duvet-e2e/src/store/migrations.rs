@@ -103,6 +103,7 @@ CREATE TABLE groups (
 
 -- Messages as decrypted, with their edits applied. message_id is the API's, unknown while one is being sent.
 -- envelope is the message as it was sent, text its author's latest; a deleted message keeps neither.
+-- reply_to is the message it answers, as the API gives it: replies go in the clear.
 CREATE TABLE messages (
     id INTEGER PRIMARY KEY,
     message_id BLOB UNIQUE,
@@ -118,7 +119,8 @@ CREATE TABLE messages (
     deleted INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL CHECK (status IN ('ok', 'waiting', 'pending')),
     shared_by BLOB,
-    has TEXT
+    has TEXT,
+    reply_to BLOB
 );
 CREATE INDEX messages_by_conversation ON messages (conversation_id, seq);
 
