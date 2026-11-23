@@ -334,6 +334,17 @@ pub(crate) fn entered(tx: &Tx<'_>, conversation: Uuid, at: Option<i64>) -> Resul
     Ok(())
 }
 
+/// Every day from `from` on is due to be built and uploaded again: this device's backup key was
+/// replaced on `from`, so what it sealed of those days under that key no longer opens. The version
+/// moves, so an upload of an older build doesn't clear it.
+pub(crate) fn rebuild_from(tx: &Tx<'_>, from: Day) -> Result<(), Error> {
+    tx.conn().execute(
+        "UPDATE segments SET dirty = 1, version = version + 1 WHERE day >= ?1",
+        [from.to_string()],
+    )?;
+    Ok(())
+}
+
 /// Whether this device holds `conversation`'s `day` whole: in the group from the day's start to its
 /// end, as far as it applied the queue, or with a complete copy of the day imported; and with no
 /// message of the day it couldn't open, nor an edit of the day it can't carry (one of a message it
@@ -474,7 +485,8 @@ struct Opened {
 /// Opens a segment of this device's user's backup, with the backup key its `key_id` names, the
 /// current one or one before it. What isn't a segment this core reads is `bad_command` (`data`); one
 /// under a key this device doesn't hold, `not_found` (`backup_key`); one that doesn't open (altered,
-/// another user's), `decrypt_failed` (`segment`).
+/// another user's, or under an earlier key for a day on or after the one that key was replaced on),
+/// `decrypt_failed` (`segment`).
 fn open(tx: &Tx<'_>, data: &[u8]) -> Result<Opened, Error> {
     let not_a_segment = || invalid("data", "the data isn't a segment this core reads");
     let wire: Wire = from_cbor(data).ok_or_else(not_a_segment)?;
@@ -486,7 +498,7 @@ fn open(tx: &Tx<'_>, data: &[u8]) -> Result<Opened, Error> {
     if wire.user != user {
         return Err(unopened());
     }
-    let backup_key = held_key(tx, &wire.key_id)?.ok_or_else(|| not_found("backup_key"))?;
+    let backup_key = held_key(tx, &wire.key_id, day)?.ok_or_else(|| not_found("backup_key"))?;
     let header = Header {
         v: wire.v,
         key_id: &wire.key_id,
@@ -547,17 +559,23 @@ fn cipher(backup_key: &[u8; 32], conversation: Uuid, day: &str) -> Result<Aes256
         .map_err(|_| Error::Internal("AES-256-GCM refused its key".into()))
 }
 
-/// The backup key this device holds that `key_id` names: the current one, or one before it.
-fn held_key(tx: &Tx<'_>, key_id: &[u8]) -> Result<Option<Zeroizing<[u8; 32]>>, Error> {
+/// The backup key this device holds that `key_id` names, for a segment of `day`: the current one,
+/// or one before it for a day before the one it was replaced on. Whoever kept an earlier key (the lost
+/// device a rotation is for) can't seal segments of later days that this device takes.
+fn held_key(tx: &Tx<'_>, key_id: &[u8], day: Day) -> Result<Option<Zeroizing<[u8; 32]>>, Error> {
     if let Some(current) = current_key(tx)?
         && recovery::key_id(&current).as_slice() == key_id
     {
         return Ok(Some(current));
     }
-    Ok(tx
-        .previous_backup_keys()?
+    let earlier = tx
+        .earlier_backup_keys()?
         .into_iter()
-        .find(|key| recovery::key_id(key).as_slice() == key_id))
+        .find(|earlier| recovery::key_id(&earlier.key).as_slice() == key_id);
+    match earlier {
+        Some(earlier) if day >= earlier.until => Err(unopened()),
+        earlier => Ok(earlier.map(|earlier| earlier.key)),
+    }
 }
 
 /// This device's backup key, once it holds the user's identity.
@@ -584,13 +602,26 @@ fn unopened() -> Error {
     }
 }
 
-/// A UTC day, by its number from 1970-01-01.
+/// A UTC day, by its number from 1970-01-01; written `YYYY-MM-DD`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Day(i64);
+pub(crate) struct Day(i64);
+
+impl Serialize for Day {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Day {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Day::parse(&text).ok_or_else(|| serde::de::Error::custom("not a YYYY-MM-DD day"))
+    }
+}
 
 impl Day {
     /// The day `ms`, a Unix time in milliseconds, falls in.
-    fn of(ms: i64) -> Day {
+    pub(crate) fn of(ms: i64) -> Day {
         Day(ms.div_euclid(DAY_MS))
     }
 

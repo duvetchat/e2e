@@ -455,7 +455,7 @@ fn recovered_with(
 
 /// The earlier backup keys as `rotate_keys` hands them to the server: `{v: 1, nonce, ct}`,
 /// AES-256-GCM under the new backup key, with "duvet previous backup keys v1" || user as associated
-/// data; `ct` holds the keys, 32 bytes each, oldest first.
+/// data; `ct` holds the CBOR list of the keys, `{key, until}`, oldest first.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PreviousKeys {
@@ -471,10 +471,10 @@ fn previous_keys_aad(user: Uuid) -> Vec<u8> {
 }
 
 /// The keys an earlier backup keys' blob holds, opened with `backup_key` for `user`.
-fn open_previous_keys(backup_key: &[u8; 32], user: Uuid, blob: &[u8]) -> Vec<u8> {
+fn open_previous_keys(backup_key: &[u8; 32], user: Uuid, blob: &[u8]) -> Vec<EarlierKey> {
     let sealed: PreviousKeys = ciborium::from_reader(blob).expect("the blob's CBOR");
     assert_eq!((sealed.v, sealed.nonce.len()), (1, 12));
-    Aes256Gcm::new_from_slice(backup_key)
+    let plain = Aes256Gcm::new_from_slice(backup_key)
         .unwrap()
         .decrypt(
             Nonce::from_slice(&sealed.nonce),
@@ -483,18 +483,28 @@ fn open_previous_keys(backup_key: &[u8; 32], user: Uuid, blob: &[u8]) -> Vec<u8>
                 aad: &previous_keys_aad(user),
             },
         )
-        .expect("the blob opens with the backup key, for its user")
+        .expect("the blob opens with the backup key, for its user");
+    ciborium::from_reader(plain.as_slice()).expect("the earlier keys")
+}
+
+/// An earlier backup key as the blob holds it: the key, and the UTC day it was replaced on.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EarlierKey {
+    #[serde(with = "serde_bytes")]
+    key: Vec<u8>,
+    until: String,
 }
 
 /// An earlier backup keys' blob holding `keys`, sealed with `backup_key` for `user`.
-fn seal_previous_keys(backup_key: &[u8; 32], user: Uuid, keys: &[u8]) -> Vec<u8> {
+fn seal_previous_keys(backup_key: &[u8; 32], user: Uuid, keys: &[EarlierKey]) -> Vec<u8> {
     let nonce = vec![3; 12];
     let ct = Aes256Gcm::new_from_slice(backup_key)
         .unwrap()
         .encrypt(
             Nonce::from_slice(&nonce),
             Payload {
-                msg: keys,
+                msg: &cbor(&keys),
                 aad: &previous_keys_aad(user),
             },
         )
@@ -1278,7 +1288,10 @@ fn recovery_with_the_earlier_keys_opens_old_segments() {
     // new backup key for A: what the rotating device keeps.
     assert_eq!(
         open_previous_keys(&new_key, dm.a, &bytes(&sealed)),
-        old_key.to_vec()
+        [EarlierKey {
+            key: old_key.to_vec(),
+            until: utc_day(dm.day + DAY_MS),
+        }]
     );
     assert_eq!(earlier_keys(&mut dm.a1), [old_key]);
 
@@ -1287,6 +1300,130 @@ fn recovery_with_the_earlier_keys_opens_old_segments() {
     let refused = error(&mut a3.core, import_command(&old["data"]));
     assert_eq!(refusal(&refused), expect("not_found", "backup_key"));
     assert_eq!(earlier_keys(&mut a3), Vec::<[u8; 32]>::new());
+}
+
+#[test]
+fn an_earlier_key_opens_only_the_days_before_its_change() {
+    let mut dm = dm();
+    let day = dm.day;
+    let (_, old, old_key, rotated) = old_segment_then_rotation(&mut dm);
+    let sealed = rotated["wrapped_previous_backup_keys"].clone();
+    let mut a2 = recovered_with(&mut dm.server, dm.a, &rotated, Some(&sealed));
+    // The old key's segment of the day before the change still opens.
+    assert_eq!(imported(&mut dm.a1, &old["data"]), 0);
+    assert_eq!(imported(&mut a2, &old["data"]), 1);
+
+    // Whoever kept the old key (the lost device) seals segments of the change's day, and of the
+    // day after, under it: no device takes them, nor moves them to the new key.
+    let records = Segment::read(&bytes(&old["data"])).open(&old_key);
+    for later in [day + DAY_MS, day + 2 * DAY_MS] {
+        let mut forged = Segment::read(&bytes(&old["data"]));
+        forged.day = utc_day(later);
+        let moved: Vec<Record> = records
+            .iter()
+            .cloned()
+            .map(|mut record| {
+                record.sent += (later - day) as u64;
+                record
+            })
+            .collect();
+        let data = json!(b64(&forged.sealed(&old_key, &moved)));
+        for device in [&mut dm.a1, &mut a2] {
+            let refused = error(&mut device.core, import_command(&data));
+            assert_eq!(refusal(&refused), expect("decrypt_failed", "segment"));
+            let refused = error(
+                &mut device.core,
+                json!({"cmd": "backup_reencrypt", "data": data}),
+            );
+            assert_eq!(refusal(&refused), expect("decrypt_failed", "segment"));
+        }
+    }
+
+    // The blob keeps the day the old key was replaced on.
+    let new_key = backup_key_of(dm.a, &rotated);
+    assert_eq!(
+        open_previous_keys(&new_key, dm.a, &bytes(&sealed)),
+        [EarlierKey {
+            key: old_key.to_vec(),
+            until: utc_day(day + DAY_MS),
+        }]
+    );
+}
+
+#[test]
+fn a_device_late_to_a_rotation_builds_again_what_it_sealed_under_the_old_key() {
+    // A DM of A and B, with A on A1 and A2, which holds A's backup key too.
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let (mut a1, identity) = server.first_device(a);
+    let mut a2 = server.device(a);
+    let mut b1 = server.device(b);
+    for device in [&mut a1, &mut a2, &mut b1] {
+        server.publish(device);
+    }
+    for device in [&mut a1, &mut a2, &mut b1] {
+        server.introduce(device);
+    }
+    let old_key = backup_key_of(a, &identity);
+    a2.core
+        .transaction(|tx| {
+            tx.conn().execute(
+                "INSERT INTO meta (key, value) VALUES ('backup_key', ?1)",
+                [old_key.as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let day = test_day();
+    server.clock.set(day - 12 * HOUR);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Dm, None, &[a, b], false);
+    let command = server.create_group(conversation);
+    server.commit(&mut a1, conversation, command).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut a2, &mut b1]);
+
+    // On the day, A1 writes, then changes the keys with A2 staying.
+    server.clock.set(day + HOUR);
+    let hello = say(&mut server, &mut a1, conversation, "antes del cambio");
+    server.deliver_all(&mut [&mut a1, &mut a2, &mut b1]);
+    server.clock.set(day + 2 * HOUR);
+    let mut rotating = json!({"cmd": "rotate_keys", "remove": []});
+    rotating["certificates"] = server.observed(a)["certificates"].clone();
+    let rotated = ok(&mut a1.core, rotating);
+    server.take_identity(a, &rotated);
+    let new_key = backup_key_of(a, &rotated);
+
+    // The next day A2 backs the day up before it takes its transfer: under the old key, for the
+    // day it was replaced on, which no device opens.
+    server.clock.set(day + DAY_MS + HOUR);
+    let the_day = utc_day(day);
+    assert_eq!(due(&mut a2), [(conversation, the_day.clone(), false)]);
+    let stale = back_up(&mut a2, conversation, &the_day);
+    assert_eq!(bytes(&stale["key_id"]), recovery::key_id(&old_key));
+
+    // Once it takes the transfer, the day is due again, and built under the new key.
+    let inbox = server.inbox(a2.id);
+    ok(
+        &mut a2.core,
+        json!({
+            "cmd": "receive_direct",
+            "message": b64(&inbox[0]),
+            "identity_key": rotated["identity_key"],
+        }),
+    );
+    assert_eq!(due(&mut a2), [(conversation, the_day.clone(), false)]);
+    let rebuilt = back_up(&mut a2, conversation, &the_day);
+    assert_eq!(bytes(&rebuilt["key_id"]), recovery::key_id(&new_key));
+    assert_eq!(due(&mut a2), []);
+
+    // A device recovered with the new recovery key and the earlier keys refuses the first copy and
+    // takes the second.
+    let sealed = rotated["wrapped_previous_backup_keys"].clone();
+    let mut a3 = recovered_with(&mut server, a, &rotated, Some(&sealed));
+    let refused = error(&mut a3.core, import_command(&stale["data"]));
+    assert_eq!(refusal(&refused), expect("decrypt_failed", "segment"));
+    assert_eq!(imported(&mut a3, &rebuilt["data"]), 1);
+    assert_eq!(shown_ids(&mut a3, conversation), [hello]);
 }
 
 #[test]
@@ -1309,7 +1446,14 @@ fn recovery_refuses_earlier_keys_that_dont_open() {
             expect("decrypt_failed", "previous_backup_keys"),
         ),
         (
-            json!(b64(&seal_previous_keys(&new_key, dm.b, &old_key))),
+            json!(b64(&seal_previous_keys(
+                &new_key,
+                dm.b,
+                &[EarlierKey {
+                    key: old_key.to_vec(),
+                    until: utc_day(dm.day + DAY_MS),
+                }],
+            ))),
             expect("decrypt_failed", "previous_backup_keys"),
         ),
         (
