@@ -1,19 +1,19 @@
-//! Changing the user's identity: starting over without the recovery key (`reset_identity`), and
-//! changing the keys once a device is lost (`rotate_keys`). Either gives the user a new identity,
-//! which certifies this device anew and signs a new device list from version 1, a new backup key
-//! and a new recovery key, and the user's contacts see the change. A rotation keeps the devices
-//! that stay on the list and the backup keys from before, sealed with the new one; starting over
-//! keeps neither.
+//! Changing the user's identity: starting over without the recovery key (`reset_identity`, on a
+//! device without the identity), and changing the keys once a device is lost (`rotate_keys`).
+//! Either gives the user a new identity, which certifies this device and signs a new device list
+//! from version 1, a new backup key and a new recovery key, and the user's contacts see the
+//! change. A rotation keeps the devices that stay on the list and the backup keys from before,
+//! sealed with the new one; starting over keeps neither.
 //!
 //! Each device that stays gets the new identity from the rotating one: a transfer, sealed to its
 //! HPKE key and signed by the rotating device as a direct message of type `rotation.transfer`, with
 //! a certificate of its own keys from the new identity, the new list and the backup keys.
 //!
-//! The device's leaf in each of its groups still carries the certificate of the identity before.
-//! The members took it as it entered and don't check it again, but a welcome or an external join
-//! holds it to the new identity: every group of the device is due for `refresh` at once, whose
-//! commit brings the leaf with the new certificate. So is every group of a device that takes a
-//! transfer.
+//! After a rotation, the device's leaf in each of its groups still carries the certificate of the
+//! identity before. The members took it as it entered and don't check it again, but a welcome or
+//! an external join holds it to the new identity: every group of the device is due for `refresh`
+//! at once, whose commit brings the leaf with the new certificate. So is every group of a device
+//! that takes a transfer.
 
 use std::collections::BTreeMap;
 
@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use super::identity::{CreatedIdentity, new_identity};
+use super::identity::{CreatedIdentity, create_identity, new_identity};
 use super::{
     BACKUP_KEY, DEVICE_LIST, IDENTITY_KEY, IDENTITY_SECRET, Identity, OwnDevice, from_cbor,
     invalid, meta_get, meta_put, not_found, random, to_cbor, unix_ms,
@@ -119,16 +119,14 @@ struct PreviousKeys {
     ct: Vec<u8>,
 }
 
-/// Starts over: a new identity, whose list has this device alone, and a new backup key, which
-/// keeps none from before. For a user with neither the recovery key nor another device; on a device
-/// that had the identity, the user's other devices are off the list from now on, and come back
-/// only as new devices of the new identity.
+/// Starts over, for a user with neither the recovery key nor another device: a new identity, whose
+/// list has this device alone, and a new backup key, which opens nothing from before. The server
+/// takes them in place of the user's identity, list and backup. On the device that's creating an
+/// identity where there's none: a device that holds the identity changes the keys instead
+/// (`rotate_keys`), which gives it all that starting over would and keeps the backup keys from
+/// before, and starting over there is `exists`.
 pub(crate) fn reset_identity(tx: &mut Tx<'_>) -> Result<CreatedIdentity, Error> {
-    let own = tx.own_device()?;
-    let (created, backup_key) = new_identity(tx, &own, vec![own.device])?;
-    keep_previous(tx, own.user, &backup_key, &[])?;
-    all_groups_due(tx)?;
-    Ok(created)
+    create_identity(tx)
 }
 
 /// Changes the keys once devices are lost: a new identity, whose list has the devices that stay

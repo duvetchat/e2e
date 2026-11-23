@@ -421,31 +421,22 @@ fn reset_identity_starts_a_new_list() {
     assert_eq!(identity_key(&mut fresh), identity);
     assert_eq!(previous_keys(&mut fresh), Vec::<[u8; 32]>::new());
 
-    // A device that had the identity, its keys changed once and its list at version 3, starts
-    // over from 1, alone, and keeps no backup key from before.
+    // A device that holds the identity doesn't start over: changing the keys gives it all that
+    // starting over would, and keeps the backup keys from before. Nothing changes.
     let user = new_id();
-    let (mut core, device, _dir) = bare_device(user, &clock);
+    let (mut core, _device, _dir) = bare_device(user, &clock);
     ok(&mut core, json!({"cmd": "create_identity"}));
-    let rotated = ok(&mut core, rotate(&[]));
-    assert_eq!(previous_keys(&mut core).len(), 1);
-    let (rotated_backup, rotated_secret) = opened(user, &rotated);
-    let rotated_identity = signer(&rotated_secret);
-    let (other, third) = (new_id(), new_id());
-    for (version, devices) in [(2, vec![device, other]), (3, vec![device, other, third])] {
-        let listed = own_list(user, &rotated_identity, version, &devices);
-        assert_eq!(ok(&mut core, listed)["state"], "same");
-    }
-
-    let reset = ok(&mut core, json!({"cmd": "reset_identity"}));
-    let identity = new_identity(user, device, &[device], &reset);
-    assert_ne!(identity, key(&rotated["identity_key"]));
+    ok(&mut core, rotate(&[]));
+    let (identity, backup) = (identity_key(&mut core), meta(&mut core, "backup_key"));
+    let previous = previous_keys(&mut core);
+    assert_eq!(previous.len(), 1);
+    let exists = error(&mut core, json!({"cmd": "reset_identity"}));
+    assert_eq!(exists["code"], "exists");
     assert_eq!(identity_key(&mut core), identity);
-    assert_eq!(previous_keys(&mut core), Vec::<[u8; 32]>::new());
-    let refused =
-        recovery::decrypt_identity(&rotated_backup, user, &bytes(&reset["encrypted_identity"]));
-    assert_eq!(refused.unwrap_err().code(), "decrypt_failed");
+    assert_eq!(meta(&mut core, "backup_key"), backup);
+    assert_eq!(previous_keys(&mut core), previous);
 
-    // Only starting over replaces an identity: creating one still refuses to.
+    // Nor does it create one.
     let exists = error(&mut core, json!({"cmd": "create_identity"}));
     assert_eq!(exists["code"], "exists");
 }
@@ -497,8 +488,10 @@ fn contacts_see_the_change() {
     let mut c1 = server.device(c);
     assert_eq!(ok(&mut c1.core, server.observed(a))["state"], "new");
 
-    // Starting over is a change too.
-    let reset = ok(&mut a1.core, json!({"cmd": "reset_identity"}));
+    // Starting over is a change too: on a new device of A's, with neither the recovery key nor
+    // another device.
+    let mut fresh = server.bare_device(a);
+    let reset = ok(&mut fresh.core, json!({"cmd": "reset_identity"}));
     server.take_identity(a, &reset);
     for device in [&mut b1, &mut c1] {
         let seen = ok(&mut device.core, server.observed(a));
@@ -641,19 +634,19 @@ fn commits_made_before_the_change_leave_their_group_due() {
     assert_eq!(due(&mut a1), BTreeSet::from([group]));
     server.deliver_all(&mut [&mut a1, &mut b1]);
 
-    // The same through the queue: A1 renews its leaf, with the new certificate, then starts over
-    // before the server's word, which it hears as a refusal (a lost answer, then the retry's 409).
-    // The group isn't due while the commit waits. B, keeping up, takes the commit.
+    // The same through the queue: A1 renews its leaf, with the new certificate, then changes its
+    // keys again before the server's word, which it hears as a refusal (a lost answer, then the
+    // retry's 409). The group isn't due while the commit waits. B, keeping up, takes the commit.
     let made = ok(&mut a1.core, command("refresh", group));
-    let reset = ok(&mut a1.core, json!({"cmd": "reset_identity"}));
+    let again = ok(&mut a1.core, rotate(&[]));
     let seq = server.take_unheard(&mut a1, group, &made);
     let observed = deliver_observing(&mut server, &mut b1, group, a);
     assert_eq!(observed["state"], "changed");
-    server.take_identity(a, &reset);
+    server.take_identity(a, &again);
     assert_eq!(due(&mut a1), BTreeSet::new());
 
     // The queue brings the commit back, and A1 merges it: its leaf is the one it made before
-    // starting over, so the group is due again.
+    // changing the keys again, so the group is due again.
     let merged = results(&server.deliver(&mut a1));
     assert_eq!(merged, [json!([seq, "commit", "own", null])]);
     assert_eq!(due(&mut a1), BTreeSet::from([group]));
@@ -666,58 +659,6 @@ fn commits_made_before_the_change_leave_their_group_due() {
     let observed = deliver_observing(&mut server, &mut b1, group, a);
     assert_eq!(observed["state"], "changed");
     same_group(&mut [&mut a1, &mut b1], group);
-}
-
-#[test]
-fn reset_identity_keeps_the_groups_and_renews_them() {
-    let mut server = FakeServer::new();
-    let (a, b, c) = (new_id(), new_id(), new_id());
-    let mut a1 = server.device(a);
-    let mut a2 = server.device(a);
-    let mut b1 = server.device(b);
-    for device in [&mut a1, &mut a2, &mut b1] {
-        server.publish(device);
-    }
-    for device in [&mut a1, &mut a2, &mut b1] {
-        server.introduce(device);
-    }
-    let group = new_id();
-    server.conversation(group, Kind::Group, Some(a), &[a, b], false);
-    start(&mut server, &mut a1, group);
-    server.deliver_all(&mut [&mut a1, &mut a2, &mut b1]);
-
-    // A starts over on A1: a new identity, whose list has A1 alone. The server proposes A2's
-    // removal, as A2 is off the list.
-    let reset = ok(&mut a1.core, json!({"cmd": "reset_identity"}));
-    server.take_identity(a, &reset);
-    server.remove_device(group, a2.id);
-
-    // A1 stays in its group, which is due for its leaf at once. The refresh certifies the leaf
-    // anew and takes A2 out; B takes it once it observes A anew.
-    assert_eq!(due(&mut a1), BTreeSet::from([group]));
-    server.deliver(&mut a1);
-    server
-        .commit(&mut a1, group, command("refresh", group))
-        .unwrap();
-    assert_eq!(due(&mut a1), BTreeSet::new());
-    let observed = deliver_observing(&mut server, &mut b1, group, a);
-    assert_eq!(observed["state"], "changed");
-
-    // A, the owner, adds C, whose welcome takes the group.
-    let mut c1 = server.device(c);
-    server.publish(&mut c1);
-    server.introduce(&mut c1);
-    for device in [&mut a1, &mut b1] {
-        ok(&mut device.core, server.observed(c));
-    }
-    let add = adding(&mut server, group, c);
-    server.commit(&mut a1, group, add).unwrap();
-    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1]);
-    let state = same_group(&mut [&mut a1, &mut b1, &mut c1], group);
-    assert_eq!(
-        devices(&state).into_iter().collect::<BTreeSet<_>>(),
-        BTreeSet::from([a1.id, b1.id, c1.id])
-    );
 }
 
 /// Each of `devices` publishes its key packages, then observes every user.
