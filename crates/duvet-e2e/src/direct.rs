@@ -1,5 +1,6 @@
 //! The messages one device sends another through the server's inbox: what an approving device
-//! hands a new one, or the key of a shared history package.
+//! hands a new one, the new identity a rotation hands the devices that stay, or the key of a shared
+//! history package.
 //!
 //! Each is encrypted with HPKE to the receiving device's key, in base mode with the HPKE of
 //! Duvet's suite, then signed by the sending device: base mode doesn't say who wrote, and anyone
@@ -193,6 +194,10 @@ pub(crate) struct ReceiveDirect {
     #[serde(default, with = "b64::option")]
     #[allow(dead_code)]
     from_certificate: Option<Vec<u8>>,
+    /// The identity the server serves for this device's own user now, which a rotation's transfer
+    /// must bring.
+    #[serde(default, with = "b64::option")]
+    identity_key: Option<Vec<u8>>,
 }
 
 /// What a direct message brought, by its type.
@@ -202,6 +207,9 @@ pub(crate) enum Received {
     /// An approver's transfer: this device has its user's identity now.
     #[serde(rename = "approval.transfer")]
     ApprovalTransfer(identity::Enrolled),
+    /// A rotation's transfer: this device has its user's new identity now.
+    #[serde(rename = "rotation.transfer")]
+    RotationTransfer(identity::Transferred),
 }
 
 /// A message from another device, taken by its type. A type this core doesn't read is
@@ -212,6 +220,11 @@ pub(crate) fn receive_direct(tx: &mut Tx<'_>, request: ReceiveDirect) -> Result<
         identity::APPROVAL_TRANSFER => Ok(Received::ApprovalTransfer(identity::receive_transfer(
             tx,
             &request.message,
+        )?)),
+        identity::ROTATION_TRANSFER => Ok(Received::RotationTransfer(identity::receive_rotation(
+            tx,
+            &request.message,
+            request.identity_key.as_deref(),
         )?)),
         _ => Err(Error::BadCommand {
             message: "the message is of a type this core doesn't read",

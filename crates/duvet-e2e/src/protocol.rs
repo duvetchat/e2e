@@ -44,6 +44,9 @@ pub(crate) enum Command {
     ResetIdentity,
     RotateKeys {
         remove: Vec<Uuid>,
+        /// The user's devices' certificates as the server serves them, for the devices that stay.
+        #[serde(default, with = "b64::list")]
+        certificates: Vec<Vec<u8>>,
     },
 
     // Attachments' parts.
@@ -121,7 +124,10 @@ pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error
         Command::KeyPackages => reply(identity::key_packages(tx)?),
 
         Command::ResetIdentity => reply(identity::reset_identity(tx)?),
-        Command::RotateKeys { remove } => reply(identity::rotate_keys(tx, &remove)?),
+        Command::RotateKeys {
+            remove,
+            certificates,
+        } => reply(identity::rotate_keys(tx, &remove, &certificates)?),
 
         Command::AttachmentKey => reply(parts::attachment_key(tx)?),
         Command::AttachmentEncrypt(part) => reply(parts::attachment_encrypt(part)?),

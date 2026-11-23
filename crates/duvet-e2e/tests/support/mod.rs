@@ -432,8 +432,9 @@ impl FakeServer {
 
     /// The new identity a device of `user` made (`rotate_keys`, `reset_identity`'s `reply`), which
     /// the server takes in place of the one it had: the key, the secret its blobs hold (opened as a
-    /// recovered device opens them), the list, and the certificate of the device that made it, the
-    /// only device that list may name, as nothing certifies the user's other devices anew.
+    /// recovered device opens them), the list, the certificate of the device that made it, and
+    /// those of the devices that stay, whose transfers wait in their inboxes. Every device on the
+    /// list has its certificate.
     pub fn take_identity(&mut self, user: Uuid, reply: &Value) {
         let recovery_key = recovery::parse(reply["recovery_key"].as_str().unwrap()).unwrap();
         let backup_key =
@@ -449,7 +450,20 @@ impl FakeServer {
         let device = DeviceCertificate::verify(&certificate, &identity_key)
             .unwrap()
             .device;
-        assert_eq!(taken.devices, [device], "only the device that made it");
+        let mut certificates = BTreeMap::from([(device, certificate)]);
+        for handed in reply["transfers"].as_array().into_iter().flatten() {
+            let staying: Uuid = handed["device_id"].as_str().unwrap().parse().unwrap();
+            let certificate = bytes(&handed["certificate"]);
+            let certified = DeviceCertificate::verify(&certificate, &identity_key).unwrap();
+            assert_eq!(certified.device, staying, "the device's own certificate");
+            certificates.insert(staying, certificate);
+            self.post(staying, bytes(&handed["transfer"]));
+        }
+        assert_eq!(
+            taken.devices,
+            certificates.keys().copied().collect::<Vec<_>>(),
+            "a certificate for each device on the list"
+        );
         self.users.insert(
             user,
             User {
@@ -458,7 +472,7 @@ impl FakeServer {
                 version: taken.version,
                 devices: taken.devices,
                 list,
-                certificates: BTreeMap::from([(device, certificate)]),
+                certificates,
             },
         );
     }

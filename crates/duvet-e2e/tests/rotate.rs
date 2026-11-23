@@ -7,13 +7,14 @@ mod support;
 
 use std::collections::BTreeSet;
 
-use duvet_e2e::{Clock, Core, FakeClock, OpenConfig, recovery};
+use duvet_e2e::{Clock, Core, DirectMessage, FakeClock, OpenConfig, recovery};
 use duvet_e2e_rules::{DeviceCertificate, DeviceList, Kind};
 use ed25519_dalek::SigningKey;
 use openmls::prelude::tls_codec::DeserializeBytes as _;
 use openmls::prelude::{BasicCredential, KeyPackageIn, ProtocolVersion, SignatureScheme};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
+use serde::Serialize;
 use serde_json::{Value, json};
 use support::*;
 use tempfile::TempDir;
@@ -831,4 +832,273 @@ fn the_rotating_device_applies_what_the_lost_one_committed_before() {
     assert_eq!(observed, [json!("changed")]);
     let state = same_group(&mut [&mut a1, &mut b1], group);
     assert!(!devices(&state).contains(&a2.id), "A2 is out");
+}
+
+/// `rotate_keys` without `remove`, with the certificates of `user`'s devices as the server serves
+/// them, which the devices that stay are certified anew from.
+fn rotating(server: &FakeServer, user: Uuid, remove: &[Uuid]) -> Value {
+    let mut command = rotate(remove);
+    command["certificates"] = server.observed(user)["certificates"].clone();
+    command
+}
+
+/// `receive_direct` of `message`, with the identity the server serves for the device's own user.
+fn receiving(message: &[u8], identity_key: &[u8; 32]) -> Value {
+    json!({
+        "cmd": "receive_direct",
+        "message": b64(message),
+        "identity_key": b64(identity_key),
+    })
+}
+
+/// The certificate the server serves for `device`, among those `observed` (an `observe_user`
+/// command) holds.
+fn served_certificate(observed: &Value, device: Uuid) -> Vec<u8> {
+    observed["certificates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(bytes)
+        .find(|certificate| {
+            DeviceCertificate::read_unverified(certificate)
+                .unwrap()
+                .device
+                == device
+        })
+        .expect("the device's certificate")
+}
+
+#[test]
+fn devices_that_stay_take_the_new_identity() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let mut a1 = server.device(a);
+    let mut a2 = server.device(a);
+    let mut a3 = server.device(a);
+    let mut b1 = server.device(b);
+    meet(&mut server, &mut [&mut a1, &mut a2, &mut a3, &mut b1]);
+    let group = new_id();
+    server.conversation(group, Kind::Group, Some(b), &[b, a], false);
+    start(&mut server, &mut b1, group);
+    server.deliver_all(&mut [&mut a1, &mut a2, &mut a3, &mut b1]);
+    let served = server.observed(a);
+
+    // A loses A2 and changes its keys on A1, without A2. A3 stays: A1 certifies A3's own keys with
+    // the new identity, for the server, and seals the identity to A3, for its inbox.
+    let rotated = ok(&mut a1.core, rotating(&server, a, &[a2.id]));
+    let new_key = new_identity(a, a1.id, &[a1.id, a3.id], &rotated);
+    let handed = rotated["transfers"].as_array().expect("transfers");
+    assert_eq!(handed.len(), 1);
+    assert_eq!(handed[0]["device_id"], json!(a3.id));
+    let before = DeviceCertificate::read_unverified(&served_certificate(&served, a3.id)).unwrap();
+    let certificate =
+        DeviceCertificate::verify(&bytes(&handed[0]["certificate"]), &new_key).unwrap();
+    assert_eq!(
+        (
+            certificate.user,
+            certificate.device,
+            &certificate.signature_key,
+            &certificate.hpke_key
+        ),
+        (a, a3.id, &before.signature_key, &before.hpke_key)
+    );
+    server.take_identity(a, &rotated);
+    server.remove_device(group, a2.id);
+
+    // A3 takes the transfer from its inbox, as the identity it brings is the one the server serves.
+    let inbox = server.inbox(a3.id);
+    assert_eq!(inbox.len(), 1);
+    let taken = ok(&mut a3.core, receiving(&inbox[0], &new_key));
+    assert_eq!(
+        (&taken["type"], &taken["certificate"]),
+        (&json!("rotation.transfer"), &handed[0]["certificate"])
+    );
+    assert_eq!(key(&taken["identity_key"]), new_key);
+    assert_eq!(identity_key(&mut a3.core), new_key);
+
+    // Its groups are due at once, for leaves the new identity certifies.
+    assert_eq!(due(&mut a3), BTreeSet::from([group]));
+    server.deliver(&mut a1);
+    server
+        .commit(&mut a1, group, command("refresh", group))
+        .unwrap();
+    server.deliver(&mut a3);
+    server
+        .commit(&mut a3, group, command("refresh", group))
+        .unwrap();
+    assert_eq!(due(&mut a3), BTreeSet::new());
+    server.deliver(&mut a1);
+    let (observed, _) = take_queue(&server, &mut b1, group);
+    assert_eq!(observed, [json!("changed")]);
+    let state = same_group(&mut [&mut a1, &mut a3, &mut b1], group);
+    assert_eq!(
+        devices(&state).into_iter().collect::<BTreeSet<_>>(),
+        BTreeSet::from([a1.id, a3.id, b1.id])
+    );
+
+    // Now B adds C, whose welcome takes the group: every leaf in it carries a certificate of the
+    // identity C pins for A.
+    let mut c1 = server.device(c);
+    server.publish(&mut c1);
+    server.introduce(&mut c1);
+    for device in [&mut a1, &mut a3, &mut b1] {
+        ok(&mut device.core, server.observed(c));
+    }
+    let add = adding(&mut server, group, c);
+    server.commit(&mut b1, group, add).unwrap();
+    let joined = results(&server.deliver(&mut c1));
+    assert_eq!(
+        (&joined[0][1], &joined[0][2]),
+        (&json!("welcome"), &json!("applied")),
+        "{joined:?}"
+    );
+    server.deliver_all(&mut [&mut a1, &mut a3, &mut b1]);
+    same_group(&mut [&mut a1, &mut a3, &mut b1, &mut c1], group);
+}
+
+/// A rotation's transfer as the core writes it, for a test to make one of its own:
+/// `{v: 1, identity, backup_key, previous_backup_keys, certificate, device_list, sender}`.
+#[derive(Serialize)]
+struct TransferPayload {
+    v: u32,
+    #[serde(with = "serde_bytes")]
+    identity: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    backup_key: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    previous_backup_keys: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    certificate: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    device_list: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    sender: Vec<u8>,
+}
+
+/// `payload` as a rotation's transfer from `from` to device `to`: sealed to `to`'s HPKE key, and
+/// signed with `from`'s own device key, as any device of the user could send it.
+fn sealed_by(
+    from: &mut TestDevice,
+    to: Uuid,
+    to_hpke: &[u8; 32],
+    payload: &TransferPayload,
+) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    ciborium::into_writer(payload, &mut encoded).unwrap();
+    from.rolled_back(|tx| {
+        let own = tx.own_device()?;
+        DirectMessage::seal(
+            tx.provider(),
+            &own.signer,
+            own.device,
+            to,
+            to_hpke,
+            "rotation.transfer",
+            &encoded,
+        )
+    })
+}
+
+#[test]
+fn a_device_takes_only_a_transfer_that_holds_up() {
+    let mut server = FakeServer::new();
+    let a = new_id();
+    let mut a1 = server.device(a);
+    let a2 = server.device(a);
+    let mut a3 = server.device(a);
+    let mut a4 = server.device(a);
+    meet(&mut server, &mut [&mut a1, &mut a3, &mut a4]);
+    let old_key = identity_key(&mut a3.core);
+    let served = server.observed(a);
+
+    // Changing the keys takes the certificate of each device that stays, verified by the identity
+    // this device holds. A refusal changes nothing.
+    let missing = error(&mut a1.core, rotate(&[a2.id]));
+    assert_eq!(
+        (&missing["code"], &missing["field"]),
+        (&json!("bad_command"), &json!("certificates"))
+    );
+    let mut forged = rotating(&server, a, &[a2.id]);
+    let stranger = signer(&[7; 32]);
+    forged["certificates"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!(b64(&DeviceCertificate::new(
+            a, a3.id, [1; 32], [2; 32], 1
+        )
+        .sign(&stranger)
+        .unwrap())));
+    let refused = error(&mut a1.core, forged);
+    assert_eq!(
+        (&refused["code"], &refused["what"]),
+        (&json!("invalid_signature"), &json!("certificate"))
+    );
+    assert_eq!(identity_key(&mut a1.core), old_key);
+
+    // A4 took A1 off the list as it knows it, before A1 changes the keys without A2.
+    ok(
+        &mut a4.core,
+        json!({"cmd": "sign_device_list", "remove": [a1.id]}),
+    );
+    let rotated = ok(&mut a1.core, rotating(&server, a, &[a2.id]));
+    let new_key = key(&rotated["identity_key"]);
+    server.take_identity(a, &rotated);
+    let to_a3 = server.inbox(a3.id).remove(0);
+    let to_a4 = server.inbox(a4.id).remove(0);
+
+    // A device off the receiver's list: A4 no longer lists A1.
+    let refused = error(&mut a4.core, receiving(&to_a4, &new_key));
+    assert_eq!(
+        (&refused["code"], &refused["rule"]),
+        (&json!("rule_violation"), &json!("device_not_listed"))
+    );
+    assert_eq!(identity_key(&mut a4.core), old_key);
+
+    // An identity other than the one the server serves for A.
+    let refused = error(&mut a3.core, receiving(&to_a3, &old_key));
+    assert_eq!(
+        (&refused["code"], &refused["rule"]),
+        (&json!("rule_violation"), &json!("identity_mismatch"))
+    );
+    assert_eq!(identity_key(&mut a3.core), old_key);
+
+    // A list that doesn't name the receiver, though the identity it brings is the one served: a
+    // transfer A1's device key signs, whose new list has A1 alone.
+    let (_, new_secret) = opened(a, &rotated);
+    let new_identity = signer(&new_secret);
+    let a3_certificate =
+        DeviceCertificate::read_unverified(&served_certificate(&served, a3.id)).unwrap();
+    let a3_hpke: [u8; 32] = a3_certificate.hpke_key.as_slice().try_into().unwrap();
+    let payload = TransferPayload {
+        v: 1,
+        identity: new_secret.to_vec(),
+        backup_key: vec![3; 32],
+        previous_backup_keys: Vec::new(),
+        certificate: DeviceCertificate::new(
+            a,
+            a3.id,
+            a3_certificate.signature_key.as_slice().try_into().unwrap(),
+            a3_hpke,
+            1,
+        )
+        .sign(&new_identity)
+        .unwrap(),
+        device_list: DeviceList::new(a, new_key, 1, vec![a1.id])
+            .sign(&new_identity)
+            .unwrap(),
+        sender: served_certificate(&served, a1.id),
+    };
+    let unlisted = sealed_by(&mut a1, a3.id, &a3_hpke, &payload);
+    let refused = error(&mut a3.core, receiving(&unlisted, &new_key));
+    assert_eq!(
+        (&refused["code"], &refused["rule"]),
+        (&json!("rule_violation"), &json!("device_not_listed"))
+    );
+    assert_eq!(identity_key(&mut a3.core), old_key);
+
+    // The transfer itself holds up: A3 takes it, once.
+    ok(&mut a3.core, receiving(&to_a3, &new_key));
+    assert_eq!(identity_key(&mut a3.core), new_key);
+    let again = error(&mut a3.core, receiving(&to_a3, &new_key));
+    assert_eq!(again["code"], "exists");
 }
