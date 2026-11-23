@@ -351,8 +351,9 @@ pub fn catch_up_within(
     {
         tx.conn().execute(
             "INSERT OR IGNORE INTO catch_ups (share_id, conversation_id, user_id, message, \
-             created_at) SELECT ?1, ?2, ?3, id, ?5 FROM messages \
-             WHERE conversation_id = ?2 AND message_id = ?4",
+             taken, created_at) SELECT ?1, ?2, ?3, m.id, d.taken, ?5 FROM messages m \
+             JOIN deviceless d ON d.message = m.id AND d.conversation_id = ?2 AND d.user_id = ?3 \
+             WHERE m.conversation_id = ?2 AND m.message_id = ?4",
             params![
                 share.as_bytes().as_slice(),
                 conversation.as_bytes().as_slice(),
@@ -375,10 +376,11 @@ pub(crate) fn catch_up_delivered(tx: &Tx<'_>, request: CatchUpDelivered) -> Resu
         request.user_id.as_bytes().as_slice(),
         request.share_id.as_bytes().as_slice(),
     );
+    // A note taken again since the package was made (an edit) has more to bring: it stays.
     tx.conn().execute(
-        "DELETE FROM deviceless WHERE conversation_id = ?1 AND user_id = ?2 AND message IN \
-         (SELECT message FROM catch_ups WHERE share_id = ?3 AND conversation_id = ?1 \
-         AND user_id = ?2)",
+        "DELETE FROM deviceless WHERE conversation_id = ?1 AND user_id = ?2 AND EXISTS \
+         (SELECT 1 FROM catch_ups c WHERE c.share_id = ?3 AND c.conversation_id = ?1 \
+         AND c.user_id = ?2 AND c.message = deviceless.message AND c.taken = deviceless.taken)",
         params![conversation, user, share],
     )?;
     let delivered = tx.conn().execute(

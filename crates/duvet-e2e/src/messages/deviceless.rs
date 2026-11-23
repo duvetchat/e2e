@@ -78,6 +78,20 @@ pub(crate) fn note(tx: &Tx<'_>, conversation: Uuid, message: i64) -> Result<(), 
     Ok(())
 }
 
+/// Notes again the message `message` of `conversation`, which this device just edited, for every
+/// member without a device there now: a note it has already is taken again (`taken` counts it), so
+/// a catch-up made before the edit doesn't forget it as it's delivered.
+pub(crate) fn note_again(tx: &Tx<'_>, conversation: Uuid, message: i64) -> Result<(), Error> {
+    tx.conn().execute(
+        "INSERT INTO deviceless (conversation_id, user_id, message, identity_key) \
+         SELECT u.conversation_id, u.user_id, ?2, c.identity_key FROM deviceless_users u \
+         LEFT JOIN contacts c ON c.user_id = u.user_id WHERE u.conversation_id = ?1 \
+         ON CONFLICT (conversation_id, user_id, message) DO UPDATE SET taken = taken + 1",
+        params![conversation.as_bytes().as_slice(), message],
+    )?;
+    Ok(())
+}
+
 /// The leaves a commit brought into `conversation`'s group: their users have a device there now.
 pub(crate) fn entered(tx: &Tx<'_>, conversation: Uuid, leaves: &[NewLeaf]) -> Result<(), Error> {
     let users: BTreeSet<Uuid> = leaves

@@ -188,12 +188,14 @@ CREATE TABLE outbox (
 );
 
 -- What was sent while a member had no device, for their catch-up, with the identity this device had
--- pinned for them then (none when it had none).
+-- pinned for them then (none when it had none). `taken` counts the times the note was taken again
+-- (an edit while they had no device), so a catch-up made before forgets only what it carried.
 CREATE TABLE deviceless (
     conversation_id BLOB NOT NULL,
     user_id BLOB NOT NULL,
     message INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
     identity_key BLOB,
+    taken INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (conversation_id, user_id, message)
 );
 
@@ -218,13 +220,15 @@ CREATE TABLE history_keys (
     received_at INTEGER NOT NULL
 );
 
--- The messages each catch-up this device made carried, by package, until its client says it
--- delivered it (catch_up_delivered): then their notes in deviceless go, and only theirs.
+-- The messages each catch-up this device made carried, by package, with their notes' `taken` then,
+-- until its client says it delivered it (catch_up_delivered): then those notes go, unless they were
+-- taken again since.
 CREATE TABLE catch_ups (
     share_id BLOB NOT NULL,
     conversation_id BLOB NOT NULL,
     user_id BLOB NOT NULL,
     message INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
+    taken INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
     PRIMARY KEY (share_id, message)
 );

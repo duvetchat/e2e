@@ -845,6 +845,56 @@ fn no_catch_up_while_the_member_has_no_device() {
 }
 
 #[test]
+fn a_note_taken_again_outlives_an_older_delivery() {
+    let mut server = FakeServer::new();
+    let (conversation, [a, b], mut a1) = deviceless_b(&mut server);
+    let message = say(&mut server, &mut a1, conversation, "antes de la edición");
+    let mut b1 = first_device_joins(&mut server, b, conversation);
+    server.introduce(&mut a1);
+    server.deliver(&mut a1);
+    let caught = ok(&mut a1.core, catch_up_command(&server, conversation, b));
+
+    // B goes without a device again before that package is delivered, and A1 edits the message:
+    // its note is taken again.
+    let without = |users: Value| json!({"cmd": "without_devices", "conversation_id": conversation, "users": users});
+    ok(&mut a1.core, without(json!([b])));
+    let edited = ok(
+        &mut a1.core,
+        json!({
+            "cmd": "edit",
+            "conversation_id": conversation,
+            "message_id": message,
+            "text": "después de la edición",
+        }),
+    );
+    server.post_change(
+        &a1,
+        conversation,
+        "edit",
+        message,
+        bytes(&edited["ciphertext"]),
+    );
+    server.deliver(&mut a1);
+
+    // The older package's delivery leaves that note: once B has a device again, B is due, and
+    // the next catch-up carries the edit.
+    ok(
+        &mut a1.core,
+        delivered(conversation, b, &caught["share_id"]),
+    );
+    ok(&mut a1.core, without(json!([])));
+    assert_eq!(due(&mut a1, conversation), json!([b]));
+    let next = ok(&mut a1.core, catch_up_command(&server, conversation, b));
+    let from = certificate(&server, a, a1.id);
+    take_package(&mut server, &mut b1, &from, &caught);
+    take_package(&mut server, &mut b1, &from, &next);
+    assert_eq!(
+        messages_of(&mut b1, conversation)[0]["text"],
+        "después de la edición"
+    );
+}
+
+#[test]
 fn a_lost_catch_up_is_made_again() {
     let mut server = FakeServer::new();
     let (conversation, [a, b], mut a1) = deviceless_b(&mut server);
