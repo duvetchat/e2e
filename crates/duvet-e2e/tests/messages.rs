@@ -1242,6 +1242,46 @@ fn undecryptable_message_waits_until_imported() {
 }
 
 #[test]
+fn a_deletion_of_a_message_that_waits_holds() {
+    let (mut server, conversation, [a, _], [mut a1, mut b1]) = dm();
+    let gone = say(&mut server, &mut a1, conversation, "borrado sin leer");
+    server.deliver(&mut a1);
+    // What A1 has of it, as a backup or a history share carries it later.
+    let records = a1
+        .core
+        .transaction(|tx| messages::records_for(tx, conversation, 0, i64::MAX))
+        .unwrap();
+
+    // The server hands B1 a copy it can't read, and names someone else as its sender.
+    let mut copy = server.entries(conversation)[2].clone();
+    let mut data = bytes(&copy["data"]);
+    *data.last_mut().unwrap() ^= 1;
+    copy["data"] = json!(b64(&data));
+    copy["sender_user"] = json!(new_id());
+    let taken = ok(&mut b1.core, apply(conversation, &[copy]));
+    assert_eq!(
+        results(&[taken]),
+        [json!([3, "message", "undecryptable", "message"])]
+    );
+
+    // A deletes it. B1 takes the deletion, signed by A, whatever the server said of the message.
+    let seq = delete(&mut server, &mut a1, conversation, gone);
+    let deletion = server.entries(conversation)[usize::try_from(seq).unwrap() - 1].clone();
+    let taken = ok(&mut b1.core, apply(conversation, &[deletion]));
+    assert_eq!(results(&[taken]), [json!([seq, "delete", "applied", null])]);
+    assert_eq!(message(&mut b1, conversation, gone), None);
+
+    // An import of the message later leaves it deleted: its author deleted it.
+    let imported = b1
+        .core
+        .transaction(|tx| messages::import(tx, conversation, &records, Some(a)))
+        .unwrap();
+    assert_eq!(imported, 0);
+    assert_eq!(message(&mut b1, conversation, gone), None);
+    assert_eq!(stored(&mut b1, gone), (None, None));
+}
+
+#[test]
 fn deviceless_member_gets_catch_up_due() {
     let mut server = FakeServer::new();
     let (a, b) = (new_id(), new_id());

@@ -200,7 +200,8 @@ fn keep_edit(
 }
 
 /// A deletion counts from its message's author alone: the message's text, file and edits go. One of
-/// a message this device hasn't got leaves a mark, so nothing brings that message in later.
+/// a message this device hasn't got leaves a mark, so nothing brings that message in later; so does
+/// one of a message it couldn't read, whose sender is only what the API said.
 fn keep_delete(
     tx: &Tx<'_>,
     from: &Received<'_>,
@@ -210,32 +211,45 @@ fn keep_delete(
     match store::by_message_id(tx, message_id)? {
         Some(row) if row.conversation != from.conversation => Ok(rejected("wrong_group")),
         Some(row) if row.deleted => Ok(Applied::Ignored),
+        Some(row) if row.status == Status::Waiting => {
+            store::forget(tx, &row)?;
+            leave_mark(tx, from, message_id, applied)
+        }
         Some(row) if row.user != from.user => Ok(rejected(NOT_AUTHOR)),
         Some(row) => {
             store::erase(tx, &row)?;
             Ok(applied)
         }
-        None => {
-            store::insert(
-                tx,
-                NewRow {
-                    message_id: Some(message_id),
-                    nonce: None,
-                    conversation: from.conversation,
-                    seq: None,
-                    user: from.user,
-                    device: from.device,
-                    sent_at: from.sent_at,
-                    opened: None,
-                    status: Status::Ok,
-                    deleted: true,
-                    shared_by: None,
-                },
-            )?;
-            store::forget_edits(tx, from.conversation, message_id)?;
-            Ok(applied)
-        }
+        None => leave_mark(tx, from, message_id, applied),
     }
+}
+
+/// The mark a deletion leaves of a message this device can't show, by its deleter: an import brings
+/// the message in only when the record's author isn't the one who deleted it.
+fn leave_mark(
+    tx: &Tx<'_>,
+    from: &Received<'_>,
+    message_id: Uuid,
+    applied: Applied,
+) -> Result<Applied, Error> {
+    store::insert(
+        tx,
+        NewRow {
+            message_id: Some(message_id),
+            nonce: None,
+            conversation: from.conversation,
+            seq: None,
+            user: from.user,
+            device: from.device,
+            sent_at: from.sent_at,
+            opened: None,
+            status: Status::Ok,
+            deleted: true,
+            shared_by: None,
+        },
+    )?;
+    store::forget_edits(tx, from.conversation, message_id)?;
+    Ok(applied)
 }
 
 /// An entry this device can't open. A message is kept as waiting, with the ID, the sender and the

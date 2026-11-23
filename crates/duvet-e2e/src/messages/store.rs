@@ -488,9 +488,10 @@ pub(crate) fn erase(tx: &Tx<'_>, row: &Row) -> Result<(), Error> {
     Ok(())
 }
 
-/// A message this device encrypted and never sent, dropped: its row goes, and with it its mentions
-/// and its notes (the tables' cascade) and its words in the search index (the trigger); its
-/// ciphertext leaves the outbox.
+/// A message's row dropped: its mentions and its notes go with it (the tables' cascade), its words
+/// leave the search index (the trigger), and its ciphertext the outbox, if it waits there. For a
+/// message this device encrypted and never sent (`discard`), and for one it couldn't read, which a
+/// deletion leaves only the mark of.
 pub(crate) fn forget(tx: &Tx<'_>, row: &Row) -> Result<(), Error> {
     tx.conn()
         .execute("DELETE FROM messages WHERE id = ?1", [row.id])?;
