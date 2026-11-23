@@ -1286,6 +1286,83 @@ fn a_day_listed_again_during_an_upload_stays_due() {
     assert!(carried.iter().all(|record| record.id != gone));
 }
 
+/// A DM of A and B as `dm` makes it, with A on A2 as well, in the group from the start and holding
+/// A's backup key too.
+fn dm_with_a2() -> (Dm, TestDevice) {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let (mut a1, identity) = server.first_device(a);
+    let mut a2 = server.device(a);
+    let mut b1 = server.device(b);
+    for device in [&mut a1, &mut a2, &mut b1] {
+        server.publish(device);
+    }
+    for device in [&mut a1, &mut a2, &mut b1] {
+        server.introduce(device);
+    }
+    let backup_key = backup_key_of(a, &identity);
+    a2.core
+        .transaction(|tx| {
+            tx.conn().execute(
+                "INSERT INTO meta (key, value) VALUES ('backup_key', ?1)",
+                [backup_key.as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let day = test_day();
+    server.clock.set(day - 12 * HOUR);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Dm, None, &[a, b], false);
+    let command = server.create_group(conversation);
+    server.commit(&mut a1, conversation, command).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut a2, &mut b1]);
+    let dm = Dm {
+        server,
+        conversation,
+        a,
+        b,
+        a1,
+        b1,
+        identity,
+        day,
+    };
+    (dm, a2)
+}
+
+#[test]
+fn an_import_during_an_upload_doesnt_clear_the_day() {
+    let (mut dm, mut a2) = dm_with_a2();
+    let (conversation, day) = (dm.conversation, dm.day);
+    dm.at(day + HOUR);
+    let gone = say(&mut dm.server, &mut dm.b1, conversation, "se borrará");
+    dm.at(day + 2 * HOUR);
+    say(&mut dm.server, &mut dm.b1, conversation, "se queda");
+    dm.at(day + DAY_MS + HOUR);
+    say(&mut dm.server, &mut dm.b1, conversation, "mañana");
+    dm.server
+        .deliver_all(&mut [&mut dm.a1, &mut a2, &mut dm.b1]);
+    let the_day = utc_day(day);
+
+    // A1 builds the day, with the message, and its upload is under way when B1 deletes it.
+    let older = segment(&mut dm.a1, conversation, &the_day);
+    dm.at(day + DAY_MS + 2 * HOUR);
+    delete(&mut dm.server, &mut dm.b1, conversation, gone);
+    dm.server
+        .deliver_all(&mut [&mut dm.a1, &mut a2, &mut dm.b1]);
+
+    // A2 backs the day up without it, and its upload lands first. A1 lists the day again and
+    // imports that copy, the same as what it holds.
+    assert_eq!(due(&mut a2), [(conversation, the_day.clone(), true)]);
+    let newer = back_up(&mut a2, conversation, &the_day);
+    assert_eq!(due(&mut dm.a1), [(conversation, the_day.clone(), true)]);
+    assert_eq!(imported(&mut dm.a1, &newer["data"]), 0);
+
+    // Then A1's older build lands over it: the server holds the message again, so the day is due.
+    uploaded(&mut dm.a1, conversation, &the_day, &older);
+    assert_eq!(due(&mut dm.a1), [(conversation, the_day, true)]);
+}
+
 #[test]
 fn a_deletion_replaces_the_servers_complete_copy() {
     let mut dm = dm();

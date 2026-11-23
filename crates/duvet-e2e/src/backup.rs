@@ -203,14 +203,15 @@ pub(crate) fn backup_segment(tx: &Tx<'_>, request: SegmentDay) -> Result<Built, 
 }
 
 /// The server holds `conversation`'s `day` now, as `backup_segment` built it at `version` and the
-/// client uploaded it, complete or not. The day isn't due any more, unless it changed since that
-/// build: an older build's upload leaves a newer change due.
+/// client uploaded it, complete or not. The day is due exactly while it changed since that build:
+/// an older build's upload leaves a newer change due, even one an import found already uploaded
+/// meanwhile, as this upload replaced that copy.
 pub(crate) fn backup_uploaded(tx: &Tx<'_>, request: Uploaded) -> Result<Empty, Error> {
     let day = parse_day(&request.day)?.to_string();
     tx.conn().execute(
         "INSERT INTO segments (conversation_id, day, dirty, uploaded) VALUES (?1, ?2, 0, ?3) \
          ON CONFLICT (conversation_id, day) DO UPDATE SET uploaded = excluded.uploaded, \
-         dirty = dirty AND version != ?4",
+         dirty = version != ?4",
         params![
             request.conversation_id.as_bytes().as_slice(),
             day,
