@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::Error;
 
 /// The schema this core writes. It opens every earlier one and refuses a later one.
-pub(crate) const VERSION: i64 = 1;
+pub(crate) const VERSION: i64 = 2;
 
 pub(crate) fn run(conn: &mut Connection) -> Result<(), Error> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -20,8 +20,20 @@ pub(crate) fn run(conn: &mut Connection) -> Result<(), Error> {
         txn.pragma_update(None, "user_version", 1)?;
         txn.commit()?;
     }
+    if version < 2 {
+        let txn = conn.transaction()?;
+        txn.execute_batch(V2)?;
+        txn.pragma_update(None, "user_version", 2)?;
+        txn.commit()?;
+    }
     Ok(())
 }
+
+/// Schema 2: where a message row's content came from. `imported` is 1 for what an import brought
+/// (a backup copy, a history share, a catch-up), which the API's `deleted` erases, and 0 for what
+/// this device decrypted from its queue or sent itself, which only its author's deletion erases.
+/// The rows schema 1 left count as decrypted.
+const V2: &str = "ALTER TABLE messages ADD COLUMN imported INTEGER NOT NULL DEFAULT 0;";
 
 const V1: &str = r#"
 -- Settings and secrets of this installation, by name (the identity, the backup key).

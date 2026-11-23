@@ -47,6 +47,10 @@ const MAX_SEGMENT: usize = 256 * 1024 * 1024;
 pub(crate) struct SegmentDay {
     conversation_id: Uuid,
     day: String,
+    /// The IDs of the conversation's messages the API saw deleted: the day is sealed without them
+    /// and their edits, though this device keeps one it decrypted until its author's deletion comes.
+    #[serde(default)]
+    deleted: Vec<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,7 +177,9 @@ pub(crate) fn backup_segment(tx: &Tx<'_>, request: SegmentDay) -> Result<Built, 
         .optional()?
         .unwrap_or(0);
     let complete = complete(tx, conversation, day)?;
-    let deflated = deflate(&carried(tx, conversation, day)?, MAX_SEGMENT)?;
+    let mut records = carried(tx, conversation, day)?;
+    records.retain(|record| !request.deleted.contains(&record.id));
+    let deflated = deflate(&records, MAX_SEGMENT)?;
     let key_id = recovery::key_id(&backup_key);
     let data = seal(
         tx,
@@ -219,10 +225,11 @@ pub(crate) fn backup_uploaded(tx: &Tx<'_>, request: Uploaded) -> Result<Empty, E
 
 /// Brings in a segment of the user's backup, as the server holds it, under the backup key or one
 /// before it: what this device lacks of the day, never overwriting what it has, and a message it
-/// holds deleted stays deleted. One the API saw deleted (`deleted`) goes from this device too, as
-/// its author's deletion takes it, wherever it lies. How many records changed something. The
-/// segment counts as the server's copy of the day: the day isn't due when this device holds the
-/// same as it, and is when it holds more or other than it.
+/// holds deleted stays deleted. One the API saw deleted (`deleted`) stays out, and goes from this
+/// device too when an import brought it, as its author's deletion takes it; one this device
+/// decrypted waits for its author's deletion. How many records changed something. The segment
+/// counts as the server's copy of the day: the day isn't due when this device holds the same as it,
+/// but what the API saw deleted, and is when it holds more or other than it.
 pub(crate) fn backup_import(tx: &Tx<'_>, request: SegmentData) -> Result<Imported, Error> {
     let opened = open(tx, &request.data)?;
     let conversation = opened.wire.conversation;
@@ -236,7 +243,10 @@ pub(crate) fn backup_import(tx: &Tx<'_>, request: SegmentData) -> Result<Importe
         .into_iter()
         .partition(|record| opened.day.holds(record) && !deleted.contains(&record.id));
     let imported = messages::import(tx, conversation, &records, None)?;
-    let same = left_out.is_empty() && same_records(carried(tx, conversation, opened.day)?, records);
+    // What this device would upload: what it holds, but what the API saw deleted.
+    let mut held = carried(tx, conversation, opened.day)?;
+    held.retain(|record| !deleted.contains(&record.id));
+    let same = left_out.is_empty() && same_records(held, records);
     tx.conn().execute(
         "INSERT INTO segments (conversation_id, day, dirty, uploaded, held) \
          VALUES (?1, ?2, ?3, ?4, ?4) ON CONFLICT (conversation_id, day) DO UPDATE SET \

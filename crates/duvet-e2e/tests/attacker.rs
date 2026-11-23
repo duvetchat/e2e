@@ -578,9 +578,10 @@ fn server_adds_member_without_owner_commit() {
 /// `edit_and_delete_from_the_author_only`): each device deletes what A and B deleted, and nothing
 /// else.
 ///
-/// The one way the server makes a device hold less is `backup_import`'s `deleted`, the IDs the
-/// client takes from the API, which erase those messages where the device holds them: as ruled
-/// with the backup, the plan lets a server make a device delete more, as it can withhold the queue.
+/// The server's own word on deletions, `backup_import`'s `deleted` (the IDs the client takes from
+/// the API), keeps those messages out of what an import brings, and erases only what an import
+/// brought before: a message the device decrypted from its queue goes by its author's deletion
+/// alone. Named there, A's first message stays on B1, which decrypted it.
 #[test]
 fn server_forges_delete() {
     let mut server = FakeServer::new();
@@ -653,6 +654,28 @@ fn server_forges_delete() {
     }
     server.deliver(&mut a1);
     assert_eq!(shown_ids(&mut a1, conversation), [fourth, first]);
+
+    // The next day, B1 backs the day up, and the server hands that copy back to B1 naming A's first
+    // message as deleted: B1 decrypted it, and keeps it.
+    server.clock.advance(DAY_MS);
+    let due = ok(&mut b1.core, json!({"cmd": "backup_due"}));
+    let built = ok(
+        &mut b1.core,
+        json!({
+            "cmd": "backup_segment",
+            "conversation_id": conversation,
+            "day": due["segments"][0]["day"],
+        }),
+    );
+    ok(
+        &mut b1.core,
+        json!({"cmd": "backup_import", "data": built["data"], "deleted": [first]}),
+    );
+    assert_eq!(shown_ids(&mut b1, conversation), [first]);
+    assert_eq!(
+        message(&mut b1, conversation, first).unwrap()["text"],
+        "la primera"
+    );
 }
 
 /// The server replays old commits under new numbers: the one that added C, the one that removed C,
@@ -888,14 +911,12 @@ fn server_serves_old_device_list() {
 /// The API proposes removing A2, a device A took off its list, and an attacker server drops that
 /// removal: it takes B1's commit that leaves it out past its validator, and proposes it no more.
 /// Every device takes that commit (that a member's commit carries the pending removals is the
-/// validator's rule alone), but A1, a device of A2's own user, sends nothing while A2's leaf is in:
-/// it takes A2 out itself, as the list allows any member to, and what is sent after its commit A2
-/// can't read.
+/// validator's rule alone), but no device that knows A's newer list sends while A2's leaf is in:
+/// B1, a member of another user, asks to observe A once, then takes A2 out itself, as the list
+/// allows any member to, and what is sent after its commit A2 can't read.
 ///
-/// The limit, as the contract has it: only a user's own devices hold their user's leaves to the
-/// user's latest list. B1 knows A's newer list, yet sends while A2 is in, and A2 reads it; where a
-/// lost device is its user's only one in the group, or the server refuses its user's devices'
-/// commits, its removal waits for the server's proposal.
+/// The residual: a server that also keeps A's newer list from the other members keeps them sending
+/// to A2. Only key transparency closes that, and it's out of the core's scope.
 #[test]
 fn server_drops_pending_removal() {
     let mut server = FakeServer::new();
@@ -906,14 +927,13 @@ fn server_drops_pending_removal() {
     start(&mut server, &mut a1, conversation);
     server.deliver_all(&mut [&mut a1, &mut a2, &mut b1]);
 
-    // A takes A2 off its list, which B1 sees. The API proposes A2's removal; B1 renews its leaf
-    // before it hears of it, and the server takes that commit, which its validator refuses.
+    // A takes A2 off its list, and the API proposes A2's removal. B1 renews its leaf before it hears
+    // of either, and the server takes that commit, which its validator refuses.
     let list = ok(
         &mut a1.core,
         json!({"cmd": "sign_device_list", "remove": [a2.id]}),
     );
     server.take_list(a, &list["device_list"]);
-    server.introduce(&mut b1);
     server.remove_device(conversation, a2.id);
     let made = ok(&mut b1.core, command("refresh", conversation));
     let check = server.check(
@@ -943,29 +963,26 @@ fn server_drops_pending_removal() {
         assert!(device_set(device, conversation).contains(&a2.id));
     }
 
-    // The limit: B1 sends, and A2 reads it.
-    assert_eq!(ready(&mut b1, conversation), Ok(()));
-    let (meanwhile, _) = say(&mut server, &mut b1, conversation, "mientras tanto");
-    server.deliver(&mut a2);
-    assert_eq!(
-        message(&mut a2, conversation, meanwhile).unwrap()["text"],
-        "mientras tanto"
-    );
-
-    // A1 sends nothing while A2's leaf is in: it asks to observe its own user once, then takes A2
-    // out with its own commit, which the server takes.
-    let asked = ready(&mut a1, conversation).unwrap_err();
+    // B1 then sees A's newer list, and sends nothing while A2's leaf is in: it asks to observe A once,
+    // then takes A2 out with its own commit, which the server takes. A1 takes that commit, and has
+    // nothing left to take out.
+    server.introduce(&mut b1);
+    let asked = ready(&mut b1, conversation).unwrap_err();
     assert_eq!(
         (&asked["code"], &asked["users"]),
         (&json!("needs_identities"), &json!([a.to_string()]))
     );
-    ok(&mut a1.core, server.observed(a));
-    let wait = ready(&mut a1, conversation).unwrap_err();
+    ok(&mut b1.core, server.observed(a));
+    let wait = ready(&mut b1, conversation).unwrap_err();
     assert_eq!(wait["code"], "pending_proposals");
-    let removal = ok(&mut a1.core, command("commit_pending", conversation));
-    take_unchecked(&mut server, &mut a1, conversation, &removal);
+    let removal = ok(&mut b1.core, command("commit_pending", conversation));
+    take_unchecked(&mut server, &mut b1, conversation, &removal);
+    assert_eq!(ready(&mut b1, conversation), Ok(()));
+    server.deliver(&mut a1);
     assert_eq!(ready(&mut a1, conversation), Ok(()));
-    assert!(!device_set(&mut a1, conversation).contains(&a2.id));
+    for device in [&mut a1, &mut b1] {
+        assert!(!device_set(device, conversation).contains(&a2.id));
+    }
 
     // A2 takes that commit once it observes A's list without it: its group is gone. What A1 and B1
     // send after it, A2 can't read.

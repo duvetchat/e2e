@@ -129,6 +129,7 @@ fn keep_message(
                 opened,
                 shared_by: None,
                 reply_to: entry.reply_to,
+                imported: false,
             },
         )
     };
@@ -148,6 +149,7 @@ fn keep_message(
                 deleted: false,
                 shared_by: None,
                 reply_to: entry.reply_to,
+                imported: false,
             },
         )?,
         Some(row) if row.conversation != from.conversation => return Ok(rejected("wrong_group")),
@@ -249,16 +251,18 @@ fn leave_mark(
             deleted: true,
             shared_by: None,
             reply_to: None,
+            imported: false,
         },
     )?;
     store::forget_edits(tx, from.conversation, message_id)?;
     Ok(applied)
 }
 
-/// The messages of `conversation` the API saw deleted (`message_ids`), each one this device holds as
-/// it was: it goes as its author's deletion takes it, and one this device couldn't read leaves the
-/// mark of its deletion, by the sender the API gave. One deleted here already, or of another
-/// conversation, stays as it is. The server can only make a device hold less this way.
+/// The messages of `conversation` the API saw deleted (`message_ids`), as this device holds them:
+/// one an import brought (`Row::imported`) goes as its author's deletion takes it, and one this
+/// device couldn't read leaves the mark of its deletion, by the sender the API gave. One this device
+/// decrypted from its queue or sent itself stays, as only its author's deletion takes it; so does
+/// one deleted here already, or of another conversation.
 pub(crate) fn erase_deleted<'a>(
     tx: &Tx<'_>,
     conversation: Uuid,
@@ -284,12 +288,13 @@ pub(crate) fn erase_deleted<'a>(
                         deleted: true,
                         shared_by: None,
                         reply_to: None,
+                        imported: false,
                     },
                 )?;
                 store::forget_edits(tx, conversation, message_id)?;
             }
-            Some(row) => store::erase(tx, &row)?,
-            None => {}
+            Some(row) if row.imported => store::erase(tx, &row)?,
+            Some(_) | None => {}
         }
     }
     Ok(())
@@ -322,6 +327,7 @@ fn undecryptable(
                 deleted: false,
                 shared_by: None,
                 reply_to: entry.reply_to,
+                imported: false,
             },
         )?;
         store::set_mentions(tx, id, &entry.mentions)?;

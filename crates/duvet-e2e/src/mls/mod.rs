@@ -264,53 +264,66 @@ pub fn load_group(tx: &Tx<'_>, conversation: Uuid) -> Result<(MlsGroup, GroupRow
 /// encrypts. What stops it from committing stops it from sending: its own commit waiting for
 /// `commit_result` or the queue (`pending_commit`), a blocked group (`rule_violation`,
 /// `group_blocked`), and its own removal proposed (`not_found`, `membership`). Beyond those, a
-/// removal the server proposed waits for its commit first, `pending_proposals`, and so does a leaf
-/// of this device's own user whose device is off the user's latest list, whose removal the server
-/// may never propose: then `commit_pending` makes them, so no message reaches a device on its way
-/// out.
+/// removal the server proposed waits for its commit first, `pending_proposals`, and so does any
+/// member's leaf whose device is off its user's latest list as this device knows it, whose removal
+/// the server may never propose: then `commit_pending` makes them, so no message reaches a device
+/// on its way out.
 pub fn ready_to_send(tx: &Tx<'_>, conversation: Uuid) -> Result<(), Error> {
     let (group, row) = load_group(tx, conversation)?;
     can_commit(&group, &row)?;
     if group.has_pending_proposals() {
         return Err(Error::PendingProposals);
     }
-    if !unlisted_own_leaves(tx, &group)?.is_empty() {
-        ask_about_own_list(tx)?;
+    let unlisted = unlisted_leaves(tx, &group)?;
+    if !unlisted.is_empty() {
+        ask_about_lists(tx, &unlisted)?;
         return Err(Error::PendingProposals);
     }
     Ok(())
 }
 
-/// The ask's key before this device takes out a device of its own user: one for every group, as
-/// what it checks, the own list, is the same everywhere.
-const OWN_LIST_ASK: &[u8] = b"own devices off the list";
+/// The ask's key before this device takes out leaves whose devices are off their users' lists: one
+/// for every group, as what it checks, each user's latest list, is the same everywhere.
+const LISTS_ASK: &[u8] = b"devices off their users' lists";
 
-/// Before this device takes out a leaf of its own user whose device is off the user's list as it
-/// holds it: `needs_identities` for the own user, once per state of that list, as a device of the
-/// user may have been set up since this device last saw it. `Ok` once the client observed its own
-/// user at what this device knows of the list now.
-fn ask_about_own_list(tx: &Tx<'_>) -> Result<(), Error> {
-    let user = tx.own_user()?.ok_or_else(|| not_found("device"))?;
-    ask_first(tx, OWN_LIST_ASK, BTreeSet::from([user]))
+/// Before this device takes out the `unlisted` leaves: `needs_identities` for their users, once per
+/// state of what this device knows of each, as a device of theirs may have been set up since this
+/// device last saw their list. `Ok` once the client observed each of them at what it knows now.
+fn ask_about_lists(tx: &Tx<'_>, unlisted: &[(LeafNodeIndex, Uuid)]) -> Result<(), Error> {
+    ask_first(
+        tx,
+        LISTS_ASK,
+        unlisted.iter().map(|(_, user)| *user).collect(),
+    )
 }
 
-/// The leaves in `group` of this device's own user whose devices are off the user's latest list
-/// as this device holds it (removed from it, or left out of a rotation), this device's own aside.
-fn unlisted_own_leaves(tx: &Tx<'_>, group: &MlsGroup) -> Result<Vec<LeafNodeIndex>, Error> {
-    let (Some(user), own) = (tx.own_user()?, group.own_leaf_index()) else {
-        return Ok(Vec::new());
-    };
-    let Some(list) = tx.device_list_of(user)? else {
-        return Ok(Vec::new());
-    };
-    Ok(leaves(group.members())
-        .map_err(|_| stored_state())?
-        .into_iter()
-        .filter(|(index, leaf)| {
-            *index != own.u32() && leaf.user == user && !list.contains(leaf.device)
-        })
-        .map(|(index, _)| LeafNodeIndex::new(index))
-        .collect())
+/// The leaves in `group` whose devices are off their users' latest lists as this device holds them
+/// (removed from them, or left out of a rotation or a reset), this device's own aside, each with
+/// its user. Every leaf entered checked against a list this device knew, and the lists it keeps
+/// only move forward: a device off the latest one is a device its user took off. A user whose list
+/// this device doesn't hold has none here.
+fn unlisted_leaves(tx: &Tx<'_>, group: &MlsGroup) -> Result<Vec<(LeafNodeIndex, Uuid)>, Error> {
+    let own = group.own_leaf_index().u32();
+    let mut lists = BTreeMap::new();
+    let mut unlisted = Vec::new();
+    for (index, leaf) in leaves(group.members()).map_err(|_| stored_state())? {
+        if index == own {
+            continue;
+        }
+        let list = match lists.entry(leaf.user) {
+            std::collections::btree_map::Entry::Occupied(known) => known.into_mut(),
+            std::collections::btree_map::Entry::Vacant(unknown) => {
+                unknown.insert(tx.device_list_of(leaf.user)?)
+            }
+        };
+        let off = list
+            .as_ref()
+            .is_some_and(|list| !list.contains(leaf.device));
+        if off {
+            unlisted.push((LeafNodeIndex::new(index), leaf.user));
+        }
+    }
+    Ok(unlisted)
 }
 
 /// Whether this device can commit in its group now: not while its own commit waits for
@@ -716,8 +729,9 @@ pub(crate) struct Draft {
 
 /// This device's next commit in `group`: the key packages it adds and the users it adds and
 /// removes, and what goes with any commit of this epoch. The removals the server proposed go in
-/// (OpenMLS takes them from the proposal store), and so do the leaves of this device's own user
-/// whose devices are off the user's latest list, proposed or not; with them, the leave statements
+/// (OpenMLS takes them from the proposal store), and so do every member's leaves whose devices are
+/// off their users' latest lists as this device knows them, those the server proposed by reference
+/// alone; with them, the leave statements
 /// of the users whose leaves all go, who leave the list, a leaving owner handing over to the first
 /// user to have entered of those who stay.
 pub(crate) fn draft(
@@ -744,13 +758,13 @@ pub(crate) fn draft(
             _ => None,
         })
         .collect();
-    let unlisted: Vec<LeafNodeIndex> = unlisted_own_leaves(tx, group)?
+    let unlisted: Vec<(LeafNodeIndex, Uuid)> = unlisted_leaves(tx, group)?
         .into_iter()
-        .filter(|leaf| !going.contains(&leaf.u32()) && !removes.contains(leaf))
+        .filter(|(leaf, _)| !going.contains(&leaf.u32()) && !removes.contains(leaf))
         .collect();
     if !unlisted.is_empty() {
-        ask_about_own_list(tx)?;
-        removes.extend(unlisted);
+        ask_about_lists(tx, &unlisted)?;
+        removes.extend(unlisted.into_iter().map(|(leaf, _)| leaf));
     }
     going.extend(removes.iter().map(|leaf| leaf.u32()));
 
