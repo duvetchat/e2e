@@ -1278,7 +1278,7 @@ fn a_day_listed_again_during_an_upload_stays_due() {
     // the message.
     uploaded(&mut dm.a1, conversation, &the_day, &built);
     let listed: Vec<String> = due(&mut dm.a1).into_iter().map(|(_, day, _)| day).collect();
-    assert_eq!(listed, [the_day.clone()]);
+    assert_eq!(listed, [the_day.as_str()]);
     let latest = back_up(&mut dm.a1, conversation, &the_day);
     assert_eq!(due(&mut dm.a1), []);
     let backup_key = backup_key_of(dm.a, &dm.identity);
