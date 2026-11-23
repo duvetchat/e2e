@@ -1128,6 +1128,63 @@ fn a_day_listed_again_during_an_upload_stays_due() {
     assert!(carried.iter().all(|record| record.id != gone));
 }
 
+#[test]
+fn a_deletion_replaces_the_servers_complete_copy() {
+    let mut dm = dm();
+    let (conversation, day) = (dm.conversation, dm.day);
+    // At noon A's second device, recovered, joins the group; then it writes, and so does B1.
+    dm.at(day + 12 * HOUR);
+    let mut a2 = recovered(&mut dm.server, dm.a, &dm.identity);
+    for device in [&mut dm.a1, &mut dm.b1, &mut a2] {
+        dm.server.introduce(device);
+    }
+    let join = json!({
+        "cmd": "join_external",
+        "conversation_id": conversation,
+        "generation": 0,
+        "group_info": dm.server.group_info(conversation),
+    });
+    dm.server
+        .commit(&mut a2, conversation, join)
+        .expect("the server takes the external commit");
+    dm.server
+        .deliver_all(&mut [&mut dm.a1, &mut dm.b1, &mut a2]);
+    dm.at(day + 13 * HOUR);
+    let gone = say(&mut dm.server, &mut a2, conversation, "lo borraré");
+    let stays = say(&mut dm.server, &mut dm.b1, conversation, "esto queda");
+    dm.at(day + DAY_MS + HOUR);
+    say(&mut dm.server, &mut dm.b1, conversation, "al día siguiente");
+    dm.server
+        .deliver_all(&mut [&mut dm.a1, &mut dm.b1, &mut a2]);
+
+    // A1, in the group the whole day, uploads it complete; then A1 is lost.
+    let the_day = utc_day(day);
+    let complete_copy = back_up(&mut dm.a1, conversation, &the_day);
+    assert_eq!(complete_copy["complete"], true);
+
+    // A2 deletes its message. The day is due on A2, which holds it incomplete (it came in at noon).
+    dm.at(day + DAY_MS + 2 * HOUR);
+    delete(&mut dm.server, &mut a2, conversation, gone);
+    assert_eq!(due(&mut a2), [(conversation, the_day.clone(), false)]);
+
+    // As the client does before it builds a day the server holds, A2 imports the server's copy: it
+    // then holds the day whole, but for the deleted message, which the copy still has. The day stays
+    // due, complete; its upload replaces the server's copy with one as complete and without the
+    // message.
+    assert_eq!(imported(&mut a2, &complete_copy["data"]), 0);
+    assert_eq!(due(&mut a2), [(conversation, the_day.clone(), true)]);
+    let replacement = back_up(&mut a2, conversation, &the_day);
+    assert_eq!(replacement["complete"], true);
+    let backup_key = backup_key_of(dm.a, &dm.identity);
+    let ids: Vec<Uuid> = Segment::read(&bytes(&replacement["data"]))
+        .open(&backup_key)
+        .iter()
+        .map(|record| record.id)
+        .collect();
+    assert_eq!(ids, [stays]);
+    assert_eq!(due(&mut a2), []);
+}
+
 /// A day of A's under A's first backup key, then A's change of keys: the old day's segment, the
 /// backup key before the change and the rotation's reply.
 fn old_segment_then_rotation(dm: &mut Dm) -> (Uuid, Value, [u8; 32], Value) {

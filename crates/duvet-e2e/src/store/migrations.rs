@@ -208,13 +208,15 @@ CREATE TABLE deviceless_users (
 -- of, or the server holds a segment of as far as it knows. `dirty` while what the device holds of the
 -- day changed since the server last held the same; `version` counts the day's changes, so that
 -- backup_uploaded takes as the day only the build of its current version; `uploaded` what the server
--- holds: none it knows of, an incomplete copy (0) or a complete one (1).
+-- holds: none it knows of, an incomplete copy (0) or a complete one (1); `held` once the device
+-- imported a complete copy of the day, which it then holds whole.
 CREATE TABLE segments (
     conversation_id BLOB NOT NULL,
     day TEXT NOT NULL,
     dirty INTEGER NOT NULL DEFAULT 1,
     version INTEGER NOT NULL DEFAULT 0,
     uploaded INTEGER CHECK (uploaded IN (0, 1)),
+    held INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (conversation_id, day)
 );
 -- A conversation and a time written here mark that UTC day's segment changed.

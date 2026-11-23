@@ -148,12 +148,25 @@ pub(crate) fn backup_due(tx: &Tx<'_>) -> Result<DueDays, Error> {
 
 /// The segment of `conversation`'s `day`, sealed with the backup key: what this device carries of
 /// the day (its messages as they were sent, and their edits), whether it holds the day whole, and the
-/// day's version it holds, which `backup_uploaded` takes back once the segment is uploaded.
+/// day's version it holds, which `backup_uploaded` takes back once the segment is uploaded. The client
+/// imports the server's copy of the day first, when there's one: then the build holds all of it but
+/// what this device holds deleted, and a complete copy imported makes this device hold the day whole.
 pub(crate) fn backup_segment(tx: &Tx<'_>, request: SegmentDay) -> Result<Built, Error> {
     let day = parse_day(&request.day)?;
+    let text = day.to_string();
     let conversation = request.conversation_id;
     let user = tx.own_user()?.ok_or_else(|| not_found("device"))?;
     let backup_key = current_key(tx)?.ok_or_else(|| not_found("backup_key"))?;
+    let version: i64 = tx
+        .conn()
+        .query_row(
+            "SELECT version FROM segments WHERE conversation_id = ?1 AND day = ?2",
+            params![conversation.as_bytes().as_slice(), text],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let complete = complete(tx, conversation, day)?;
     let plain = Zeroizing::new(to_cbor(&carried(tx, conversation, day)?)?);
     if plain.len() > MAX_SEGMENT {
         return Err(Error::TooLarge {
@@ -161,8 +174,6 @@ pub(crate) fn backup_segment(tx: &Tx<'_>, request: SegmentDay) -> Result<Built, 
         });
     }
     let deflated = Zeroizing::new(miniz_oxide::deflate::compress_to_vec(&plain, LEVEL));
-    let complete = complete(tx, conversation, day)?;
-    let text = day.to_string();
     let key_id = recovery::key_id(&backup_key);
     let data = seal(
         tx,
@@ -178,15 +189,6 @@ pub(crate) fn backup_segment(tx: &Tx<'_>, request: SegmentDay) -> Result<Built, 
         },
         &deflated,
     )?;
-    let version: i64 = tx
-        .conn()
-        .query_row(
-            "SELECT version FROM segments WHERE conversation_id = ?1 AND day = ?2",
-            params![conversation.as_bytes().as_slice(), text],
-            |row| row.get(0),
-        )
-        .optional()?
-        .unwrap_or(0);
     Ok(Built {
         data,
         key_id: key_id.to_vec(),
@@ -235,9 +237,9 @@ pub(crate) fn backup_import(tx: &Tx<'_>, request: SegmentData) -> Result<Importe
     let same =
         records.len() == all.len() && same_records(carried(tx, conversation, opened.day)?, records);
     tx.conn().execute(
-        "INSERT INTO segments (conversation_id, day, dirty, uploaded) VALUES (?1, ?2, ?3, ?4) \
-         ON CONFLICT (conversation_id, day) DO UPDATE SET dirty = excluded.dirty, \
-         uploaded = excluded.uploaded",
+        "INSERT INTO segments (conversation_id, day, dirty, uploaded, held) \
+         VALUES (?1, ?2, ?3, ?4, ?4) ON CONFLICT (conversation_id, day) DO UPDATE SET \
+         dirty = excluded.dirty, uploaded = excluded.uploaded, held = held OR excluded.held",
         params![
             conversation.as_bytes().as_slice(),
             opened.day.to_string(),
@@ -327,13 +329,16 @@ pub(crate) fn entered(tx: &Tx<'_>, conversation: Uuid, at: i64) -> Result<(), Er
 }
 
 /// Whether this device holds `conversation`'s `day` whole: in the group from the day's start to its
-/// end, as far as it applied the queue, with no message of the day it couldn't open, nor an edit of
-/// the day it can't carry (one of a message it doesn't show).
+/// end, as far as it applied the queue, or with a complete copy of the day imported; and with no
+/// message of the day it couldn't open, nor an edit of the day it can't carry (one of a message it
+/// doesn't show).
 fn complete(tx: &Tx<'_>, conversation: Uuid, day: Day) -> Result<bool, Error> {
     let (start, end) = day.bounds();
     Ok(tx.conn().query_row(
-        "SELECT EXISTS (SELECT 1 FROM memberships WHERE conversation_id = ?1 \
+        "SELECT (EXISTS (SELECT 1 FROM memberships WHERE conversation_id = ?1 \
              AND entered_at <= ?2 AND seen_until >= ?3) \
+             OR EXISTS (SELECT 1 FROM segments WHERE conversation_id = ?1 AND day = ?4 \
+             AND held = 1)) \
          AND NOT EXISTS (SELECT 1 FROM messages WHERE conversation_id = ?1 \
              AND status = 'waiting' AND sent_at >= ?2 AND sent_at < ?3) \
          AND NOT EXISTS (SELECT 1 FROM edits e WHERE e.conversation_id = ?1 \
@@ -341,7 +346,12 @@ fn complete(tx: &Tx<'_>, conversation: Uuid, day: Day) -> Result<bool, Error> {
              AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.message_id = e.message_id \
                  AND m.conversation_id = e.conversation_id AND m.status = 'ok' \
                  AND m.deleted = 0))",
-        params![conversation.as_bytes().as_slice(), start, end],
+        params![
+            conversation.as_bytes().as_slice(),
+            start,
+            end,
+            day.to_string()
+        ],
         |row| row.get(0),
     )?)
 }
