@@ -730,7 +730,7 @@ pub fn import(
     for record in records {
         let shared_by = shared_by.or(record.shared_by);
         let changed = match record.kind {
-            RecordKind::Message => import_message(tx, conversation, record, shared_by)?,
+            RecordKind::Message => import_message(tx, conversation, record, shared_by, None)?,
             RecordKind::Edit => import_edit(tx, conversation, record, shared_by)?,
         };
         if changed {
@@ -740,11 +740,29 @@ pub fn import(
     Ok(imported)
 }
 
+/// Brings in one `record` of `conversation` from a package `sharer` shared, marked as shared by
+/// them: as [`import`] does, but a message that waits takes only a record whose user is its sender
+/// as the API named them, and a record from its own author's package (`sharer` is its user)
+/// replaces a copy another member shared. Whether it changed something.
+pub fn import_shared(
+    tx: &Tx<'_>,
+    conversation: Uuid,
+    record: &Record,
+    sharer: Uuid,
+) -> Result<bool, Error> {
+    match record.kind {
+        RecordKind::Message => import_message(tx, conversation, record, Some(sharer), Some(sharer)),
+        RecordKind::Edit => import_edit(tx, conversation, record, Some(sharer)),
+    }
+}
+
+/// `package` is the sharer of the package the record came in, for [`import_shared`]'s rules.
 fn import_message(
     tx: &Tx<'_>,
     conversation: Uuid,
     record: &Record,
     shared_by: Option<Uuid>,
+    package: Option<Uuid>,
 ) -> Result<bool, Error> {
     let (Ok(Envelope::Message { text, attachments }), Ok(sent_at)) = (
         Envelope::decode(&record.envelope),
@@ -777,7 +795,20 @@ fn import_message(
         Some(row) if row.conversation != conversation => return Ok(false),
         // Deleted by its author: it stays deleted. A mark another user left wasn't a deletion.
         Some(row) if row.deleted && row.user == record.user => return Ok(false),
-        Some(row) if row.deleted || row.status == Status::Waiting => {
+        // What waits is its sender's, as the API named them: a package fills it only as theirs.
+        Some(row)
+            if package.is_some() && row.status == Status::Waiting && row.user != record.user =>
+        {
+            return Ok(false);
+        }
+        // Its author's own package outweighs a copy another member shared.
+        Some(row)
+            if row.deleted
+                || row.status == Status::Waiting
+                || package.is_some_and(|sharer| {
+                    sharer == record.user && row.shared_by.is_some_and(|by| by != sharer)
+                }) =>
+        {
             fill(
                 tx,
                 row.id,

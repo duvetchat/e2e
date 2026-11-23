@@ -895,6 +895,98 @@ fn a_note_taken_again_outlives_an_older_delivery() {
 }
 
 #[test]
+fn a_forged_share_neither_takes_another_senders_message_nor_outlasts_its_authors() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1, mut c1] = new_devices(&mut server, [a, c]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b, c], false);
+    let create = json!({
+        "cmd": "create_group",
+        "conversation_id": conversation,
+        "kind": "group",
+        "owner": a,
+        "members": [a, b, c],
+        "key_packages": server.claim(&[a, c]),
+        "external_sender": server.external_sender(),
+        "legacy": false,
+    });
+    server.commit(&mut a1, conversation, create).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut c1]);
+    ok(
+        &mut a1.core,
+        json!({"cmd": "without_devices", "conversation_id": conversation, "users": [b]}),
+    );
+
+    // A1 writes twice while B has no device; B1 joins, and shows both as waiting, A's.
+    let first = encrypted(&mut a1, conversation, "lo que A escribió");
+    let second = encrypted(&mut a1, conversation, "y esto también");
+    let mut b1 = first_device_joins(&mut server, b, conversation);
+    let first = post(&mut server, &mut a1, conversation, first);
+    let second = post(&mut server, &mut a1, conversation, second);
+    server.introduce(&mut c1);
+    server.deliver_all(&mut [&mut b1, &mut c1]);
+
+    // C shares made-up copies: the first as A's, the second as C's own.
+    let forged = |id: Uuid, user: Uuid, text: &str| Record {
+        kind: duvet_e2e::messages::RecordKind::Message,
+        id,
+        seq: 1,
+        user,
+        device: c1.id,
+        sent: 1,
+        envelope: duvet_e2e::Envelope::Message {
+            text: Some(text.into()),
+            attachments: Vec::new(),
+        }
+        .encode()
+        .unwrap(),
+        shared_by: None,
+        reply_to: None,
+    };
+    let records = vec![forged(first, a, "inventado"), forged(second, c, "también")];
+    let deflated = miniz_oxide::deflate::compress_to_vec(&cbor(&records), 6);
+    let devices = certificate_bytes(&server, b);
+    let sealed = c1
+        .core
+        .transaction(|tx| {
+            let own = tx.own_device()?;
+            let header = Header {
+                kind: ShareKind::Share,
+                conversation,
+                user: c,
+                device: own.device,
+                to: b,
+            };
+            let package = history::package(&own.signer, &header, &deflated)?;
+            history::seal(tx, ShareKind::Share, conversation, b, &package, &devices)
+        })
+        .unwrap();
+    let from_c = certificate(&server, c, c1.id);
+    let forgery = serde_json::to_value(&sealed).unwrap();
+    take_package(&mut server, &mut b1, &from_c, &forgery);
+
+    // The message the API says is A's takes no record of C's: it still waits.
+    let shown = messages_of(&mut b1, conversation);
+    assert_eq!(ids(&shown), [second, first]);
+    assert_eq!(shown[0]["status"], "waiting");
+
+    // A's own catch-up replaces the copy C shared, and fills what waits.
+    server.introduce(&mut a1);
+    server.deliver(&mut a1);
+    let caught = ok(&mut a1.core, catch_up_command(&server, conversation, b));
+    let from_a = certificate(&server, a, a1.id);
+    assert_eq!(take_package(&mut server, &mut b1, &from_a, &caught), 2);
+    let shown = messages_of(&mut b1, conversation);
+    assert_eq!(shown[0]["text"], "y esto también");
+    assert_eq!(shown[1]["text"], "lo que A escribió");
+    for message in &shown {
+        assert_eq!(message["user_id"], json!(a));
+        assert_eq!(message["shared_by"], json!(a));
+    }
+}
+
+#[test]
 fn a_lost_catch_up_is_made_again() {
     let mut server = FakeServer::new();
     let (conversation, [a, b], mut a1) = deviceless_b(&mut server);

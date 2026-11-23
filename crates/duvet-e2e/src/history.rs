@@ -36,7 +36,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::identity::{from_cbor, invalid, not_found, random, stored_key, stored_uuid, to_cbor};
-use crate::messages::{Empty, Record, RecordKind, import, noted_records, records_for};
+use crate::messages::{Empty, Record, RecordKind, import_shared, noted_records, records_for};
 use crate::mls::{GroupRow, ask_first};
 use crate::parts::{PACKAGE_PART, TAG, fits, open_part, seal_part};
 use crate::protocol::b64;
@@ -901,12 +901,7 @@ fn import_records(
     for _ in 0..count {
         let record: Record =
             ciborium::from_reader(&mut inflater).map_err(|_| refused(&inflater))?;
-        imported += import(
-            tx,
-            conversation,
-            std::slice::from_ref(&record),
-            Some(sharer),
-        )?;
+        imported += usize::from(import_shared(tx, conversation, &record, sharer)?);
     }
     if !inflater.finished() {
         return Err(unreadable());
