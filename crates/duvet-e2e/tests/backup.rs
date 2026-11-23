@@ -829,6 +829,46 @@ fn delete_marks_its_days_again() {
 }
 
 #[test]
+fn a_copy_from_before_a_deletion_doesnt_bring_the_message_back() {
+    let mut dm = dm();
+    let (conversation, day) = (dm.conversation, dm.day);
+    // On the day A1 writes and edits its message, and B1 answers; A1 backs the day up the next
+    // day, then deletes its message and is lost before it uploads the day again.
+    dm.at(day + HOUR);
+    let gone = say(&mut dm.server, &mut dm.a1, conversation, "lo borraré");
+    dm.at(day + 2 * HOUR);
+    edit(&mut dm.server, &mut dm.a1, conversation, gone, "editado");
+    dm.at(day + 3 * HOUR);
+    let stays = say(&mut dm.server, &mut dm.b1, conversation, "esto queda");
+    dm.deliver();
+    dm.at(day + DAY_MS + HOUR);
+    say(&mut dm.server, &mut dm.b1, conversation, "mañana");
+    dm.deliver();
+    let the_day = utc_day(day);
+    let before = back_up(&mut dm.a1, conversation, &the_day);
+    delete(&mut dm.server, &mut dm.a1, conversation, gone);
+
+    // A device recovered after the deletion imports that copy with the IDs the API saw deleted in
+    // the conversation: neither the message nor its edit comes back, and the day is due, to upload
+    // without them.
+    let mut a2 = recovered(&mut dm.server, dm.a, &dm.identity);
+    let taken = ok(
+        &mut a2.core,
+        json!({"cmd": "backup_import", "data": before["data"], "deleted": [gone]}),
+    );
+    assert_eq!(taken, json!({"imported": 1}));
+    assert_eq!(shown_ids(&mut a2, conversation), [stays]);
+    assert_eq!(due(&mut a2), [(conversation, the_day.clone(), true)]);
+    let rebuilt = segment(&mut a2, conversation, &the_day);
+    let held: Vec<Uuid> = Segment::read(&bytes(&rebuilt["data"]))
+        .open(&backup_key_of(dm.a, &dm.identity))
+        .iter()
+        .map(|record| record.id)
+        .collect();
+    assert_eq!(held, [stays]);
+}
+
+#[test]
 fn a_stay_out_of_the_group_breaks_its_days() {
     let mut dm = dm();
     let (conversation, day) = (dm.conversation, dm.day);

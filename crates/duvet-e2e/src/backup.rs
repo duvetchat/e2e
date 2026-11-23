@@ -12,6 +12,7 @@
 //! start to its end (`memberships`, which `apply` and `commit_result` keep, by the time the API took
 //! each entry) and holds everything of it: no message it couldn't open, no edit it can't carry.
 
+use std::collections::HashSet;
 use std::fmt;
 
 use aes_gcm::aead::{Aead, Payload};
@@ -62,6 +63,16 @@ pub(crate) struct Uploaded {
 pub(crate) struct SegmentData {
     #[serde(with = "b64")]
     data: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ImportSegment {
+    #[serde(with = "b64")]
+    data: Vec<u8>,
+    /// The IDs of the conversation's messages the API saw deleted (a deletion entry carries its
+    /// message's in the clear): a copy from before a deletion brings none of them back.
+    #[serde(default)]
+    deleted: Vec<Uuid>,
 }
 
 #[derive(Serialize)]
@@ -218,24 +229,22 @@ pub(crate) fn backup_uploaded(tx: &Tx<'_>, request: Uploaded) -> Result<Empty, E
 
 /// Brings in a segment of the user's backup, as the server holds it, under the backup key or one
 /// before it: what this device lacks of the day, never overwriting what it has, and a message it
-/// holds deleted stays deleted. How many records changed something. The segment counts as the
-/// server's copy of the day: the day isn't due when this device holds the same as it, and is when it
-/// holds more or other than it.
-pub(crate) fn backup_import(tx: &Tx<'_>, request: SegmentData) -> Result<Imported, Error> {
+/// holds deleted stays deleted, as does one the API saw deleted (`deleted`). How many records
+/// changed something. The segment counts as the server's copy of the day: the day isn't due when
+/// this device holds the same as it, and is when it holds more or other than it.
+pub(crate) fn backup_import(tx: &Tx<'_>, request: ImportSegment) -> Result<Imported, Error> {
     let opened = open(tx, &request.data)?;
     let conversation = opened.wire.conversation;
-    let (start, end) = opened.day.bounds();
     let all = records_in(&opened.deflated, MAX_SEGMENT)?;
-    // A record outside the segment's day isn't the day's: it's left out, and the day is due again,
-    // to upload without it.
-    let records: Vec<Record> = all
-        .iter()
-        .filter(|record| i64::try_from(record.sent).is_ok_and(|sent| start <= sent && sent < end))
-        .cloned()
-        .collect();
+    // A record outside the segment's day isn't the day's, and a message the API saw deleted doesn't
+    // come back, nor do its edits: they're left out, and the day is due again, to upload without
+    // them.
+    let deleted: HashSet<Uuid> = request.deleted.into_iter().collect();
+    let (records, left_out): (Vec<Record>, Vec<Record>) = all
+        .into_iter()
+        .partition(|record| opened.day.holds(record) && !deleted.contains(&record.id));
     let imported = messages::import(tx, conversation, &records, None)?;
-    let same =
-        records.len() == all.len() && same_records(carried(tx, conversation, opened.day)?, records);
+    let same = left_out.is_empty() && same_records(carried(tx, conversation, opened.day)?, records);
     tx.conn().execute(
         "INSERT INTO segments (conversation_id, day, dirty, uploaded, held) \
          VALUES (?1, ?2, ?3, ?4, ?4) ON CONFLICT (conversation_id, day) DO UPDATE SET \
@@ -629,6 +638,12 @@ impl Day {
     fn bounds(self) -> (i64, i64) {
         let start = self.0.saturating_mul(DAY_MS);
         (start, start.saturating_add(DAY_MS))
+    }
+
+    /// Whether `record` was sent on this day.
+    fn holds(self, record: &Record) -> bool {
+        let (start, end) = self.bounds();
+        i64::try_from(record.sent).is_ok_and(|sent| start <= sent && sent < end)
     }
 
     /// The day `YYYY-MM-DD` names, from 0000-01-01 to 9999-12-31: its spelling alone.

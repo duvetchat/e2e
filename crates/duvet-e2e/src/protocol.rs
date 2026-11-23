@@ -95,7 +95,7 @@ pub(crate) enum Command {
     BackupDue,
     BackupSegment(crate::backup::SegmentDay),
     BackupUploaded(crate::backup::Uploaded),
-    BackupImport(crate::backup::SegmentData),
+    BackupImport(crate::backup::ImportSegment),
     BackupReencrypt(crate::backup::SegmentData),
 }
 
