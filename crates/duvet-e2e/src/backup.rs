@@ -141,11 +141,11 @@ pub(crate) fn backup_due(tx: &Tx<'_>) -> Result<DueDays, Error> {
             continue;
         };
         let conversation = stored_uuid(&conversation)?;
-        let complete = complete(tx, conversation, day)?;
-        if !dirty && !(complete && uploaded != Some(true)) {
+        if uploaded.is_none() && !carries(tx, conversation, day)? {
             continue;
         }
-        if uploaded.is_none() && carried(tx, conversation, day)?.is_empty() {
+        let complete = complete(tx, conversation, day)?;
+        if !dirty && !(complete && uploaded != Some(true)) {
             continue;
         }
         segments.push(DueDay {
@@ -393,6 +393,24 @@ fn complete(tx: &Tx<'_>, conversation: Uuid, day: Day) -> Result<bool, Error> {
 fn carried(tx: &Tx<'_>, conversation: Uuid, day: Day) -> Result<Vec<Record>, Error> {
     let (start, end) = day.bounds();
     messages::records_for(tx, conversation, start, end)
+}
+
+/// Whether this device carries anything of `conversation`'s `day`, without reading it: what
+/// `messages::records_for` takes, a message it shows (numbered, not deleted) or its author's edit of
+/// one, once numbered.
+fn carries(tx: &Tx<'_>, conversation: Uuid, day: Day) -> Result<bool, Error> {
+    let (start, end) = day.bounds();
+    Ok(tx.conn().query_row(
+        "SELECT EXISTS (SELECT 1 FROM messages WHERE conversation_id = ?1 \
+             AND sent_at >= ?2 AND sent_at < ?3 AND status = 'ok' AND deleted = 0 \
+             AND message_id IS NOT NULL AND seq IS NOT NULL AND envelope IS NOT NULL) \
+         OR EXISTS (SELECT 1 FROM edits e JOIN messages m ON m.message_id = e.message_id \
+             AND m.conversation_id = e.conversation_id AND m.user_id = e.user_id \
+             WHERE e.conversation_id = ?1 AND e.sent_at >= ?2 AND e.sent_at < ?3 \
+             AND e.seq IS NOT NULL AND m.status = 'ok' AND m.deleted = 0)",
+        params![conversation.as_bytes().as_slice(), start, end],
+        |row| row.get(0),
+    )?)
 }
 
 /// Whether two sets of records are the same, in whatever order.

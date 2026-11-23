@@ -1109,6 +1109,41 @@ fn what_a_device_cant_carry_keeps_its_day_incomplete() {
 }
 
 #[test]
+fn a_day_with_nothing_to_carry_is_due_once_it_has_something() {
+    let mut dm = dm();
+    let (conversation, day) = (dm.conversation, dm.day);
+    // On `day` A1 writes once, and B1 gets a copy it can't read; the next day A1 edits it, and
+    // B1's edit waits for its message. B1 has nothing of either day to carry.
+    dm.at(day + HOUR);
+    let unread = say(&mut dm.server, &mut dm.a1, conversation, "B1 no lo lee");
+    hand_unreadable(&dm.server, &mut dm.b1, conversation);
+    dm.at(day + DAY_MS + HOUR);
+    edit(&mut dm.server, &mut dm.a1, conversation, unread, "editado");
+    dm.at(day + 2 * DAY_MS + HOUR);
+    say(&mut dm.server, &mut dm.a1, conversation, "pasado mañana");
+    dm.deliver();
+    assert_eq!(due(&mut dm.b1), []);
+
+    // Once B1 has the message, both days are due: the message's, and its edit's.
+    let records = dm
+        .a1
+        .core
+        .transaction(|tx| messages::records_for(tx, conversation, day, day + DAY_MS))
+        .unwrap();
+    dm.b1
+        .core
+        .transaction(|tx| messages::import(tx, conversation, &records, Some(dm.a)))
+        .unwrap();
+    assert_eq!(
+        due(&mut dm.b1),
+        [
+            (conversation, utc_day(day), true),
+            (conversation, utc_day(day + DAY_MS), true)
+        ]
+    );
+}
+
+#[test]
 fn reencrypt_moves_old_segments_to_the_new_key() {
     let mut dm = dm();
     let (conversation, day) = (dm.conversation, dm.day);
