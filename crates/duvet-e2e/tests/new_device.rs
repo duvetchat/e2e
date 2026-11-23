@@ -484,9 +484,11 @@ fn approval_by_code() {
     let revealed = ok(&mut n.core, reveal(&offered["offer"]));
     let checked = ok(&mut a1.core, check(&revealed["reveal"]));
 
-    // Both show the same code, of 6 digits.
-    let code = revealed["code"].as_str().unwrap();
-    assert_eq!(checked["code"], code);
+    // The new device answers with its reveal alone: its own code stays in the core, which compares
+    // it with the one the person types there from the approver's screen. The approver shows a code
+    // of 6 digits.
+    assert_eq!(revealed, json!({"reveal": revealed["reveal"]}));
+    let code = checked["code"].as_str().unwrap();
     assert_eq!(code.len(), 6);
     assert!(code.bytes().all(|digit| digit.is_ascii_digit()), "{code}");
 
@@ -621,13 +623,18 @@ fn approval_rejects_a_reveal_that_breaks_the_commitment() {
     let refused = error(&mut a1.core, check(&json!(b64(b"not a reveal"))));
     assert_eq!(refusal(&refused), expect("bad_command", "reveal"));
 
-    // Nothing held, so there's no code to confirm, not even the new device's own.
-    let refused = error(&mut a1.core, confirm(revealed["code"].as_str().unwrap()));
+    // Nothing held, so there's no code to confirm, not even the new device's own (computed apart).
+    let own = code_of(
+        &honest,
+        &read(&offered["offer"]),
+        &read(&begun["commitment"]),
+    );
+    let refused = error(&mut a1.core, confirm(&own));
     assert_eq!(refusal(&refused), expect("not_found", "code"));
 
-    // The new device's own reveal holds, and both show its code.
+    // The new device's own reveal holds, and the approver shows its code.
     let checked = ok(&mut a1.core, check(&revealed["reveal"]));
-    assert_eq!(checked["code"], revealed["code"]);
+    assert_eq!(checked["code"], own);
 }
 
 #[test]
@@ -833,6 +840,13 @@ fn server_cannot_force_the_code() {
         other
     );
 
+    // Each time, the person types into the new device the code the approver shows, and the new
+    // device refuses it: it isn't its own.
+    let refused_there = |n: &mut TestDevice, checked: &Value| {
+        let refused = error(&mut n.core, accept(checked["code"].as_str().unwrap()));
+        assert_eq!(refusal(&refused), expect("rule_violation", "code_mismatch"));
+    };
+
     // The server stands in for the new device with a key of its own: it commits to that key under
     // the new device's request, and reveals it once the approver's offer is out. The approver's
     // check of the commitment passes, but its code isn't the new device's.
@@ -849,14 +863,14 @@ fn server_cannot_force_the_code() {
         hash: commitment.hash.clone(),
         ..read(&offered["offer"])
     };
-    let revealed = ok(&mut n.core, reveal(&json!(b64(&cbor(&to_new)))));
+    ok(&mut n.core, reveal(&json!(b64(&cbor(&to_new)))));
     let own = Reveal {
         v: 1,
         key: key.to_vec(),
         nonce: nonce.to_vec(),
     };
     let checked = ok(&mut a1.core, check(&json!(b64(&cbor(&own)))));
-    assert_ne!(checked["code"], revealed["code"]);
+    refused_there(&mut n, &checked);
 
     // The server puts keys of its own in the new device's request: the approver would certify
     // them, but its code isn't the new device's.
@@ -870,7 +884,7 @@ fn server_cannot_force_the_code() {
     let offered = ok(&mut a1.core, offer(&json!(b64(&cbor(&substituted)))));
     let revealed = ok(&mut n.core, reveal(&offered["offer"]));
     let checked = ok(&mut a1.core, check(&revealed["reveal"]));
-    assert_ne!(checked["code"], revealed["code"]);
+    refused_there(&mut n, &checked);
 
     // The server changes the approver's nonce on its way to the new device.
     let begun = begin(&mut n);
@@ -881,7 +895,7 @@ fn server_cannot_force_the_code() {
     };
     let revealed = ok(&mut n.core, reveal(&json!(b64(&cbor(&substituted)))));
     let checked = ok(&mut a1.core, check(&revealed["reveal"]));
-    assert_ne!(checked["code"], revealed["code"]);
+    refused_there(&mut n, &checked);
 
     // The server hands the new device another device's certificate as the approver's.
     let begun = begin(&mut n);
@@ -892,7 +906,7 @@ fn server_cannot_force_the_code() {
     };
     let revealed = ok(&mut n.core, reveal(&json!(b64(&cbor(&substituted)))));
     let checked = ok(&mut a1.core, check(&revealed["reveal"]));
-    assert_ne!(checked["code"], revealed["code"]);
+    refused_there(&mut n, &checked);
 
     // Untouched, the two codes match.
     let begun = begin(&mut n);
@@ -907,7 +921,7 @@ fn server_cannot_force_the_code() {
     let refused = error(&mut n.core, reveal(&json!(b64(&cbor(&substituted)))));
     assert_eq!(refusal(&refused), expect("exists", "offer exists already"));
     let checked = ok(&mut a1.core, check(&revealed["reveal"]));
-    assert_eq!(checked["code"], revealed["code"]);
+    ok(&mut n.core, accept(checked["code"].as_str().unwrap()));
 }
 
 #[test]
@@ -1351,8 +1365,9 @@ fn a_transfer_by_the_notice_waits_for_the_code() {
         assert_eq!(refusal(&refused), expect("not_found", "code"));
     }
     assert_eq!(identity_rows(&mut n), before);
-    // A code that isn't this device's is refused, and leaves the attempt as it was.
-    let wrong = other_code(revealed["code"].as_str().unwrap());
+    // A code that isn't this device's (its own, computed apart, with every digit changed) is
+    // refused, and leaves the attempt as it was.
+    let wrong = other_code(&code_of(&read(&revealed["reveal"]), &server_offer, &asked));
     let refused = error(&mut n.core, accept(&wrong));
     assert_eq!(refusal(&refused), expect("rule_violation", "code_mismatch"));
     assert_eq!(identity_rows(&mut n), before);

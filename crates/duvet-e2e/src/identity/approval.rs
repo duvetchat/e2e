@@ -9,18 +9,19 @@
 //!   signature and HPKE keys) and the QR's key. It never passes through the server, so only the
 //!   device that scans it can encrypt to that key, and the new device takes a transfer sealed to it
 //!   from whichever approver that is.
-//! - **By the notice**, all of it passes through the server, and the person compares a code on
-//!   both screens. A hash commitment, as in ZRTP, leaves a server in the middle one try at making
-//!   the two codes match:
+//! - **By the notice**, all of it passes through the server, and the person types into the new
+//!   device the code the approver shows, which the new device compares with its own. A hash
+//!   commitment, as in ZRTP, leaves a server in the middle one try at making the two codes match:
 //!   1. the new device sends its request and the commitment, SHA-256("duvet approval commit v1"
 //!      || key || nonce), with its other key and 32 random bytes as the nonce, and keeps both;
 //!   2. the approver answers with its offer: its certificate, and 32 random bytes of its own (the
 //!      same commitment again gets the same offer);
 //!   3. only then does the new device reveal the key and the nonce, which the approver holds to
 //!      the commitment;
-//!   4. both show 6 digits: the first 8 bytes of SHA-256("duvet approval code v1" || key ||
+//!   4. both work out 6 digits: the first 8 bytes of SHA-256("duvet approval code v1" || key ||
 //!      nonce || the approver's certificate || the new device's user, ID, signature key and HPKE
-//!      key || the approver's nonce), as a big-endian number, modulo 10^6.
+//!      key || the approver's nonce), as a big-endian number, modulo 10^6. The approver shows
+//!      them; the new device keeps its own, so the person can only type what the approver shows.
 //!
 //!   The code covers what each side acts on: the key the approver encrypts to and the keys it
 //!   certifies, and the approver the new device trusts. A server in the middle commits to its
@@ -463,12 +464,13 @@ pub(crate) struct ApprovalReveal {
 pub(crate) struct Revealed {
     #[serde(with = "b64")]
     reveal: Vec<u8>,
-    code: String,
 }
 
-/// The new device's answer to the approver's offer: the key and the nonce its commitment hid, and
-/// the code to compare with the approver's. An attempt takes the first offer, and lasts 10 minutes
-/// from then on: the same one again gets the same answer, and another one `exists`.
+/// The new device's answer to the approver's offer: the key and the nonce its commitment hid. Its
+/// own code stays here, for `approval_accept` to compare the approver's with, and no command
+/// returns it: a screen that showed it beside the field would invite the person to type it. An
+/// attempt takes the first offer, and lasts 10 minutes from then on: the same one again gets the
+/// same answer, and another one `exists`.
 pub(crate) fn approval_reveal(tx: &mut Tx<'_>, request: ApprovalReveal) -> Result<Revealed, Error> {
     let own = tx.own_device()?;
     let (id, _, mut attempt) = under_way::<Attempt>(tx, NEW)?;
@@ -514,19 +516,12 @@ pub(crate) fn approval_reveal(tx: &mut Tx<'_>, request: ApprovalReveal) -> Resul
             )?;
         }
     }
-    let code = code_digits(
-        &attempt.key,
-        &attempt.nonce,
-        &answer.certificate,
-        &Asked::of(&own)?,
-        &answer.nonce,
-    );
     let reveal = to_cbor(&Reveal {
         v: 1,
         key: attempt.key,
         nonce: attempt.nonce,
     })?;
-    Ok(Revealed { reveal, code })
+    Ok(Revealed { reveal })
 }
 
 #[derive(Debug, Deserialize)]
