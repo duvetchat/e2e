@@ -204,15 +204,66 @@ CREATE TABLE deviceless_users (
     PRIMARY KEY (conversation_id, user_id)
 );
 
--- The backup's days: which are complete, and which to upload (again).
+-- The backup's days: a row for each conversation and UTC day (YYYY-MM-DD) this device holds anything
+-- of, or the server holds a segment of as far as it knows. `dirty` while what the device holds of the
+-- day changed since the server last held the same; `listed` once backup_due or backup_segment handed
+-- the day out after its last change, so that backup_uploaded takes what the client uploads as the
+-- day; `uploaded` what the server holds: none it knows of, an incomplete copy (0) or a complete one (1).
 CREATE TABLE segments (
     conversation_id BLOB NOT NULL,
     day TEXT NOT NULL,
-    complete INTEGER NOT NULL DEFAULT 0,
     dirty INTEGER NOT NULL DEFAULT 1,
-    uploaded_at INTEGER,
+    listed INTEGER NOT NULL DEFAULT 0,
+    uploaded INTEGER CHECK (uploaded IN (0, 1)),
     PRIMARY KEY (conversation_id, day)
 );
+-- A conversation and a time written here mark that UTC day's segment changed.
+CREATE VIEW segment_changes (conversation_id, at) AS SELECT NULL, NULL WHERE 0;
+CREATE TRIGGER segment_changed INSTEAD OF INSERT ON segment_changes BEGIN
+    INSERT OR IGNORE INTO segments (conversation_id, day)
+        VALUES (new.conversation_id, strftime('%Y-%m-%d', new.at / 1000.0, 'unixepoch'));
+    UPDATE segments SET dirty = 1, listed = 0
+        WHERE conversation_id = new.conversation_id
+        AND day = strftime('%Y-%m-%d', new.at / 1000.0, 'unixepoch');
+END;
+-- A message or an edit written, dropped, or changed in what a segment carries of it (not its shown
+-- text) changes its day, and the day it had: a deletion, the message's day and its edits'.
+CREATE TRIGGER segments_message_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO segment_changes VALUES (new.conversation_id, new.sent_at);
+END;
+CREATE TRIGGER segments_message_update AFTER UPDATE OF message_id, conversation_id, seq, user_id,
+    device_id, sent_at, envelope, deleted, status, shared_by, reply_to ON messages BEGIN
+    INSERT INTO segment_changes VALUES (old.conversation_id, old.sent_at);
+    INSERT INTO segment_changes VALUES (new.conversation_id, new.sent_at);
+END;
+CREATE TRIGGER segments_message_delete AFTER DELETE ON messages BEGIN
+    INSERT INTO segment_changes VALUES (old.conversation_id, old.sent_at);
+END;
+CREATE TRIGGER segments_edit_insert AFTER INSERT ON edits BEGIN
+    INSERT INTO segment_changes VALUES (new.conversation_id, new.sent_at);
+END;
+CREATE TRIGGER segments_edit_update AFTER UPDATE OF conversation_id, message_id, seq, user_id,
+    device_id, sent_at, text, shared_by ON edits BEGIN
+    INSERT INTO segment_changes VALUES (old.conversation_id, old.sent_at);
+    INSERT INTO segment_changes VALUES (new.conversation_id, new.sent_at);
+END;
+CREATE TRIGGER segments_edit_delete AFTER DELETE ON edits BEGIN
+    INSERT INTO segment_changes VALUES (old.conversation_id, old.sent_at);
+END;
+-- A day's messages and edits, as a segment and a complete day read them.
+CREATE INDEX messages_by_day ON messages (conversation_id, sent_at);
+CREATE INDEX edits_by_day ON edits (conversation_id, sent_at);
+
+-- When this device was in each conversation's group, for the backup's complete days: from when it
+-- entered to the latest time it knows it was still in (the newest entry it applied there, or the
+-- commit that took it out). A row each time it enters; `open` while it's in.
+CREATE TABLE memberships (
+    conversation_id BLOB NOT NULL,
+    entered_at INTEGER NOT NULL,
+    seen_until INTEGER NOT NULL,
+    open INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX memberships_by_conversation ON memberships (conversation_id);
 
 -- The key packages this device handed out, to know when to make more.
 CREATE TABLE key_packages (

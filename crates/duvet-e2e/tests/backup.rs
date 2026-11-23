@@ -1,0 +1,1020 @@
+//! The encrypted backup through `Core::handle`, against a fake of the API: each conversation's UTC
+//! days as segments the user's backup key encrypts. A device lists the days due (`backup_due`),
+//! builds a day's segment (`backup_segment`) and hears the server holds it (`backup_uploaded`);
+//! another device of the user imports it (`backup_import`). A day is complete when the device was in
+//! the group from its start to its end and read everything of it; a deletion makes its days due
+//! again; and after a rotation the old segments move to the new key (`backup_reencrypt`). The
+//! segments are opened here as the contract lays them out, apart from the core's own code.
+
+mod support;
+
+use aes_gcm::aead::{Aead, Payload};
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use duvet_e2e::messages::{self, Record, RecordKind};
+use duvet_e2e::{Clock, SystemClock, recovery};
+use duvet_e2e_rules::Kind;
+use hkdf::Hkdf;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::Sha256;
+use support::*;
+use uuid::Uuid;
+
+const MINUTE: i64 = 60 * 1000;
+const HOUR: i64 = 60 * MINUTE;
+
+/// A segment as the contract lays it out: `{v: 1, key_id, user, conversation, day, complete,
+/// nonce, ct}`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Segment {
+    v: u32,
+    #[serde(with = "serde_bytes")]
+    key_id: Vec<u8>,
+    user: Uuid,
+    conversation: Uuid,
+    day: String,
+    complete: bool,
+    #[serde(with = "serde_bytes")]
+    nonce: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    ct: Vec<u8>,
+}
+
+/// A segment's header, its associated data: its fields but `ct`, in the same order.
+#[derive(Serialize)]
+struct Header<'a> {
+    v: u32,
+    #[serde(with = "serde_bytes")]
+    key_id: &'a [u8],
+    user: Uuid,
+    conversation: Uuid,
+    day: &'a str,
+    complete: bool,
+    #[serde(with = "serde_bytes")]
+    nonce: &'a [u8],
+}
+
+fn cbor(value: &impl Serialize) -> Vec<u8> {
+    let mut out = Vec::new();
+    ciborium::into_writer(value, &mut out).unwrap();
+    out
+}
+
+impl Segment {
+    fn read(data: &[u8]) -> Segment {
+        ciborium::from_reader(data).expect("a segment")
+    }
+
+    fn header(&self) -> Vec<u8> {
+        cbor(&Header {
+            v: self.v,
+            key_id: &self.key_id,
+            user: self.user,
+            conversation: self.conversation,
+            day: &self.day,
+            complete: self.complete,
+            nonce: &self.nonce,
+        })
+    }
+
+    /// The AES-256-GCM key of this conversation's day: HKDF of `backup_key`, with the info
+    /// "duvet segment v1" || conversation || day.
+    fn cipher(&self, backup_key: &[u8; 32]) -> Aes256Gcm {
+        let info = [
+            b"duvet segment v1".as_slice(),
+            self.conversation.as_bytes(),
+            self.day.as_bytes(),
+        ]
+        .concat();
+        let mut key = [0u8; 32];
+        Hkdf::<Sha256>::new(None, backup_key)
+            .expand(&info, &mut key)
+            .unwrap();
+        Aes256Gcm::new_from_slice(&key).unwrap()
+    }
+
+    /// What it holds, opened with `backup_key`: the deflate of the records' CBOR.
+    fn open(&self, backup_key: &[u8; 32]) -> Vec<Record> {
+        let deflated = self
+            .cipher(backup_key)
+            .decrypt(
+                Nonce::from_slice(&self.nonce),
+                Payload {
+                    msg: &self.ct,
+                    aad: &self.header(),
+                },
+            )
+            .expect("the segment opens with the key");
+        let plain = miniz_oxide::inflate::decompress_to_vec(&deflated).unwrap();
+        ciborium::from_reader(plain.as_slice()).unwrap()
+    }
+
+    /// The segment sealed anew with `backup_key`, holding `records`, its header as it is.
+    fn sealed(mut self, backup_key: &[u8; 32], records: &[Record]) -> Vec<u8> {
+        let plain = miniz_oxide::deflate::compress_to_vec(&cbor(&records.to_vec()), 6);
+        self.ct = self
+            .cipher(backup_key)
+            .encrypt(
+                Nonce::from_slice(&self.nonce),
+                Payload {
+                    msg: &plain,
+                    aad: &self.header(),
+                },
+            )
+            .unwrap();
+        cbor(&self)
+    }
+}
+
+/// The UTC date of `ms`, counted day by day from 1970: the test's own reckoning, apart from the
+/// core's.
+fn utc_day(ms: i64) -> String {
+    let leap = |year: i64| (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let mut days = ms.div_euclid(DAY_MS);
+    let mut year = 1970;
+    loop {
+        let length = if leap(year) { 366 } else { 365 };
+        if days < length {
+            break;
+        }
+        days -= length;
+        year += 1;
+    }
+    let february = if leap(year) { 29 } else { 28 };
+    let months = [31, february, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month = 0;
+    while days >= months[month] {
+        days -= months[month];
+        month += 1;
+    }
+    format!("{year:04}-{:02}-{:02}", month + 1, days + 1)
+}
+
+/// The start of the UTC day after tomorrow by the system's clock: the tests' day. The core's clock
+/// never goes behind the system's, which OpenMLS reads for its key packages' lifetimes.
+fn test_day() -> i64 {
+    (SystemClock.now_ms().div_euclid(DAY_MS) + 2) * DAY_MS
+}
+
+/// A DM of A and B, which A1 made at noon the day before `day`: A1 with A's identity (its
+/// `create_identity` reply, the recovery key in it), and B1.
+struct Dm {
+    server: FakeServer,
+    conversation: Uuid,
+    a: Uuid,
+    b: Uuid,
+    a1: TestDevice,
+    b1: TestDevice,
+    identity: Value,
+    day: i64,
+}
+
+fn dm() -> Dm {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let (mut a1, identity) = server.first_device(a);
+    let mut b1 = server.device(b);
+    for device in [&mut a1, &mut b1] {
+        server.publish(device);
+    }
+    for device in [&mut a1, &mut b1] {
+        server.introduce(device);
+    }
+    let day = test_day();
+    server.clock.set(day - 12 * HOUR);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Dm, None, &[a, b], false);
+    let command = server.create_group(conversation);
+    server
+        .commit(&mut a1, conversation, command)
+        .expect("the server takes epoch 0");
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    Dm {
+        server,
+        conversation,
+        a,
+        b,
+        a1,
+        b1,
+        identity,
+        day,
+    }
+}
+
+impl Dm {
+    fn at(&mut self, ms: i64) {
+        self.server.clock.set(ms);
+    }
+
+    /// Every device of the chat applies its queue.
+    fn deliver(&mut self) {
+        self.server.deliver_all(&mut [&mut self.a1, &mut self.b1]);
+    }
+}
+
+/// The backup key an identity's reply hands the server, as its recovery key opens it.
+fn backup_key_of(user: Uuid, reply: &Value) -> [u8; 32] {
+    let recovery_key = recovery::parse(reply["recovery_key"].as_str().unwrap()).unwrap();
+    *recovery::unwrap_backup_key(&recovery_key, user, &bytes(&reply["wrapped_backup_key"])).unwrap()
+}
+
+/// `device` sends `envelope`, answering `reply_to`, and hears the API's answer: the message's ID.
+fn send(
+    server: &mut FakeServer,
+    device: &mut TestDevice,
+    conversation: Uuid,
+    envelope: Value,
+    reply_to: Option<Uuid>,
+) -> Uuid {
+    let nonce = new_id().to_string();
+    let encrypted = ok(
+        &mut device.core,
+        json!({
+            "cmd": "encrypt",
+            "conversation_id": conversation,
+            "nonce": nonce,
+            "envelope": envelope,
+        }),
+    );
+    let ciphertext = bytes(&encrypted["ciphertext"]);
+    let (message_id, seq) = server.post_message(device, conversation, &nonce, ciphertext, &[]);
+    let mut answer = json!({
+        "cmd": "sent",
+        "conversation_id": conversation,
+        "nonce": nonce,
+        "message_id": message_id,
+        "seq": seq,
+    });
+    if let Some(reply_to) = reply_to {
+        let queue = &mut server.chats.get_mut(&conversation).unwrap().queue;
+        let entry = &mut queue[usize::try_from(seq).unwrap() - 1];
+        entry.meta.insert("reply_to".into(), json!(reply_to));
+        answer["reply_to"] = json!(reply_to);
+    }
+    ok(&mut device.core, answer);
+    message_id
+}
+
+fn say(server: &mut FakeServer, device: &mut TestDevice, conversation: Uuid, text: &str) -> Uuid {
+    send(server, device, conversation, json!({"text": text}), None)
+}
+
+fn edit(
+    server: &mut FakeServer,
+    device: &mut TestDevice,
+    conversation: Uuid,
+    message_id: Uuid,
+    text: &str,
+) {
+    let edited = ok(
+        &mut device.core,
+        json!({"cmd": "edit", "conversation_id": conversation, "message_id": message_id, "text": text}),
+    );
+    let ciphertext = bytes(&edited["ciphertext"]);
+    server.post_change(device, conversation, "edit", message_id, ciphertext);
+}
+
+fn delete(server: &mut FakeServer, device: &mut TestDevice, conversation: Uuid, message_id: Uuid) {
+    let deleted = ok(
+        &mut device.core,
+        json!({"cmd": "delete", "conversation_id": conversation, "message_id": message_id}),
+    );
+    let ciphertext = bytes(&deleted["ciphertext"]);
+    server.post_change(device, conversation, "delete", message_id, ciphertext);
+}
+
+/// The server hands `device` a copy it can't read of the last entry of `conversation`'s queue, a
+/// message: the device keeps it as waiting.
+fn hand_unreadable(server: &FakeServer, device: &mut TestDevice, conversation: Uuid) {
+    let mut copy = server.entries(conversation).last().unwrap().clone();
+    let mut data = bytes(&copy["data"]);
+    *data.last_mut().unwrap() ^= 1;
+    copy["data"] = json!(b64(&data));
+    let taken = ok(
+        &mut device.core,
+        json!({"cmd": "apply", "conversation_id": conversation, "entries": [copy]}),
+    );
+    assert_eq!(taken["results"][0]["result"], "undecryptable");
+}
+
+/// A file as a message carries it: the file itself isn't in the backup, only what the envelope
+/// says of it, its key among it.
+fn file() -> Value {
+    json!({
+        "id": new_id(),
+        "key": b64(&[7; 32]),
+        "sha256": b64(&[8; 32]),
+        "name": "foto.jpg",
+        "type": "image/jpeg",
+        "size": 48_213,
+    })
+}
+
+/// The days `backup_due` lists: each one's conversation, day and whether it's complete.
+fn due(device: &mut TestDevice) -> Vec<(Uuid, String, bool)> {
+    ok(&mut device.core, json!({"cmd": "backup_due"}))["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|due| {
+            (
+                due["conversation_id"].as_str().unwrap().parse().unwrap(),
+                due["day"].as_str().unwrap().to_owned(),
+                due["complete"].as_bool().unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn segment_command(conversation: Uuid, day: &str) -> Value {
+    json!({"cmd": "backup_segment", "conversation_id": conversation, "day": day})
+}
+
+/// `backup_segment`'s reply for the day.
+fn segment(device: &mut TestDevice, conversation: Uuid, day: &str) -> Value {
+    ok(&mut device.core, segment_command(conversation, day))
+}
+
+/// The server holds the day, complete or not.
+fn uploaded(device: &mut TestDevice, conversation: Uuid, day: &str, complete: bool) {
+    let reply = ok(
+        &mut device.core,
+        json!({
+            "cmd": "backup_uploaded",
+            "conversation_id": conversation,
+            "day": day,
+            "complete": complete,
+        }),
+    );
+    assert_eq!(reply, json!({}));
+}
+
+/// `device` builds the day's segment, the client uploads it, and the core hears the server holds
+/// it: `backup_segment`'s reply.
+fn back_up(device: &mut TestDevice, conversation: Uuid, day: &str) -> Value {
+    let built = segment(device, conversation, day);
+    uploaded(
+        device,
+        conversation,
+        day,
+        built["complete"].as_bool().unwrap(),
+    );
+    built
+}
+
+fn import_command(data: &Value) -> Value {
+    json!({"cmd": "backup_import", "data": data})
+}
+
+/// How many records of the segment `data` changed something on `device`.
+fn imported(device: &mut TestDevice, data: &Value) -> u64 {
+    ok(&mut device.core, import_command(data))["imported"]
+        .as_u64()
+        .unwrap()
+}
+
+/// `(code, detail)` of an error: its `what`, `kind`, `rule` or `field`.
+fn refusal(error: &Value) -> (String, String) {
+    let detail = ["what", "kind", "rule", "field"]
+        .into_iter()
+        .find_map(|name| error.get(name))
+        .map_or_else(String::new, |detail| detail.as_str().unwrap().to_string());
+    (error["code"].as_str().unwrap().to_string(), detail)
+}
+
+fn expect(code: &str, detail: &str) -> (String, String) {
+    (code.to_string(), detail.to_string())
+}
+
+/// The messages of `conversation` as `device` shows them, newest first, without the nonce only the
+/// sender's own copy keeps.
+fn shown(device: &mut TestDevice, conversation: Uuid) -> Vec<Value> {
+    let page = ok(
+        &mut device.core,
+        json!({"cmd": "messages", "conversation_id": conversation, "limit": 100}),
+    );
+    page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .cloned()
+        .map(|mut message| {
+            message.as_object_mut().unwrap().remove("nonce");
+            message
+        })
+        .collect()
+}
+
+/// The IDs of the messages `device` shows, newest first.
+fn shown_ids(device: &mut TestDevice, conversation: Uuid) -> Vec<Uuid> {
+    shown(device, conversation)
+        .iter()
+        .map(|message| message["message_id"].as_str().unwrap().parse().unwrap())
+        .collect()
+}
+
+/// A new device of `user`, recovered with the recovery key of `identity` (an identity's reply): it
+/// holds that identity's backup key, and no group.
+fn recovered(server: &mut FakeServer, user: Uuid, identity: &Value) -> TestDevice {
+    let mut device = server.bare_device(user);
+    let list = server.observed(user)["device_list"].clone();
+    let recovered = ok(
+        &mut device.core,
+        json!({
+            "cmd": "recover",
+            "recovery_key": identity["recovery_key"],
+            "wrapped_backup_key": identity["wrapped_backup_key"],
+            "encrypted_identity": identity["encrypted_identity"],
+            "device_list": list,
+        }),
+    );
+    server.take_device(user, &recovered["certificate"], &recovered["device_list"]);
+    device
+}
+
+#[test]
+fn segment_round_trip() {
+    let mut dm = dm();
+    let (conversation, day) = (dm.conversation, dm.day);
+
+    // On the day, A1 writes, B1 answers with a file, and A1 edits its message.
+    dm.at(day + HOUR);
+    let hello = say(&mut dm.server, &mut dm.a1, conversation, "hola");
+    dm.at(day + 2 * HOUR);
+    let photo = send(
+        &mut dm.server,
+        &mut dm.b1,
+        conversation,
+        json!({"text": "mira", "attachments": [file()]}),
+        Some(hello),
+    );
+    dm.at(day + 3 * HOUR);
+    edit(
+        &mut dm.server,
+        &mut dm.a1,
+        conversation,
+        hello,
+        "hola, editado",
+    );
+    dm.deliver();
+    // The next day B1 writes again: A1 applied its queue past the day's end.
+    dm.at(day + DAY_MS + HOUR);
+    say(&mut dm.server, &mut dm.b1, conversation, "mañana");
+    dm.deliver();
+
+    // The day is due, complete: A1 was in the group from its start to its end, and read it all.
+    // The day still going isn't due.
+    let the_day = utc_day(day);
+    assert_eq!(due(&mut dm.a1), [(conversation, the_day.clone(), true)]);
+    let built = segment(&mut dm.a1, conversation, &the_day);
+    assert_eq!(built["complete"], true);
+    let backup_key = backup_key_of(dm.a, &dm.identity);
+    assert_eq!(bytes(&built["key_id"]), recovery::key_id(&backup_key));
+
+    // The segment as the contract lays it out, opened with A's backup key: its header, and the
+    // day's messages and edit as A1 carries them, in the order they were sent. The file isn't in
+    // it: its key is, in its message's envelope.
+    let segment = Segment::read(&bytes(&built["data"]));
+    assert_eq!(segment.v, 1);
+    assert_eq!(segment.key_id, recovery::key_id(&backup_key));
+    assert_eq!(
+        (segment.user, segment.conversation, segment.day.as_str()),
+        (dm.a, conversation, the_day.as_str())
+    );
+    assert!(segment.complete);
+    assert_eq!(segment.nonce.len(), 12);
+    let records = segment.open(&backup_key);
+    let order: Vec<(RecordKind, Uuid)> = records
+        .iter()
+        .map(|record| (record.kind, record.id))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            (RecordKind::Message, hello),
+            (RecordKind::Message, photo),
+            (RecordKind::Edit, hello),
+        ]
+    );
+    assert_eq!(records[1].user, dm.b);
+    assert_eq!(records[1].reply_to, Some(hello));
+    let carried = dm
+        .a1
+        .core
+        .transaction(|tx| messages::records_for(tx, conversation, day, day + DAY_MS))
+        .unwrap();
+    assert_eq!(records, carried);
+
+    // Another device of A's, recovered with the recovery key, imports it: it shows the day as A1
+    // does, the edit applied, the reply and the file kept.
+    let mut a2 = recovered(&mut dm.server, dm.a, &dm.identity);
+    assert_eq!(imported(&mut a2, &built["data"]), 3);
+    let the_day_on_a1: Vec<Value> = shown(&mut dm.a1, conversation)
+        .into_iter()
+        .filter(|message| message["sent_at"].as_i64().unwrap() < day + DAY_MS)
+        .collect();
+    assert_eq!(the_day_on_a1.len(), 2);
+    assert_eq!(the_day_on_a1[1]["text"], "hola, editado");
+    assert_eq!(shown(&mut a2, conversation), the_day_on_a1);
+    // Again, it changes nothing; and A2 holds the day as the server does, so nothing is due.
+    assert_eq!(imported(&mut a2, &built["data"]), 0);
+    assert_eq!(due(&mut a2), []);
+
+    // Once the server holds it, A1 has nothing due either.
+    uploaded(&mut dm.a1, conversation, &the_day, true);
+    assert_eq!(due(&mut dm.a1), []);
+}
+
+#[test]
+fn segment_rejects_tampering_and_other_keys() {
+    let mut dm = dm();
+    let (conversation, day) = (dm.conversation, dm.day);
+    dm.at(day + HOUR);
+    say(&mut dm.server, &mut dm.a1, conversation, "solo para A");
+    dm.deliver();
+    dm.at(day + DAY_MS + HOUR);
+    let the_day = utc_day(day);
+    let built = segment(&mut dm.a1, conversation, &the_day);
+    let theirs = segment(&mut dm.b1, conversation, &the_day);
+    let segment = Segment::read(&bytes(&built["data"]));
+    let backup_key = backup_key_of(dm.a, &dm.identity);
+    let records = segment.open(&backup_key);
+    let mut a2 = recovered(&mut dm.server, dm.a, &dm.identity);
+    let mut refused = |blob: Vec<u8>| -> (String, String) {
+        refusal(&error(&mut a2.core, import_command(&json!(b64(&blob)))))
+    };
+
+    // A byte of its ciphertext changed.
+    let mut changed = segment.clone();
+    *changed.ct.last_mut().unwrap() ^= 1;
+    assert_eq!(refused(cbor(&changed)), expect("decrypt_failed", "segment"));
+    // Its header changed: another conversation or day (another key, other associated data), its
+    // completeness, or its user.
+    let mut others = vec![segment.clone(), segment.clone(), segment.clone()];
+    others[0].conversation = new_id();
+    others[1].day = utc_day(day + DAY_MS);
+    others[2].complete = !segment.complete;
+    let mut stranger = segment.clone();
+    stranger.user = dm.b;
+    others.push(stranger);
+    for other in others {
+        assert_eq!(
+            refused(cbor(&other)),
+            expect("decrypt_failed", "segment"),
+            "{other:?}"
+        );
+    }
+    // Another backup key: one that no key A2 holds is named by...
+    let another_key = [0x42u8; 32];
+    let mut foreign = segment.clone();
+    foreign.key_id = recovery::key_id(&another_key).to_vec();
+    assert_eq!(
+        refused(foreign.sealed(&another_key, &records)),
+        expect("not_found", "backup_key")
+    );
+    // ...or one that claims A's key's ID, which doesn't open it.
+    let forged = segment.clone().sealed(&another_key, &records);
+    assert_eq!(refused(forged), expect("decrypt_failed", "segment"));
+    // B's own backup of the same day, under B's key.
+    assert_eq!(
+        refused(bytes(&theirs["data"])),
+        expect("decrypt_failed", "segment")
+    );
+    // What isn't a segment, or one of a version this core doesn't read.
+    assert_eq!(
+        refused(b"not a segment".to_vec()),
+        expect("bad_command", "data")
+    );
+    let mut later = segment.clone();
+    later.v = 2;
+    assert_eq!(refused(cbor(&later)), expect("bad_command", "data"));
+
+    // None of it imported anything; the segment itself imports.
+    assert_eq!(shown(&mut a2, conversation), Vec::<Value>::new());
+    assert_eq!(imported(&mut a2, &built["data"]), 1);
+}
+
+#[test]
+fn segment_day_is_utc() {
+    let mut dm = dm();
+    let (conversation, day) = (dm.conversation, dm.day);
+    // Two messages of the same evening in UTC-5: at 18:59 there, the day before `day` in UTC as
+    // well, and at 23:30 there, which in UTC is 04:30 of `day`.
+    let evening = day - MINUTE;
+    let late_evening = day + 4 * HOUR + 30 * MINUTE;
+    assert_eq!(
+        utc_day(evening - 5 * HOUR),
+        utc_day(late_evening - 5 * HOUR)
+    );
+    dm.at(evening);
+    let earlier = say(&mut dm.server, &mut dm.a1, conversation, "18:59 en UTC-5");
+    dm.at(late_evening);
+    let later = say(&mut dm.server, &mut dm.a1, conversation, "23:30 en UTC-5");
+    dm.deliver();
+
+    // While `day` lasts in UTC, only the day before is due: a day is due once it ends. A1 made the
+    // DM at noon that day, so it isn't complete.
+    let (before, the_day) = (utc_day(day - DAY_MS), utc_day(day));
+    assert_eq!(due(&mut dm.a1), [(conversation, before.clone(), false)]);
+
+    // Once `day` ends in UTC (and the next day's first message came), it's due as well, complete.
+    dm.at(day + DAY_MS + HOUR);
+    say(&mut dm.server, &mut dm.b1, conversation, "el día siguiente");
+    dm.deliver();
+    assert_eq!(
+        due(&mut dm.a1),
+        [
+            (conversation, before.clone(), false),
+            (conversation, the_day.clone(), true)
+        ]
+    );
+
+    // The message of 23:30 in UTC-5 is in `day`'s segment; the one of 18:59, in the day before's.
+    let backup_key = backup_key_of(dm.a, &dm.identity);
+    let mut holds = |day: &str| -> Vec<Uuid> {
+        let built = segment(&mut dm.a1, conversation, day);
+        Segment::read(&bytes(&built["data"]))
+            .open(&backup_key)
+            .iter()
+            .map(|record| record.id)
+            .collect()
+    };
+    assert_eq!(holds(&the_day), [later]);
+    assert_eq!(holds(&before), [earlier]);
+
+    // A day is a UTC date written YYYY-MM-DD, and nothing else.
+    for day in [
+        "2026-13-01",
+        "2026-02-30",
+        "2025-02-29",
+        "26-11-23",
+        "2026-11-23T00:00:00Z",
+        "2026-1-23",
+        " 2026-11-23",
+        "",
+    ] {
+        let refused = error(&mut dm.a1.core, segment_command(conversation, day));
+        assert_eq!(refusal(&refused), expect("bad_command", "day"), "{day:?}");
+    }
+    segment(&mut dm.a1, conversation, "2024-02-29");
+}
+
+#[test]
+fn delete_marks_its_days_again() {
+    let mut dm = dm();
+    let (conversation, day) = (dm.conversation, dm.day);
+    // A1 writes on `day` and edits it the next day, beside a message of B1's that day.
+    dm.at(day + HOUR);
+    let gone = say(&mut dm.server, &mut dm.a1, conversation, "lo borraré");
+    dm.at(day + DAY_MS + HOUR);
+    edit(
+        &mut dm.server,
+        &mut dm.a1,
+        conversation,
+        gone,
+        "lo borraré, editado",
+    );
+    dm.at(day + DAY_MS + 2 * HOUR);
+    let stays = say(&mut dm.server, &mut dm.b1, conversation, "esto queda");
+    dm.deliver();
+
+    // The day after, A1 backs both days up, and has nothing due. B1 lists and builds them too, but
+    // its uploads are still under way when the deletion comes.
+    dm.at(day + 2 * DAY_MS + HOUR);
+    let days = [utc_day(day), utc_day(day + DAY_MS)];
+    for device in [&mut dm.a1, &mut dm.b1] {
+        let listed: Vec<String> = due(device).into_iter().map(|(_, day, _)| day).collect();
+        assert_eq!(listed, days);
+    }
+    let before_deletion: Vec<Value> = days
+        .iter()
+        .map(|day| back_up(&mut dm.a1, conversation, day))
+        .collect();
+    assert_eq!(due(&mut dm.a1), []);
+    let in_flight: Vec<Value> = days
+        .iter()
+        .map(|day| segment(&mut dm.b1, conversation, day))
+        .collect();
+
+    // A1 deletes its message. On A1, and on B1 once the queue brings the deletion, the message's
+    // day and its edit's are due again: on B1 even once the server holds the segments it built
+    // before, which still have them.
+    dm.at(day + 2 * DAY_MS + 2 * HOUR);
+    delete(&mut dm.server, &mut dm.a1, conversation, gone);
+    dm.deliver();
+    for (day, built) in days.iter().zip(&in_flight) {
+        let complete = built["complete"].as_bool().unwrap();
+        uploaded(&mut dm.b1, conversation, day, complete);
+    }
+    for device in [&mut dm.a1, &mut dm.b1] {
+        let listed: Vec<String> = due(device).into_iter().map(|(_, day, _)| day).collect();
+        assert_eq!(listed, days);
+    }
+
+    // Their segments hold neither the message nor its edit.
+    let backup_key = backup_key_of(dm.a, &dm.identity);
+    let mut holds = |day: &str| -> Vec<(RecordKind, Uuid)> {
+        let built = segment(&mut dm.a1, conversation, day);
+        Segment::read(&bytes(&built["data"]))
+            .open(&backup_key)
+            .iter()
+            .map(|record| (record.kind, record.id))
+            .collect()
+    };
+    assert_eq!(holds(&days[0]), []);
+    assert_eq!(holds(&days[1]), [(RecordKind::Message, stays)]);
+    for device in [&mut dm.a1, &mut dm.b1] {
+        for day in &days {
+            back_up(device, conversation, day);
+        }
+        assert_eq!(due(device), []);
+    }
+
+    // The server hands back the copy from before the deletion: it brings nothing back, and leaves
+    // its day due, as the server's copy isn't what A1 holds.
+    assert_eq!(imported(&mut dm.a1, &before_deletion[0]["data"]), 0);
+    assert!(!shown_ids(&mut dm.a1, conversation).contains(&gone));
+    let listed: Vec<String> = due(&mut dm.a1).into_iter().map(|(_, day, _)| day).collect();
+    assert_eq!(listed, [days[0].clone()]);
+}
+
+#[test]
+fn a_stay_out_of_the_group_breaks_its_days() {
+    let mut dm = dm();
+    let (conversation, day) = (dm.conversation, dm.day);
+    // The day before `day`, a second device of A's, recovered, joins the group by external commit.
+    dm.at(day - 11 * HOUR);
+    let mut a2 = recovered(&mut dm.server, dm.a, &dm.identity);
+    dm.server.publish(&mut a2);
+    for device in [&mut dm.a1, &mut dm.b1, &mut a2] {
+        dm.server.introduce(device);
+    }
+    let join = |server: &mut FakeServer, a2: &mut TestDevice| {
+        let command = json!({
+            "cmd": "join_external",
+            "conversation_id": conversation,
+            "generation": 0,
+            "group_info": server.group_info(conversation),
+        });
+        server
+            .commit(a2, conversation, command)
+            .expect("the server takes the external commit");
+    };
+    join(&mut dm.server, &mut a2);
+    dm.server
+        .deliver_all(&mut [&mut dm.a1, &mut dm.b1, &mut a2]);
+
+    // B1 writes through `day` and the day after. At 10:00 on `day` the API takes A2 out (its
+    // removal, which A1 commits); at 10:00 the next day A2 comes back by external commit.
+    let write = |dm: &mut Dm, a2: &mut TestDevice, at: i64, text: &str| {
+        dm.at(at);
+        say(&mut dm.server, &mut dm.b1, conversation, text);
+        dm.server.deliver_all(&mut [&mut dm.a1, &mut dm.b1, a2]);
+    };
+    write(&mut dm, &mut a2, day + HOUR, "antes");
+    dm.at(day + 10 * HOUR);
+    dm.server.remove_device(conversation, a2.id);
+    dm.server
+        .deliver_all(&mut [&mut dm.a1, &mut dm.b1, &mut a2]);
+    let commit = json!({"cmd": "commit_pending", "conversation_id": conversation});
+    dm.server
+        .commit(&mut dm.a1, conversation, commit)
+        .expect("the server takes the removal");
+    dm.server
+        .deliver_all(&mut [&mut dm.a1, &mut dm.b1, &mut a2]);
+    assert_eq!(a2.no_group(conversation)["what"], "membership");
+    write(&mut dm, &mut a2, day + 11 * HOUR, "fuera");
+    write(&mut dm, &mut a2, day + DAY_MS + HOUR, "aún fuera");
+    dm.at(day + DAY_MS + 10 * HOUR);
+    join(&mut dm.server, &mut a2);
+    dm.server
+        .deliver_all(&mut [&mut dm.a1, &mut dm.b1, &mut a2]);
+    write(&mut dm, &mut a2, day + DAY_MS + 11 * HOUR, "de vuelta");
+    write(&mut dm, &mut a2, day + 2 * DAY_MS + HOUR, "al otro día");
+    write(&mut dm, &mut a2, day + 3 * DAY_MS + HOUR, "y al siguiente");
+
+    // A1, in the group all along, holds the three days whole. A2 holds neither the day it left nor
+    // the one it came back, only the one after, which it was in from start to end.
+    let days = [
+        utc_day(day),
+        utc_day(day + DAY_MS),
+        utc_day(day + 2 * DAY_MS),
+    ];
+    let whole = |completes: [bool; 3]| -> Vec<(Uuid, String, bool)> {
+        days.iter()
+            .zip(completes)
+            .map(|(day, complete)| (conversation, day.clone(), complete))
+            .collect()
+    };
+    assert_eq!(due(&mut dm.a1), whole([true, true, true]));
+    assert_eq!(due(&mut a2), whole([false, false, true]));
+}
+
+#[test]
+fn incomplete_day_can_be_replaced() {
+    let mut dm = dm();
+    let (conversation, day) = (dm.conversation, dm.day);
+
+    // On `day`, B1 writes, and the server hands A1 a copy it can't read: A1 keeps it as waiting.
+    dm.at(day + HOUR);
+    let unread = say(&mut dm.server, &mut dm.b1, conversation, "no llega bien");
+    hand_unreadable(&dm.server, &mut dm.a1, conversation);
+
+    // At noon, a second device of A's, recovered, joins the group by external commit.
+    dm.at(day + 12 * HOUR);
+    let mut a2 = recovered(&mut dm.server, dm.a, &dm.identity);
+    dm.server.publish(&mut a2);
+    for device in [&mut dm.a1, &mut dm.b1, &mut a2] {
+        dm.server.introduce(device);
+    }
+    let join = json!({
+        "cmd": "join_external",
+        "conversation_id": conversation,
+        "generation": 0,
+        "group_info": dm.server.group_info(conversation),
+    });
+    dm.server
+        .commit(&mut a2, conversation, join)
+        .expect("the server takes the external commit");
+    dm.server
+        .deliver_all(&mut [&mut dm.a1, &mut dm.b1, &mut a2]);
+    dm.at(day + 13 * HOUR);
+    let read = say(&mut dm.server, &mut dm.b1, conversation, "este sí");
+    dm.server
+        .deliver_all(&mut [&mut dm.a1, &mut dm.b1, &mut a2]);
+
+    // After midnight, before anything of the next day came: the day is due on both of A's devices,
+    // incomplete. A1 couldn't read a message of it, A2 came in at noon, and neither has seen the
+    // day end.
+    dm.at(day + DAY_MS + 30 * MINUTE);
+    let the_day = utc_day(day);
+    assert_eq!(due(&mut dm.a1), [(conversation, the_day.clone(), false)]);
+    assert_eq!(due(&mut a2), [(conversation, the_day.clone(), false)]);
+
+    // A1 uploads its copy, incomplete. A2 finds the server's copy no less complete than its own and
+    // keeps it. Neither has the day due any more.
+    let first = back_up(&mut dm.a1, conversation, &the_day);
+    assert_eq!(first["complete"], false);
+    uploaded(&mut a2, conversation, &the_day, false);
+    assert_eq!(due(&mut dm.a1), []);
+    assert_eq!(due(&mut a2), []);
+
+    // The message A1 couldn't read comes another way (an import of what B1 has of the day): the
+    // day changed, and is due again, still incomplete.
+    let records = dm
+        .b1
+        .core
+        .transaction(|tx| messages::records_for(tx, conversation, day, day + DAY_MS))
+        .unwrap();
+    let filled = dm
+        .a1
+        .core
+        .transaction(|tx| messages::import(tx, conversation, &records, Some(dm.b)))
+        .unwrap();
+    assert_eq!(filled, 1);
+    assert_eq!(due(&mut dm.a1), [(conversation, the_day.clone(), false)]);
+    let second = back_up(&mut dm.a1, conversation, &the_day);
+    assert_eq!(second["complete"], false);
+    assert_eq!(due(&mut dm.a1), []);
+
+    // Then the next day's first message comes: A1 has its queue past the day's end. The day is
+    // complete, and due once more, to replace the server's incomplete copy. A2's, begun at noon,
+    // never is.
+    dm.at(day + DAY_MS + HOUR);
+    say(&mut dm.server, &mut dm.b1, conversation, "buenos días");
+    dm.server
+        .deliver_all(&mut [&mut dm.a1, &mut dm.b1, &mut a2]);
+    assert_eq!(due(&mut dm.a1), [(conversation, the_day.clone(), true)]);
+    assert_eq!(due(&mut a2), []);
+    let third = back_up(&mut dm.a1, conversation, &the_day);
+    assert_eq!(third["complete"], true);
+    assert_eq!(due(&mut dm.a1), []);
+
+    // A device restoring the backup takes the incomplete copy, then the complete one that
+    // replaced it: the second brings what the first lacked. It then holds the day as the server
+    // does.
+    let mut a3 = recovered(&mut dm.server, dm.a, &dm.identity);
+    assert_eq!(imported(&mut a3, &first["data"]), 1);
+    assert_eq!(shown_ids(&mut a3, conversation), [read]);
+    assert_eq!(imported(&mut a3, &third["data"]), 1);
+    assert_eq!(shown_ids(&mut a3, conversation), [read, unread]);
+    assert_eq!(due(&mut a3), []);
+}
+
+#[test]
+fn what_a_device_cant_carry_keeps_its_day_incomplete() {
+    let mut dm = dm();
+    let (conversation, day) = (dm.conversation, dm.day);
+    // On `day`, A1 writes twice; B1 gets a copy of the first it can't read, and keeps it as waiting.
+    dm.at(day + HOUR);
+    let unread = say(&mut dm.server, &mut dm.a1, conversation, "B1 no lo lee");
+    hand_unreadable(&dm.server, &mut dm.b1, conversation);
+    dm.at(day + 2 * HOUR);
+    say(
+        &mut dm.server,
+        &mut dm.a1,
+        conversation,
+        "este B1 sí lo lee",
+    );
+    // The next day A1 edits the first: B1 reads the edit, which waits for its message.
+    dm.at(day + DAY_MS + HOUR);
+    edit(&mut dm.server, &mut dm.a1, conversation, unread, "editado");
+    dm.at(day + DAY_MS + 2 * HOUR);
+    say(&mut dm.server, &mut dm.a1, conversation, "otro día");
+    dm.deliver();
+
+    // Once both days ended and the next one's first message came, A1 holds both whole. B1 holds
+    // neither, though it applied its queue past their ends: it couldn't read a message of the
+    // first, and can't carry the second's edit, of a message it doesn't show.
+    dm.at(day + 2 * DAY_MS + HOUR);
+    say(&mut dm.server, &mut dm.a1, conversation, "pasado mañana");
+    dm.deliver();
+    let (first, second) = (utc_day(day), utc_day(day + DAY_MS));
+    assert_eq!(
+        due(&mut dm.a1),
+        [
+            (conversation, first.clone(), true),
+            (conversation, second.clone(), true)
+        ]
+    );
+    assert_eq!(
+        due(&mut dm.b1),
+        [
+            (conversation, first.clone(), false),
+            (conversation, second.clone(), false)
+        ]
+    );
+
+    // Once B1 has the message (an import of what A1 has of its day), the edit applies to it, and
+    // both days are complete.
+    let records = dm
+        .a1
+        .core
+        .transaction(|tx| messages::records_for(tx, conversation, day, day + DAY_MS))
+        .unwrap();
+    let filled = dm
+        .b1
+        .core
+        .transaction(|tx| messages::import(tx, conversation, &records, Some(dm.a)))
+        .unwrap();
+    assert_eq!(filled, 1);
+    assert_eq!(
+        due(&mut dm.b1),
+        [(conversation, first, true), (conversation, second, true)]
+    );
+}
+
+#[test]
+fn reencrypt_moves_old_segments_to_the_new_key() {
+    let mut dm = dm();
+    let (conversation, day) = (dm.conversation, dm.day);
+    dm.at(day + HOUR);
+    let hello = say(&mut dm.server, &mut dm.a1, conversation, "antes del cambio");
+    dm.deliver();
+    dm.at(day + DAY_MS + HOUR);
+    let the_day = utc_day(day);
+    let old = segment(&mut dm.a1, conversation, &the_day);
+    let old_key = backup_key_of(dm.a, &dm.identity);
+    assert_eq!(bytes(&old["key_id"]), recovery::key_id(&old_key));
+    let old_segment = Segment::read(&bytes(&old["data"]));
+
+    // A changes its keys: a new backup key, the old one kept by A1, wrapped by the new.
+    let rotated = ok(&mut dm.a1.core, json!({"cmd": "rotate_keys", "remove": []}));
+    dm.server.take_identity(dm.a, &rotated);
+    let new_key = backup_key_of(dm.a, &rotated);
+    assert_ne!(new_key, old_key);
+
+    // A1 moves the old segment to the new key: the same day and records, under the new key's ID.
+    let moved = ok(
+        &mut dm.a1.core,
+        json!({"cmd": "backup_reencrypt", "data": old["data"]}),
+    );
+    assert_eq!(bytes(&moved["key_id"]), recovery::key_id(&new_key));
+    let moved_segment = Segment::read(&bytes(&moved["data"]));
+    assert_eq!(moved_segment.key_id, recovery::key_id(&new_key));
+    assert_eq!(
+        (
+            moved_segment.user,
+            moved_segment.conversation,
+            &moved_segment.day,
+            moved_segment.complete
+        ),
+        (dm.a, conversation, &the_day, old_segment.complete)
+    );
+    assert_ne!(moved_segment.nonce, old_segment.nonce);
+    assert_eq!(moved_segment.open(&new_key), old_segment.open(&old_key));
+    // What it builds from now on is under the new key too.
+    let rebuilt = segment(&mut dm.a1, conversation, &the_day);
+    assert_eq!(bytes(&rebuilt["key_id"]), recovery::key_id(&new_key));
+
+    // A device recovered with the new recovery key holds the new backup key alone: it imports the
+    // moved segment, and can't open the old one.
+    let mut a2 = recovered(&mut dm.server, dm.a, &rotated);
+    let refused = error(&mut a2.core, import_command(&old["data"]));
+    assert_eq!(refusal(&refused), expect("not_found", "backup_key"));
+    assert_eq!(imported(&mut a2, &moved["data"]), 1);
+    assert_eq!(shown_ids(&mut a2, conversation), [hello]);
+    // A1, which keeps the old key, still opens the old segment.
+    assert_eq!(imported(&mut dm.a1, &old["data"]), 0);
+}

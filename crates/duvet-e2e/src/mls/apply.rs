@@ -235,6 +235,7 @@ pub(crate) fn apply(tx: &Tx<'_>, request: ApplyRequest) -> Result<ApplyReply, Er
         }
         let holding = at.group.is_some();
         let applied = handler(entry.kind).apply(tx, &mut at, entry)?;
+        crate::backup::followed(tx, at.id, holding, at.group.is_some(), entry.sent_at)?;
         // In the group, every entry counts, in order; out of it, only one that took effect.
         let counts = if holding {
             !matches!(applied, Applied::Ignored)

@@ -90,6 +90,13 @@ pub(crate) enum Command {
     Messages(messages::ListMessages),
     Search(messages::Search),
     WithoutDevices(messages::WithoutDevices),
+
+    // The encrypted backup.
+    BackupDue,
+    BackupSegment(crate::backup::SegmentDay),
+    BackupUploaded(crate::backup::Uploaded),
+    BackupImport(crate::backup::SegmentData),
+    BackupReencrypt(crate::backup::SegmentData),
 }
 
 pub(crate) fn parse(command: &str) -> Result<Command, Error> {
@@ -165,6 +172,12 @@ pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error
         Command::Messages(request) => reply(messages::messages(tx, request)?),
         Command::Search(request) => reply(messages::search(tx, request)?),
         Command::WithoutDevices(request) => reply(messages::without_devices(tx, request)?),
+
+        Command::BackupDue => reply(crate::backup::backup_due(tx)?),
+        Command::BackupSegment(request) => reply(crate::backup::backup_segment(tx, request)?),
+        Command::BackupUploaded(request) => reply(crate::backup::backup_uploaded(tx, request)?),
+        Command::BackupImport(request) => reply(crate::backup::backup_import(tx, request)?),
+        Command::BackupReencrypt(request) => reply(crate::backup::backup_reencrypt(tx, request)?),
     }
 }
 
