@@ -429,11 +429,21 @@ fn concurrent_epoch_zero_converges() {
     let taken = server.deliver(&mut b2);
     assert_eq!(results(&taken), [json!([2, "welcome", "applied", null])]);
 
-    // A1 takes the winner's welcome, which matches its record; A2, whose key package that refused
-    // welcome used up, rejoins by external commit. All four end in one group.
+    // A1 takes the winner's welcome, which matches its record. A2, whose key package that refused
+    // welcome used up, joins by external commit, its client passing the record there too: refused,
+    // as the record has B owning the group. Once its person has checked the members, its client
+    // stops passing the record, and A2 joins. All four end in one group.
     server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
-    let join = joining(&server, conversation);
-    server.commit(&mut a2, conversation, join).unwrap();
+    let mut join = joining(&server, conversation);
+    join["expected"] = json!({"owner": b, "members": [a, b]});
+    let refused = error(&mut a2.core, join);
+    assert_eq!(
+        (&refused["code"], &refused["rule"]),
+        (&json!("rule_violation"), &json!("member_list_mismatch"))
+    );
+    server
+        .commit(&mut a2, conversation, joining(&server, conversation))
+        .unwrap();
     server.deliver_all(&mut [&mut a1, &mut a2, &mut b1, &mut b2]);
     let state = same_group(&mut [&mut a1, &mut a2, &mut b1, &mut b2], conversation);
     assert_eq!(state["epoch"], 2);
