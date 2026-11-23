@@ -178,13 +178,7 @@ pub(crate) fn backup_segment(tx: &Tx<'_>, request: SegmentDay) -> Result<Built, 
         .optional()?
         .unwrap_or(0);
     let complete = complete(tx, conversation, day)?;
-    let plain = Zeroizing::new(to_cbor(&carried(tx, conversation, day)?)?);
-    if plain.len() > MAX_SEGMENT {
-        return Err(Error::TooLarge {
-            limit: MAX_SEGMENT as u64,
-        });
-    }
-    let deflated = Zeroizing::new(miniz_oxide::deflate::compress_to_vec(&plain, LEVEL));
+    let deflated = deflate(&carried(tx, conversation, day)?, MAX_SEGMENT)?;
     let key_id = recovery::key_id(&backup_key);
     let data = seal(
         tx,
@@ -261,9 +255,22 @@ pub(crate) fn backup_import(tx: &Tx<'_>, request: ImportSegment) -> Result<Impor
 
 /// A segment of the user's backup sealed anew with the current backup key, the same day and records
 /// in it: after a rotation, a device that kept the keys before it moves the backup to the new key,
-/// segment by segment, each segment saying which key it's under meanwhile.
+/// segment by segment, each segment saying which key it's under meanwhile. It reads what it moves as
+/// an import does: a segment an import refuses doesn't move, and a record outside the day is left
+/// out.
 pub(crate) fn backup_reencrypt(tx: &Tx<'_>, request: SegmentData) -> Result<Reencrypted, Error> {
     let opened = open(tx, &request.data)?;
+    let all = records_in(&opened.deflated, MAX_SEGMENT)?;
+    let count = all.len();
+    let records: Vec<Record> = all
+        .into_iter()
+        .filter(|record| opened.day.holds(record))
+        .collect();
+    let deflated = if records.len() == count {
+        opened.deflated
+    } else {
+        deflate(&records, MAX_SEGMENT)?
+    };
     let backup_key = current_key(tx)?.ok_or_else(|| not_found("backup_key"))?;
     let key_id = recovery::key_id(&backup_key);
     let wire = &opened.wire;
@@ -279,7 +286,7 @@ pub(crate) fn backup_reencrypt(tx: &Tx<'_>, request: SegmentData) -> Result<Reen
             complete: wire.complete,
             nonce: &[],
         },
-        &opened.deflated,
+        &deflated,
     )?;
     Ok(Reencrypted {
         data,
@@ -532,6 +539,19 @@ fn open(tx: &Tx<'_>, data: &[u8]) -> Result<Opened, Error> {
         day,
         deflated,
     })
+}
+
+/// The deflate of `records`' CBOR, which takes `limit` bytes at most: past it, `too_large`.
+fn deflate(records: &[Record], limit: usize) -> Result<Zeroizing<Vec<u8>>, Error> {
+    let plain = Zeroizing::new(to_cbor(&records)?);
+    if plain.len() > limit {
+        return Err(Error::TooLarge {
+            limit: limit as u64,
+        });
+    }
+    Ok(Zeroizing::new(miniz_oxide::deflate::compress_to_vec(
+        &plain, LEVEL,
+    )))
 }
 
 /// The records `deflated` holds, inflated to `limit` bytes at most: past it, `too_large`.

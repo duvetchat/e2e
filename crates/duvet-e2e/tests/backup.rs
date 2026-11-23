@@ -111,14 +111,20 @@ impl Segment {
     }
 
     /// The segment sealed anew with `backup_key`, holding `records`, its header as it is.
-    fn sealed(mut self, backup_key: &[u8; 32], records: &[Record]) -> Vec<u8> {
-        let plain = miniz_oxide::deflate::compress_to_vec(&cbor(&records.to_vec()), 6);
+    fn sealed(self, backup_key: &[u8; 32], records: &[Record]) -> Vec<u8> {
+        let plain = cbor(&records.to_vec());
+        self.sealed_plain(backup_key, &plain)
+    }
+
+    /// The segment sealed anew with `backup_key`, holding the deflate of `plain`, whatever it is.
+    fn sealed_plain(mut self, backup_key: &[u8; 32], plain: &[u8]) -> Vec<u8> {
+        let deflated = miniz_oxide::deflate::compress_to_vec(plain, 6);
         self.ct = self
             .cipher(backup_key)
             .encrypt(
                 Nonce::from_slice(&self.nonce),
                 Payload {
-                    msg: &plain,
+                    msg: &deflated,
                     aad: &self.header(),
                 },
             )
@@ -1146,6 +1152,39 @@ fn reencrypt_moves_old_segments_to_the_new_key() {
     assert_eq!(shown_ids(&mut a2, conversation), [hello]);
     // A1, which keeps the old key, still opens the old segment.
     assert_eq!(imported(&mut dm.a1, &old["data"]), 0);
+}
+
+#[test]
+fn reencrypt_moves_only_what_an_import_takes() {
+    let mut dm = dm();
+    let (conversation, day) = (dm.conversation, dm.day);
+    dm.at(day + HOUR);
+    say(&mut dm.server, &mut dm.a1, conversation, "hola");
+    dm.deliver();
+    dm.at(day + DAY_MS + HOUR);
+    let built = segment(&mut dm.a1, conversation, &utc_day(day));
+    let backup_key = backup_key_of(dm.a, &dm.identity);
+    let read = Segment::read(&bytes(&built["data"]));
+    let records = read.clone().open(&backup_key);
+    let reencrypt = |data: &Value| json!({"cmd": "backup_reencrypt", "data": data});
+
+    // A segment that holds something other than records moves no more than it imports.
+    let not_records = json!(b64(&read.clone().sealed_plain(&backup_key, b"no records")));
+    for command in [import_command(&not_records), reencrypt(&not_records)] {
+        let refused = error(&mut dm.a1.core, command);
+        assert_eq!(refusal(&refused), expect("decrypt_failed", "segment"));
+    }
+
+    // A record of another day moves without it, as an import leaves it out.
+    let mut stray = records[0].clone();
+    stray.id = new_id();
+    stray.sent += DAY_MS as u64;
+    let mixed = json!(b64(&read.sealed(&backup_key, &[records[0].clone(), stray])));
+    let moved = ok(&mut dm.a1.core, reencrypt(&mixed));
+    assert_eq!(
+        Segment::read(&bytes(&moved["data"])).open(&backup_key),
+        records
+    );
 }
 
 #[test]
