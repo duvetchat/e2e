@@ -204,6 +204,20 @@ CREATE TABLE deviceless_users (
     PRIMARY KEY (conversation_id, user_id)
 );
 
+-- The keys of the history packages other devices sent this one (shares and catch-ups), by package:
+-- whose they are, of which conversation, and the sending device's signature key, which must have
+-- signed the package.
+CREATE TABLE history_keys (
+    share_id BLOB PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('share', 'catch_up')),
+    conversation_id BLOB NOT NULL,
+    user_id BLOB NOT NULL,
+    device_id BLOB NOT NULL,
+    signature_key BLOB NOT NULL,
+    key BLOB NOT NULL,
+    received_at INTEGER NOT NULL
+);
+
 -- The backup's days: a row for each conversation and UTC day (YYYY-MM-DD) this device holds anything
 -- of, or the server holds a segment of as far as it knows. `dirty` while what the device holds of the
 -- day changed since the server last held the same; `version` counts the day's changes, so that

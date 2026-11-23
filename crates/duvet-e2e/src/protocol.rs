@@ -97,6 +97,11 @@ pub(crate) enum Command {
     BackupUploaded(crate::backup::Uploaded),
     BackupImport(crate::backup::SegmentData),
     BackupReencrypt(crate::backup::SegmentData),
+
+    // Shared history, and catching up members who had no device.
+    HistoryShare(crate::history::HistoryShare),
+    HistoryImport(crate::history::HistoryImport),
+    CatchUp(crate::history::CatchUp),
 }
 
 pub(crate) fn parse(command: &str) -> Result<Command, Error> {
@@ -178,6 +183,10 @@ pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error
         Command::BackupUploaded(request) => reply(crate::backup::backup_uploaded(tx, request)?),
         Command::BackupImport(request) => reply(crate::backup::backup_import(tx, request)?),
         Command::BackupReencrypt(request) => reply(crate::backup::backup_reencrypt(tx, request)?),
+
+        Command::HistoryShare(request) => reply(crate::history::history_share(tx, request)?),
+        Command::HistoryImport(request) => reply(crate::history::history_import(tx, request)?),
+        Command::CatchUp(request) => reply(crate::history::catch_up(tx, request)?),
     }
 }
 

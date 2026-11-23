@@ -189,10 +189,10 @@ fn decrypt(
 pub(crate) struct ReceiveDirect {
     #[serde(with = "b64")]
     message: Vec<u8>,
-    /// The sending device's certificate, for the types whose sender this device knows no other way.
-    /// An approval's transfer carries its sender's certificate itself: for it, this isn't read.
+    /// The sending device's certificate, for the types whose sender this device knows no other way:
+    /// a shared history's key and a catch-up's. An approval's or a rotation's transfer carries its
+    /// sender's certificate itself: for them, this isn't read.
     #[serde(default, with = "b64::option")]
-    #[allow(dead_code)]
     from_certificate: Option<Vec<u8>>,
     /// The identity the server serves for this device's own user now, which a rotation's transfer
     /// must bring.
@@ -210,6 +210,12 @@ pub(crate) enum Received {
     /// A rotation's transfer: this device has its user's new identity now.
     #[serde(rename = "rotation.transfer")]
     RotationTransfer(identity::Transferred),
+    /// The key of a member's share of a conversation's history, kept for `history_import`.
+    #[serde(rename = "history.key")]
+    HistoryKey(crate::history::KeyReceived),
+    /// The key of a catch-up, kept for `history_import`.
+    #[serde(rename = "catch_up.key")]
+    CatchUpKey(crate::history::KeyReceived),
 }
 
 /// A message from another device, taken by its type. A type this core doesn't read is
@@ -226,6 +232,18 @@ pub(crate) fn receive_direct(tx: &mut Tx<'_>, request: ReceiveDirect) -> Result<
             tx,
             &request.message,
             request.identity_key.as_deref(),
+        )?)),
+        crate::history::SHARE_KEY => Ok(Received::HistoryKey(crate::history::receive_key(
+            tx,
+            crate::history::ShareKind::Share,
+            &request.message,
+            request.from_certificate.as_deref(),
+        )?)),
+        crate::history::CATCH_UP_KEY => Ok(Received::CatchUpKey(crate::history::receive_key(
+            tx,
+            crate::history::ShareKind::CatchUp,
+            &request.message,
+            request.from_certificate.as_deref(),
         )?)),
         _ => Err(Error::BadCommand {
             message: "the message is of a type this core doesn't read",

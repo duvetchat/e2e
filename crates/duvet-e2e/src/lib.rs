@@ -7,6 +7,7 @@ mod backup;
 mod direct;
 mod envelope;
 mod error;
+pub mod history;
 mod identity;
 pub mod messages;
 pub mod mls;
