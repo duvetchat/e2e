@@ -71,11 +71,15 @@ struct Transfer {
     sender: Vec<u8>,
 }
 
-/// What `rotate_keys` answers: `create_identity`'s reply, and the devices that stay.
+/// What `rotate_keys` answers: `create_identity`'s reply, the backup keys from before sealed with
+/// the new one, for the server to keep beside the wrapped backup key (none when this device kept
+/// none, as it held no backup key), and the devices that stay.
 #[derive(Serialize)]
 pub(crate) struct Rotated {
     #[serde(flatten)]
     created: CreatedIdentity,
+    #[serde(with = "b64::option", skip_serializing_if = "Option::is_none")]
+    wrapped_previous_backup_keys: Option<Vec<u8>>,
     transfers: Vec<Handed>,
 }
 
@@ -191,6 +195,8 @@ pub(crate) fn rotate_keys(
     keep_earlier_identity(tx, own.user, &held)?;
     let (created, backup_key) = new_identity(tx, &own, staying)?;
     keep_previous(tx, own.user, &backup_key, &kept)?;
+    // What a device recovered with the new recovery key takes, to open the segments of those keys.
+    let wrapped_previous_backup_keys = meta_get(tx, PREVIOUS_BACKUP_KEYS)?;
     let before = Before {
         sender: &sender,
         list: &previous_list,
@@ -210,7 +216,11 @@ pub(crate) fn rotate_keys(
         true,
     )?;
     all_groups_due(tx)?;
-    Ok(Rotated { created, transfers })
+    Ok(Rotated {
+        created,
+        wrapped_previous_backup_keys,
+        transfers,
+    })
 }
 
 /// A device that stays but the rotating one, with its keys as its certificate has them.
@@ -591,11 +601,44 @@ fn previous_keys(tx: &Tx<'_>, user: Uuid, current: &[u8; 32]) -> Result<Zeroizin
     let Some(stored) = meta_get(tx, PREVIOUS_BACKUP_KEYS)? else {
         return Ok(Zeroizing::new(Vec::new()));
     };
-    let sealed: PreviousKeys = from_cbor(&stored)
-        .filter(|sealed: &PreviousKeys| sealed.v == 1 && sealed.nonce.len() == NONCE)
-        .ok_or_else(malformed)?;
+    let sealed = read_previous(&stored).ok_or_else(malformed)?;
+    unseal_previous(&sealed, user, current).ok_or_else(malformed)
+}
+
+/// The backup keys before `backup_key` that the server keeps for `user`, as `rotate_keys` handed
+/// them out (`wrapped_previous_backup_keys`), which a device recovered with the recovery key takes:
+/// 32 bytes each, oldest first. What isn't such a blob is `bad_command`; one that doesn't open with
+/// `backup_key` for `user` (another user's, or altered), `decrypt_failed` (`previous_backup_keys`).
+pub(super) fn opened_previous(
+    sealed: &[u8],
+    user: Uuid,
+    backup_key: &[u8; 32],
+) -> Result<Zeroizing<Vec<u8>>, Error> {
+    let sealed = read_previous(sealed).ok_or_else(|| {
+        invalid(
+            "wrapped_previous_backup_keys",
+            "the earlier backup keys are malformed",
+        )
+    })?;
+    unseal_previous(&sealed, user, backup_key).ok_or_else(|| Error::DecryptFailed {
+        kind: "previous_backup_keys".into(),
+    })
+}
+
+/// Backup keys from before, sealed: `{v: 1, nonce, ct}`.
+fn read_previous(bytes: &[u8]) -> Option<PreviousKeys> {
+    from_cbor(bytes).filter(|sealed: &PreviousKeys| sealed.v == 1 && sealed.nonce.len() == NONCE)
+}
+
+/// The keys `sealed` holds, opened with `backup_key` for `user`: 32 bytes each, oldest first.
+fn unseal_previous(
+    sealed: &PreviousKeys,
+    user: Uuid,
+    backup_key: &[u8; 32],
+) -> Option<Zeroizing<Vec<u8>>> {
     let keys = Zeroizing::new(
-        cipher(current)?
+        cipher(backup_key)
+            .ok()?
             .decrypt(
                 Nonce::from_slice(&sealed.nonce),
                 Payload {
@@ -603,17 +646,19 @@ fn previous_keys(tx: &Tx<'_>, user: Uuid, current: &[u8; 32]) -> Result<Zeroizin
                     aad: &associated(user),
                 },
             )
-            .map_err(|_| malformed())?,
+            .ok()?,
     );
-    if keys.len() % KEY != 0 {
-        return Err(malformed());
-    }
-    Ok(keys)
+    (keys.len() % KEY == 0).then_some(keys)
 }
 
 /// Keeps `keys`, the backup keys before `backup_key`, the current one, sealed with it; with none
 /// to keep, no row.
-fn keep_previous(tx: &Tx<'_>, user: Uuid, backup_key: &[u8], keys: &[u8]) -> Result<(), Error> {
+pub(super) fn keep_previous(
+    tx: &Tx<'_>,
+    user: Uuid,
+    backup_key: &[u8],
+    keys: &[u8],
+) -> Result<(), Error> {
     if keys.is_empty() {
         tx.conn()
             .execute("DELETE FROM meta WHERE key = ?1", [PREVIOUS_BACKUP_KEYS])?;
