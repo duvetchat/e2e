@@ -74,8 +74,35 @@ fn file(name: &str, content_type: &str) -> Value {
     })
 }
 
-/// `device` encrypts `envelope` under `nonce`, posts it with the users it mentions, and hears the
-/// API's answer (`sent`): the message's ID.
+/// `device` encrypts `envelope` under a new nonce and posts it with the users it mentions, but
+/// hasn't heard the API's answer yet: the nonce, and the message's ID and number.
+fn posted(
+    server: &mut FakeServer,
+    device: &mut TestDevice,
+    conversation: Uuid,
+    envelope: Value,
+    mentions: &[Uuid],
+) -> (String, Uuid, u64) {
+    let nonce = new_nonce();
+    let encrypted = ok(&mut device.core, encrypt(conversation, &nonce, envelope));
+    let ciphertext = bytes(&encrypted["ciphertext"]);
+    let (message_id, seq) = server.post_message(device, conversation, &nonce, ciphertext, mentions);
+    (nonce, message_id, seq)
+}
+
+/// The API's answer to the message sent under `nonce`.
+fn sent_command(conversation: Uuid, nonce: &str, message_id: Uuid, seq: u64) -> Value {
+    json!({
+        "cmd": "sent",
+        "conversation_id": conversation,
+        "nonce": nonce,
+        "message_id": message_id,
+        "seq": seq,
+    })
+}
+
+/// `device` encrypts `envelope`, posts it with the users it mentions, and hears the API's answer
+/// (`sent`): the message's ID.
 fn send(
     server: &mut FakeServer,
     device: &mut TestDevice,
@@ -83,21 +110,19 @@ fn send(
     envelope: Value,
     mentions: &[Uuid],
 ) -> Uuid {
-    let nonce = new_nonce();
-    let encrypted = ok(&mut device.core, encrypt(conversation, &nonce, envelope));
-    let ciphertext = bytes(&encrypted["ciphertext"]);
-    let (message_id, seq) = server.post_message(device, conversation, &nonce, ciphertext, mentions);
+    let (nonce, message_id, seq) = posted(server, device, conversation, envelope, mentions);
     ok(
         &mut device.core,
-        json!({
-            "cmd": "sent",
-            "conversation_id": conversation,
-            "nonce": nonce,
-            "message_id": message_id,
-            "seq": seq,
-        }),
+        sent_command(conversation, &nonce, message_id, seq),
     );
     message_id
+}
+
+/// The server labels the entry `seq` of `conversation`'s queue as the message `message_id`.
+fn label(server: &mut FakeServer, conversation: Uuid, seq: u64, message_id: Uuid) {
+    let queue = &mut server.chats.get_mut(&conversation).unwrap().queue;
+    let entry = &mut queue[usize::try_from(seq).unwrap() - 1];
+    entry.meta.insert("message_id".into(), json!(message_id));
 }
 
 /// `device` writes `text` to `conversation`: the message's ID.
@@ -441,6 +466,185 @@ fn nonce_retry_does_not_duplicate() {
     // Once its copy has come back, the nonce is spent.
     let spent = error(&mut a1.core, encrypt(conversation, "retry", envelope));
     assert_eq!(spent["code"], "exists");
+}
+
+#[test]
+fn the_id_of_another_message_is_refused() {
+    let (mut server, conversation, [a, _], [mut a1, mut b1]) = dm();
+    let theirs = say(&mut server, &mut a1, conversation, "el mensaje de A");
+    server.deliver(&mut b1);
+
+    // B1 sends a message. The server answers with the ID of A's, and labels the copy in its queue
+    // the same way: B1 refuses the answer, and the copy, its own, changes nothing.
+    let (nonce, _, seq) = posted(
+        &mut server,
+        &mut b1,
+        conversation,
+        json!({"text": "el de B"}),
+        &[],
+    );
+    label(&mut server, conversation, seq, theirs);
+    let refused = error(
+        &mut b1.core,
+        sent_command(conversation, &nonce, theirs, seq),
+    );
+    assert_eq!(
+        (&refused["code"], &refused["field"]),
+        (&json!("bad_command"), &json!("message_id"))
+    );
+    let taken = server.deliver(&mut b1);
+    assert_eq!(results(&taken), [json!([seq, "message", "own", null])]);
+
+    // Nor does a copy so labelled replace the ID an answer bound.
+    let (nonce, _, seq) = posted(
+        &mut server,
+        &mut b1,
+        conversation,
+        json!({"text": "otro de B"}),
+        &[],
+    );
+    let bound = new_id();
+    ok(&mut b1.core, sent_command(conversation, &nonce, bound, seq));
+    label(&mut server, conversation, seq, theirs);
+    let taken = server.deliver(&mut b1);
+    assert_eq!(results(&taken), [json!([seq, "message", "own", null])]);
+    assert_eq!(
+        message(&mut b1, conversation, bound).unwrap()["text"],
+        "otro de B"
+    );
+
+    // Nor is a message B deleted a deletion of the one the server gives its ID.
+    let gone = say(&mut server, &mut b1, conversation, "ya no está");
+    delete(&mut server, &mut b1, conversation, gone);
+    server.deliver(&mut b1);
+    let (nonce, _, seq) = posted(
+        &mut server,
+        &mut b1,
+        conversation,
+        json!({"text": "sigue aquí"}),
+        &[],
+    );
+    let refused = error(&mut b1.core, sent_command(conversation, &nonce, gone, seq));
+    assert_eq!(refused["field"], "message_id");
+    assert_eq!(messages_of(&mut b1, conversation)[0]["text"], "sigue aquí");
+
+    // A's message stays as it was, in the history and in the search; B1's first waits for its ID.
+    let kept = message(&mut b1, conversation, theirs).unwrap();
+    assert_eq!(
+        (&kept["user_id"], &kept["text"]),
+        (&json!(a), &json!("el mensaje de A"))
+    );
+    assert_eq!(found(&mut b1, json!({"text": "mensaje"})), [theirs]);
+    let shown = messages_of(&mut b1, conversation);
+    let first = shown
+        .iter()
+        .find(|shown| shown["text"] == "el de B")
+        .unwrap();
+    assert_eq!(
+        (&first["status"], &first["message_id"]),
+        (&json!("pending"), &Value::Null)
+    );
+}
+
+#[test]
+fn a_copy_an_import_brought_gives_way() {
+    // The API's answer before the queue's copy, then the other way around.
+    for echo_first in [false, true] {
+        let (mut server, conversation, [a, _], [mut a1, mut b1]) = dm();
+        let (nonce, id, seq) = posted(
+            &mut server,
+            &mut b1,
+            conversation,
+            json!({"text": "la copia llegó antes"}),
+            &[],
+        );
+
+        // Before the API's answer reaches B1, B1 imports A1's records, which hold its message.
+        server.deliver(&mut a1);
+        let records = a1
+            .core
+            .transaction(|tx| messages::records_for(tx, conversation, 0, i64::MAX))
+            .unwrap();
+        let imported = b1
+            .core
+            .transaction(|tx| messages::import(tx, conversation, &records, Some(a)))
+            .unwrap();
+        assert_eq!(imported, 1);
+        assert_eq!(messages_of(&mut b1, conversation).len(), 2);
+
+        // The copy gives way to B1's own message, which takes its ID.
+        let answer = sent_command(conversation, &nonce, id, seq);
+        if echo_first {
+            server.deliver(&mut b1);
+            ok(&mut b1.core, answer);
+        } else {
+            ok(&mut b1.core, answer);
+            server.deliver(&mut b1);
+        }
+        let shown = messages_of(&mut b1, conversation);
+        assert_eq!(shown.len(), 1, "echo first: {echo_first}");
+        assert_eq!(shown[0]["message_id"], json!(id));
+        assert_eq!(shown[0]["nonce"], json!(nonce));
+        assert_eq!(shown[0]["status"], "ok");
+        assert_eq!(shown[0]["shared_by"], Value::Null);
+    }
+}
+
+#[test]
+fn a_deletion_this_user_made_first_holds() {
+    // The API's answer before the queue's copy, then the other way around.
+    for echo_first in [false, true] {
+        let (mut server, conversation, _, [_, _, mut b1, mut b2]) = group_of_four();
+        let (nonce, id, seq) = posted(
+            &mut server,
+            &mut b1,
+            conversation,
+            json!({"text": "borrado desde el otro"}),
+            &[],
+        );
+
+        // B2 reads it and deletes it. The server hands B1 the deletion ahead of its message's copy:
+        // B1 doesn't know the message's ID yet, and keeps the deletion's mark.
+        server.deliver(&mut b2);
+        delete(&mut server, &mut b2, conversation, id);
+        let entries = server.entries(conversation);
+        let at = usize::try_from(seq).unwrap();
+        let mut deletion = entries[at].clone();
+        deletion["seq"] = json!(seq);
+        let mut copy = entries[at - 1].clone();
+        copy["seq"] = json!(seq + 1);
+
+        // The mark holds: B1's message, once it has the ID, is deleted.
+        if echo_first {
+            let taken = ok(&mut b1.core, apply(conversation, &[deletion, copy]));
+            assert_eq!(
+                results(&[taken]),
+                [
+                    json!([seq, "delete", "applied", null]),
+                    json!([seq + 1, "message", "own", null])
+                ]
+            );
+            // Its number as B1's queue gave it.
+            ok(
+                &mut b1.core,
+                sent_command(conversation, &nonce, id, seq + 1),
+            );
+        } else {
+            ok(&mut b1.core, apply(conversation, &[deletion]));
+            ok(&mut b1.core, sent_command(conversation, &nonce, id, seq));
+            let taken = ok(&mut b1.core, apply(conversation, &[copy]));
+            assert_eq!(
+                results(&[taken]),
+                [json!([seq + 1, "message", "own", null])]
+            );
+        }
+        assert_eq!(
+            messages_of(&mut b1, conversation),
+            Vec::<Value>::new(),
+            "echo first: {echo_first}"
+        );
+        assert_eq!(stored(&mut b1, id), (None, None));
+    }
 }
 
 #[test]

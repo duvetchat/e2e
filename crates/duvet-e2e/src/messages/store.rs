@@ -283,8 +283,9 @@ pub(crate) fn fill(tx: &Tx<'_>, id: i64, filled: Filled<'_>) -> Result<(), Error
 }
 
 /// This device's own message once the API has it: its ID and its number, and from the queue's copy
-/// the time the API took it and whom it mentions. A copy of it that an import brought first gives
-/// way, but a deletion of it this user made from another device holds.
+/// the time the API took it and whom it mentions. Another row with that ID gives way only when it
+/// stands for this same message (`takes_over`). Anything else, or another ID than the one bound
+/// already, leaves every row as it is: false.
 pub(crate) fn bind(
     tx: &Tx<'_>,
     row: &Row,
@@ -292,15 +293,22 @@ pub(crate) fn bind(
     seq: u64,
     sent_at: Option<i64>,
     mentions: &[Uuid],
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     let mut deleted = row.deleted;
-    if let Some(message_id) = message_id
-        && let Some(other) = by_message_id(tx, message_id)?
-        && other.id != row.id
-    {
-        deleted |= other.deleted && other.user == row.user;
-        tx.conn()
-            .execute("DELETE FROM messages WHERE id = ?1", [other.id])?;
+    if let Some(message_id) = message_id {
+        if row.message_id.is_some_and(|bound| bound != message_id) {
+            return Ok(false);
+        }
+        if let Some(other) = by_message_id(tx, message_id)?
+            && other.id != row.id
+        {
+            let Some(holds) = takes_over(row, &other) else {
+                return Ok(false);
+            };
+            deleted |= holds;
+            tx.conn()
+                .execute("DELETE FROM messages WHERE id = ?1", [other.id])?;
+        }
     }
     tx.conn().execute(
         "UPDATE messages SET message_id = COALESCE(?2, message_id), seq = ?3, \
@@ -313,12 +321,38 @@ pub(crate) fn bind(
         ],
     )?;
     if deleted {
-        return erase(tx, &by_id(tx, row.id)?);
+        erase(tx, &by_id(tx, row.id)?)?;
+        return Ok(true);
     }
     if !mentions.is_empty() {
         set_mentions(tx, row.id, mentions)?;
     }
-    deviceless::note(tx, row.conversation, row.id)
+    deviceless::note(tx, row.conversation, row.id)?;
+    Ok(true)
+}
+
+/// Whether `other`, which has the ID the API gave this device's message `row`, stands for that same
+/// message in its conversation, and if so whether it holds a deletion of it:
+/// - a deletion's mark, left by a deletion of a message this device didn't have: this user's holds,
+///   and another user's is none, as only the author deletes;
+/// - a copy an import brought before the API's answer came: this device's own message, with the
+///   same envelope, which gives way.
+///
+/// None for anything else, which the API's ID can't take over: another message, deleted or not.
+fn takes_over(row: &Row, other: &Row) -> Option<bool> {
+    if other.conversation != row.conversation {
+        return None;
+    }
+    if other.deleted {
+        let mark = other.seq.is_none() && other.nonce.is_none();
+        return mark.then_some(other.user == row.user);
+    }
+    let copy = other.status == Status::Ok
+        && other.nonce.is_none()
+        && (other.user, other.device) == (row.user, row.device)
+        && other.envelope.is_some()
+        && other.envelope == row.envelope;
+    copy.then_some(false)
 }
 
 /// The users a message mentions, as its sender listed them for the API: as many as a conversation

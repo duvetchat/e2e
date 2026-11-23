@@ -272,7 +272,9 @@ fn undecryptable(
 }
 
 /// This device's own message or edit, back from the queue: known by its ciphertext, which MLS
-/// wouldn't open for it. A message takes the ID, the number and the time the API gave it.
+/// wouldn't open for it. A message takes the ID, the number and the time the API gave it, unless
+/// that ID can't be its own (`store::bind`): then its rows stay as they are, and the copy is still
+/// its own.
 fn own_echo(tx: &Tx<'_>, conversation: Uuid, entry: &Entry) -> Result<Option<Applied>, Error> {
     let nonce: Option<String> = tx
         .conn()

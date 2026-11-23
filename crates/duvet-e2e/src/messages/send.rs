@@ -161,7 +161,7 @@ fn retry(
 }
 
 /// The API's answer to a message this device sent: its ID and its number, bound to its nonce. The
-/// same answer again changes nothing, and another is refused.
+/// same answer again changes nothing, and another is refused, as is the ID of another message.
 pub(crate) fn sent(tx: &Tx<'_>, request: Sent) -> Result<Empty, Error> {
     if i64::try_from(request.seq).is_err() {
         return Err(invalid("seq", "the message's number is out of range"));
@@ -170,7 +170,11 @@ pub(crate) fn sent(tx: &Tx<'_>, request: Sent) -> Result<Empty, Error> {
         .filter(|row| row.conversation == request.conversation_id)
         .ok_or_else(|| not_found("message"))?;
     match row.message_id {
-        None => store::bind(tx, &row, Some(request.message_id), request.seq, None, &[])?,
+        None => {
+            if !store::bind(tx, &row, Some(request.message_id), request.seq, None, &[])? {
+                return Err(invalid("message_id", "another message has this ID"));
+            }
+        }
         Some(bound) if bound != request.message_id => {
             return Err(invalid(
                 "message_id",
