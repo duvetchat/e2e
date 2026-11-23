@@ -1209,6 +1209,74 @@ fn deviceless_member_gets_catch_up_due() {
 }
 
 #[test]
+fn a_late_answer_keeps_what_was_noted() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1] = new_devices(&mut server, [a]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+
+    // A makes the group with B, who has no device yet, as A1's client knows.
+    let create = json!({
+        "cmd": "create_group",
+        "conversation_id": conversation,
+        "kind": "group",
+        "owner": a,
+        "members": [a, b],
+        "key_packages": server.claim(&[a]),
+        "external_sender": server.external_sender(),
+        "legacy": false,
+    });
+    server.commit(&mut a1, conversation, create).unwrap();
+    server.deliver(&mut a1);
+    ok(
+        &mut a1.core,
+        json!({"cmd": "without_devices", "conversation_id": conversation, "users": [b]}),
+    );
+
+    // A1 sends a message, and the API's answer is lost.
+    let (_, early, seq) = posted(
+        &mut server,
+        &mut a1,
+        conversation,
+        json!({"text": "antes de que llegues"}),
+        &[],
+    );
+
+    // B's first device enters after it in the queue. A1's client learns that B has a device, and
+    // says so before A1 takes its queue.
+    let mut b1 = server.device(b);
+    server.introduce(&mut b1);
+    server
+        .commit(&mut b1, conversation, joining(&server, conversation))
+        .unwrap();
+    server.introduce(&mut a1);
+    ok(
+        &mut a1.core,
+        json!({"cmd": "without_devices", "conversation_id": conversation, "users": []}),
+    );
+
+    // B's device can't read the message, which came before it: B is due a catch-up that has it.
+    let taken = server.deliver(&mut a1);
+    assert_eq!(
+        results(&taken),
+        [
+            json!([seq, "message", "own", null]),
+            json!([seq + 1, "commit", "applied", null])
+        ]
+    );
+    assert_eq!(taken[0]["catch_up_due"], json!([b]));
+    let noted: Vec<Uuid> = a1
+        .core
+        .transaction(|tx| messages::noted_records(tx, conversation, b))
+        .unwrap()
+        .iter()
+        .map(|record| record.id)
+        .collect();
+    assert_eq!(noted, [early]);
+}
+
+#[test]
 fn catch_up_is_for_the_identity_pinned_when_noted() {
     let (mut server, conversation, [_, b], [mut a1, b1]) = dm();
 

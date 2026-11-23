@@ -69,7 +69,7 @@ pub(crate) struct Changed {
 /// and in the outbox: a retry under the same nonce gets the same ciphertext, not encrypted again,
 /// which the API knows by the nonce. The nonce is spent once the message comes back from the queue.
 /// Before encrypting, what keeps this device from committing keeps it from sending
-/// (`ready_to_send`).
+/// (`ready_to_send`). The message is noted then for the members without a device (`deviceless`).
 pub(crate) fn encrypt(tx: &Tx<'_>, request: Encrypt) -> Result<Encrypted, Error> {
     let conversation = request.conversation_id;
     if request.nonce.is_empty() || request.nonce.chars().count() > MAX_NONCE {
@@ -101,7 +101,7 @@ pub(crate) fn encrypt(tx: &Tx<'_>, request: Encrypt) -> Result<Encrypted, Error>
         ));
     };
     let opened = Opened::new(plain, text, &attachments);
-    store::insert(
+    let id = store::insert(
         tx,
         NewRow {
             message_id: None,
@@ -117,6 +117,9 @@ pub(crate) fn encrypt(tx: &Tx<'_>, request: Encrypt) -> Result<Encrypted, Error>
             shared_by: None,
         },
     )?;
+    // Noted as it leaves, for whoever has no device now: by the API's answer, the client may have
+    // learned that one of theirs entered after it, which can't read it.
+    deviceless::note(tx, conversation, id)?;
     Ok(Encrypted {
         ciphertext: sealed.ciphertext,
         generation: sealed.generation,
