@@ -320,8 +320,51 @@ fn history_share_week() {
         assert_eq!(message["status"], "ok");
     }
 
-    // The same package again changes nothing.
-    assert_eq!(ok(&mut b1.core, import(&shared))["imported"], 0);
+    // Its key went with the import: the same package again is unknown.
+    let again = error(&mut b1.core, import(&shared));
+    assert_eq!(refusal(&again), json!(["not_found", "share"]));
+}
+
+/// How many package keys `device` keeps.
+fn keys_kept(device: &mut TestDevice) -> i64 {
+    device.rolled_back(|tx| {
+        Ok(tx
+            .conn()
+            .query_row("SELECT count(*) FROM history_keys", [], |row| row.get(0))?)
+    })
+}
+
+#[test]
+fn a_key_goes_once_its_package_is_imported_or_the_server_drops_it() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let (conversation, [mut a1, mut b1]) = group_of(&mut server, [a, b]);
+    let share_all = json!({
+        "cmd": "history_share",
+        "conversation_id": conversation,
+        "to_user": b,
+        "range": "all",
+        "devices": certificates(&server, b),
+    });
+    let from = certificate(&server, a, a1.id);
+
+    // B1 takes a key whose package it never imports. 31 days on, when another key comes, the
+    // server no longer keeps that package, and its key goes.
+    let old = ok(&mut a1.core, share_all.clone());
+    post_keys(&mut server, &old);
+    take_inbox(&mut server, &mut b1, &from);
+    assert_eq!(keys_kept(&mut b1), 1);
+    server.clock.advance(31 * DAY_MS);
+    let new = ok(&mut a1.core, share_all);
+    post_keys(&mut server, &new);
+    take_inbox(&mut server, &mut b1, &from);
+    assert_eq!(keys_kept(&mut b1), 1);
+    let gone = error(&mut b1.core, import(&old));
+    assert_eq!(refusal(&gone), json!(["not_found", "share"]));
+
+    // The other is used up by its import.
+    ok(&mut b1.core, import(&new));
+    assert_eq!(keys_kept(&mut b1), 0);
 }
 
 #[test]

@@ -674,6 +674,11 @@ pub(crate) fn receive_key(
         message,
     )?;
     let payload = read_key(&payload)?;
+    // A key whose package the server no longer keeps opens nothing any more.
+    tx.conn().execute(
+        "DELETE FROM history_keys WHERE received_at < ?1",
+        [tx.now().saturating_sub(PACKAGE_KEPT_MS)],
+    )?;
     let kept = StoredKey {
         kind,
         conversation: payload.conversation,
@@ -816,6 +821,12 @@ pub(crate) fn history_import(tx: &Tx<'_>, request: HistoryImport) -> Result<Impo
     let records = inflate_records(&body.records)?;
     drop(body);
     let imported = import(tx, stored.conversation, &records, Some(stored.user))?;
+    // The key is used up: kept, it would open the server's copy of the package again, a message
+    // deleted since included.
+    tx.conn().execute(
+        "DELETE FROM history_keys WHERE share_id = ?1",
+        [request.share_id.as_bytes().as_slice()],
+    )?;
     Ok(Imported { imported })
 }
 
