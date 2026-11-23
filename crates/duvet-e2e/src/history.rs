@@ -42,13 +42,17 @@ use crate::messages::{Empty, NOTED, Record, Scope, each_record, import_shared};
 use crate::mls::{GroupRow, ask_first};
 use crate::parts::{PACKAGE_PART, TAG, fits, open_part, seal_part};
 use crate::protocol::b64;
-use crate::{DirectMessage, Error, OwnDevice, Tx};
+use crate::{DirectMessage, Error, MAX_ENVELOPE, OwnDevice, Tx};
 
 /// The largest package, sealed: 64 MiB.
 pub const MAX_PACKAGE: usize = 64 * 1024 * 1024;
 
 /// The most a package's records take inflated: 256 MiB.
 pub const MAX_RECORDS: usize = 256 * 1024 * 1024;
+
+/// The most one record takes as CBOR: its envelope is a message's, at most `MAX_ENVELOPE`, and its
+/// other fields take about 200 bytes more.
+pub const MAX_RECORD: usize = MAX_ENVELOPE + 1024;
 
 /// The types of the direct messages that carry a package's key.
 pub(crate) const SHARE_KEY: &str = "history.key";
@@ -1013,10 +1017,12 @@ fn open_parts(key: &[u8; 32], share: Uuid, parts: Vec<Vec<u8>>) -> Result<Vec<u8
 }
 
 /// Imports the records `deflated` holds as shared by `sharer`, one at a time as they inflate: what
-/// this holds is one record, never the list. Once more than `MAX_RECORDS` bytes inflated, it's
-/// `too_large`, and nothing more is inflated; a stream that isn't DEFLATE, or what it inflates to
-/// that isn't one list of records and nothing after, is `decrypt_failed` (`history`). Either undoes
-/// what was imported, with the rest of the command. How many records changed something.
+/// this holds is one record, never the list, and a record is read through `MAX_RECORD`, so one
+/// longer than a message's can be is `too_large` before it's held whole. Once more than
+/// `MAX_RECORDS` bytes inflated, it's `too_large` too, and nothing more is inflated; a stream that
+/// isn't DEFLATE, or what it inflates to that isn't one list of records and nothing after, is
+/// `decrypt_failed` (`history`). Each undoes what was imported, with the rest of the command. How
+/// many records changed something.
 fn import_records(
     tx: &Tx<'_>,
     conversation: Uuid,
@@ -1043,8 +1049,18 @@ fn import_records(
     let count = array_len(&mut inflater).map_err(|_| refused(&inflater))?;
     let mut imported = 0;
     for _ in 0..count {
-        let record: Record =
-            ciborium::from_reader(&mut inflater).map_err(|_| refused(&inflater))?;
+        let mut capped = (&mut inflater).take(MAX_RECORD as u64);
+        let read: Result<Record, _> = ciborium::from_reader(&mut capped);
+        let cut = capped.limit() == 0;
+        let record = read.map_err(|_| {
+            if cut && !inflater.over {
+                Error::TooLarge {
+                    limit: MAX_RECORD as u64,
+                }
+            } else {
+                refused(&inflater)
+            }
+        })?;
         imported += usize::from(import_shared(tx, conversation, &record, sharer)?);
     }
     if !inflater.finished() {

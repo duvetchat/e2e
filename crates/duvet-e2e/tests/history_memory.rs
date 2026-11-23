@@ -3,12 +3,14 @@
 //! while one measures. SQLite's own allocations go through its allocator, not this one; SQLite
 //! counts them itself, and the tests read that count too.
 
+mod bombs;
 mod support;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
+use bombs::{bomb, record_head};
 use duvet_e2e::Envelope;
 use duvet_e2e::history::{self, Header, ShareKind};
 use duvet_e2e::messages::{Record, RecordKind};
@@ -121,6 +123,46 @@ fn certificate(server: &FakeServer, user: Uuid, device: Uuid) -> String {
     b64(&found)
 }
 
+/// A1's package of `deflated` records for B, whose key B1 takes: the command that imports it.
+fn import_of(
+    server: &FakeServer,
+    a1: &mut TestDevice,
+    b1: &mut TestDevice,
+    conversation: Uuid,
+    deflated: &[u8],
+) -> String {
+    let (a, b) = (a1.user, b1.user);
+    let devices = certificates(server, b);
+    let sealed = a1
+        .core
+        .transaction(|tx| {
+            let own = tx.own_device()?;
+            let header = Header {
+                kind: ShareKind::Share,
+                conversation,
+                user: a,
+                device: own.device,
+                to: b,
+            };
+            let package = history::package(&own.signer, &header, deflated)?;
+            history::seal(tx, ShareKind::Share, conversation, b, &package, &devices)
+        })
+        .unwrap();
+    let shared = serde_json::to_value(&sealed).unwrap();
+    let key = json!({
+        "cmd": "receive_direct",
+        "message": shared["keys"][0]["message"],
+        "from_certificate": certificate(server, a, a1.id),
+    });
+    ok(&mut b1.core, key);
+    json!({
+        "cmd": "history_import",
+        "share_id": shared["share_id"],
+        "parts": shared["parts"],
+    })
+    .to_string()
+}
+
 /// `count` messages of A1's of 4 KiB each, sent a millisecond apart: what deflates to little.
 fn messages_of_a(a: Uuid, a1: &TestDevice, count: u64) -> Vec<Record> {
     let envelope = Envelope::Message {
@@ -159,42 +201,49 @@ fn an_import_holds_one_record_at_a_time() {
     ciborium::into_writer(&records, &mut cbor).unwrap();
     let deflated = miniz_oxide::deflate::compress_to_vec(&cbor, 1);
     drop((records, cbor));
-    let devices = certificates(&server, b);
-    let sealed = a1
-        .core
-        .transaction(|tx| {
-            let own = tx.own_device()?;
-            let header = Header {
-                kind: ShareKind::Share,
-                conversation,
-                user: a,
-                device: own.device,
-                to: b,
-            };
-            let package = history::package(&own.signer, &header, &deflated)?;
-            history::seal(tx, ShareKind::Share, conversation, b, &package, &devices)
-        })
-        .unwrap();
-    let shared = serde_json::to_value(&sealed).unwrap();
-    let from = certificate(&server, a, a1.id);
-    let key = json!({
-        "cmd": "receive_direct",
-        "message": shared["keys"][0]["message"],
-        "from_certificate": from,
-    });
-    ok(&mut b1.core, key);
-    let command = json!({
-        "cmd": "history_import",
-        "share_id": shared["share_id"],
-        "parts": shared["parts"],
-    })
-    .to_string();
+    let command = import_of(&server, &mut a1, &mut b1, conversation, &deflated);
 
     // The import reads them one at a time: it never holds them all.
     let (reply, peak, _) = peak_during(|| b1.core.handle(&command));
     let reply: Value = serde_json::from_str(&reply).unwrap();
     assert_eq!(reply["ok"]["imported"], 6144, "{reply}");
     assert!(peak < 8 * MIB, "the import held {} MiB at once", peak / MIB);
+}
+
+#[test]
+fn an_import_refuses_a_record_bigger_than_a_message() {
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let (conversation, mut a1, mut b1) = group(&mut server, a, b);
+
+    // A1 signs a package of under 2 MiB whose one record inflates to 255 MiB: an envelope no
+    // message could have, though the whole stays under the cap on what a package inflates to.
+    let record = Record {
+        kind: RecordKind::Message,
+        id: new_id(),
+        seq: 100,
+        user: a,
+        device: a1.id,
+        sent: 1_000,
+        envelope: Vec::new(),
+        shared_by: None,
+        reply_to: None,
+    };
+    let zeros = 255 * MIB as u64;
+    let head = record_head(&record, zeros);
+    let deflated = bomb([(&[0x81][..], 0), (head.as_slice(), zeros)]);
+    assert!(deflated.len() < 2 * MIB, "{} bytes", deflated.len());
+    let command = import_of(&server, &mut a1, &mut b1, conversation, &deflated);
+
+    // B1 refuses the record once it passes what a record can be, holding little of it.
+    let (reply, peak, _) = peak_during(|| b1.core.handle(&command));
+    assert!(peak < 8 * MIB, "the import held {} MiB at once", peak / MIB);
+    let reply: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(reply["error"]["code"], "too_large", "{reply}");
+    assert_eq!(reply["error"]["limit"], history::MAX_RECORD);
 }
 
 #[test]

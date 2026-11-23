@@ -5,12 +5,14 @@
 //! the channel between devices; the recipient takes the key (`receive_direct`), then the package
 //! (`history_import`), whose messages show as shared by the sender.
 
+mod bombs;
 mod support;
 
+use bombs::{bomb, record_head};
 use duvet_e2e::history::{self, Header, MAX_PACKAGE, MAX_RECORDS, Range, ShareKind};
 use duvet_e2e::messages::{Record, RecordKind};
 use duvet_e2e::parts::{open_part, seal_part};
-use duvet_e2e::{Clock, DirectMessage, Envelope};
+use duvet_e2e::{Clock, DirectMessage, Envelope, MAX_ENVELOPE};
 use duvet_e2e_rules::{DeviceCertificate, Kind};
 use openmls::prelude::SignatureScheme;
 use openmls_basic_credential::SignatureKeyPair;
@@ -639,10 +641,11 @@ fn share_rejects_a_bad_signature_or_a_stranger() {
 
 #[test]
 fn decompression_bomb_is_too_large() {
-    // The bomb is a DEFLATE stream made by hand: a check that it inflates as meant.
+    // The bombs are DEFLATE streams made by hand: a check that one inflates as meant.
+    let parts = [(b"xy".as_slice(), 600), (b"z", 3), (b"w", 0)];
     assert_eq!(
-        miniz_oxide::inflate::decompress_to_vec(&bomb(b"xy", 600)).unwrap(),
-        [b"xy".as_slice(), &[0; 600]].concat()
+        miniz_oxide::inflate::decompress_to_vec(&bomb(parts)).unwrap(),
+        [b"xy".as_slice(), &[0; 600], b"z", &[0; 3], b"w"].concat()
     );
 
     let mut server = FakeServer::new();
@@ -650,14 +653,26 @@ fn decompression_bomb_is_too_large() {
     let (conversation, [mut a1, mut b1]) = group_of(&mut server, [a, b]);
     let devices = certificate_bytes(&server, b);
 
-    // A1 signs a package whose records inflate to 300 MiB: one record whose envelope is a byte
-    // string of that length, which a CBOR reader would read whole.
-    let zeros: u64 = 300 * 1024 * 1024;
-    let mut prefix = vec![0x81, 0xA1, 0x68];
-    prefix.extend_from_slice(b"envelope");
-    prefix.push(0x5B);
-    prefix.extend_from_slice(&zeros.to_be_bytes());
-    let records = bomb(&prefix, zeros);
+    // A1 signs a package whose records inflate past 256 MiB: 8300 records, each with an envelope
+    // of 32 KiB of zeros, as big as a message's can be.
+    let record = Record {
+        kind: RecordKind::Message,
+        id: new_id(),
+        seq: 1,
+        user: a,
+        device: a1.id,
+        sent: 1,
+        envelope: Vec::new(),
+        shared_by: None,
+        reply_to: None,
+    };
+    let envelope = MAX_ENVELOPE as u64;
+    let head = record_head(&record, envelope);
+    let count: u64 = 8300;
+    let mut list = vec![0x9B]; // an array, its length in 8 bytes
+    list.extend(count.to_be_bytes());
+    let each = std::iter::repeat_n((head.as_slice(), envelope), count as usize);
+    let records = bomb(std::iter::once((list.as_slice(), 0)).chain(each));
     assert!(records.len() < MAX_PACKAGE / 16, "{} bytes", records.len());
     let sealed = a1
         .core
@@ -1652,73 +1667,4 @@ fn cbor(value: &impl serde::Serialize) -> Vec<u8> {
     let mut out = Vec::new();
     ciborium::into_writer(value, &mut out).unwrap();
     out
-}
-
-/// A raw DEFLATE stream that inflates to `prefix`, then `zeros` zero bytes, in about 13 bits for
-/// each 258 of them: one block of fixed Huffman codes, the zeros after the first as copies of the
-/// byte before (length 258, distance 1).
-fn bomb(prefix: &[u8], zeros: u64) -> Vec<u8> {
-    let mut bits = Bits::default();
-    bits.put(1, 1); // the last block,
-    bits.put(1, 2); // of fixed codes
-    for &byte in prefix {
-        bits.literal(byte);
-    }
-    bits.literal(0);
-    let mut left = zeros - 1;
-    // Length 258 is code 285, 8 bits (11000101); distance 1 is code 0, 5 bits.
-    let copy = reversed(0b1100_0101, 8);
-    while left >= 258 {
-        bits.put(copy, 13);
-        left -= 258;
-    }
-    for _ in 0..left {
-        bits.literal(0);
-    }
-    bits.put(0, 7); // the end of the block: code 256, seven zero bits
-    bits.finish()
-}
-
-/// Bits as DEFLATE packs them: from each byte's least significant bit on, but Huffman codes from
-/// their most significant bit.
-#[derive(Default)]
-struct Bits {
-    out: Vec<u8>,
-    acc: u64,
-    len: u32,
-}
-
-impl Bits {
-    fn put(&mut self, value: u64, count: u32) {
-        self.acc |= value << self.len;
-        self.len += count;
-        while self.len >= 8 {
-            self.out.push(self.acc as u8);
-            self.acc >>= 8;
-            self.len -= 8;
-        }
-    }
-
-    /// A literal byte in fixed codes: 0 to 143 in 8 bits from 00110000, 144 to 255 in 9 bits
-    /// from 110010000.
-    fn literal(&mut self, byte: u8) {
-        let byte = u64::from(byte);
-        if byte <= 143 {
-            self.put(reversed(0b0011_0000 + byte, 8), 8);
-        } else {
-            self.put(reversed(0b1_1001_0000 + byte - 144, 9), 9);
-        }
-    }
-
-    fn finish(mut self) -> Vec<u8> {
-        if self.len > 0 {
-            self.out.push(self.acc as u8);
-        }
-        self.out
-    }
-}
-
-/// A Huffman code of `count` bits, its bits in the order DEFLATE packs them.
-fn reversed(code: u64, count: u32) -> u64 {
-    (0..count).fold(0, |out, bit| out | ((code >> bit) & 1) << (count - 1 - bit))
 }
