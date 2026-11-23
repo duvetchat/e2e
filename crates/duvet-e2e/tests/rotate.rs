@@ -860,6 +860,13 @@ fn devices_that_stay_take_the_new_identity() {
     assert_eq!(key(&taken["identity_key"]), new_key);
     assert_eq!(identity_key(&mut a3.core), new_key);
 
+    // Its backup key is the new one, and it keeps the backup keys from before as A1 does.
+    let (new_backup, _) = opened(a, &rotated);
+    assert_eq!(meta(&mut a3.core, "backup_key"), new_backup);
+    let earlier = previous_keys(&mut a1.core);
+    assert!(!earlier.is_empty());
+    assert_eq!(previous_keys(&mut a3.core), earlier);
+
     // Its groups are due at once, for leaves the new identity certifies.
     assert_eq!(due(&mut a3), BTreeSet::from([group]));
     server.deliver(&mut a1);
@@ -1073,6 +1080,31 @@ fn send(device: &mut TestDevice, conversation: Uuid, text: &[u8]) -> Vec<u8> {
         .unwrap()
 }
 
+/// What a client without the rules would do with `commit` in its group of `conversation`: process
+/// and merge it with OpenMLS alone.
+fn merge_unchecked(device: &mut TestDevice, conversation: Uuid, commit: &[u8]) {
+    device
+        .core
+        .transaction(|tx| {
+            let (mut group, _) = mls::load_group(tx, conversation)?;
+            let message = MlsMessageIn::tls_deserialize_exact_bytes(commit)
+                .unwrap()
+                .try_into_protocol_message()
+                .unwrap();
+            let processed = group
+                .process_message(tx.provider(), message)
+                .map_err(|error| Error::Internal(error.to_string()))?;
+            let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content()
+            else {
+                panic!("not a commit");
+            };
+            group
+                .merge_staged_commit(tx.provider(), *staged)
+                .map_err(|error| Error::Internal(error.to_string()))
+        })
+        .unwrap();
+}
+
 /// What an application message says, as `device` decrypts it in its group of `conversation`, when
 /// it can.
 fn read(device: &mut TestDevice, conversation: Uuid, message: &[u8]) -> Result<Vec<u8>, Error> {
@@ -1122,7 +1154,13 @@ fn a_lost_device_leaves_the_groups_without_the_server() {
     );
     assert_eq!(ok(&mut a1.core, server.observed(a))["state"], "same");
     let wait = ready(&mut a1, group).unwrap_err();
-    assert_eq!(wait["code"], "pending_proposals");
+    assert_eq!(
+        (&wait["code"], &wait["message"]),
+        (
+            &json!("pending_proposals"),
+            &json!("removals are pending: commit them first with commit_pending")
+        )
+    );
     server
         .commit(&mut a1, group, command("commit_pending", group))
         .unwrap();
@@ -1132,7 +1170,18 @@ fn a_lost_device_leaves_the_groups_without_the_server() {
     // What A1 sends next, A2 can't read. B's devices take the commit, once they observe A anew, and
     // read it.
     let next = send(&mut a1, group, b"after the change");
-    assert!(read(&mut a2, group, &next).is_err());
+    let removal = server.chats[&group]
+        .queue
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == "commit")
+        .unwrap()
+        .data
+        .clone();
+    merge_unchecked(&mut a2, group, &removal);
+    assert!(
+        matches!(read(&mut a2, group, &next), Err(Error::NotFound { what }) if what == "membership")
+    );
     for device in [&mut b1, &mut b2] {
         let (observed, reply) = take_queue(&server, device, group);
         assert_eq!(observed, [json!("changed")]);

@@ -26,7 +26,7 @@ pub enum Error {
     Gap { from: u64 },
     #[error("a commit waits for commit_result")]
     PendingCommit,
-    #[error("removals are proposed: commit them first with commit_pending")]
+    #[error("removals are pending: commit them first with commit_pending")]
     PendingProposals,
     #[error("the identities of these users are missing: call observe_user")]
     NeedsIdentities { users: Vec<String> },

@@ -136,9 +136,12 @@ pub(crate) fn reset_identity(tx: &mut Tx<'_>) -> Result<CreatedIdentity, Error> 
 
 /// Changes the keys once devices are lost: a new identity, whose list has the devices that stay
 /// (all but `remove`, this one among them), and a new backup key, which keeps those from before for
-/// the backup's segments. What the lost devices hold opens nothing made from now on: no device of
-/// the user that holds the new list sends in a group while a lost device's leaf is in it, and its
-/// next commit there takes that leaf out (`ready_to_send`, `commit_pending`).
+/// the backup's segments. What the lost devices hold opens nothing made from now on in the groups
+/// the user's remaining devices share with them: no device of the user that holds the new list
+/// sends in such a group while a lost device's leaf is in it, and its next commit there takes that
+/// leaf out (`ready_to_send`, `commit_pending`). In a group where a lost device is its user's only
+/// one, other users' devices take out only devices of their own users: its removal waits for the
+/// server's proposal there.
 ///
 /// Each device that stays but this one is certified anew, for its own keys as its certificate
 /// among `certificates` has them (the user's devices' certificates as the server serves them,
