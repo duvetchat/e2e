@@ -1231,6 +1231,42 @@ fn reencrypt_moves_only_what_an_import_takes() {
 }
 
 #[test]
+fn reencrypt_leaves_out_what_was_deleted() {
+    let mut dm = dm();
+    let (conversation, day) = (dm.conversation, dm.day);
+    // On the day B1 writes and edits a message, then writes another; A1 builds the day the next day.
+    dm.at(day + HOUR);
+    let gone = say(&mut dm.server, &mut dm.b1, conversation, "se borrará");
+    dm.at(day + 2 * HOUR);
+    edit(&mut dm.server, &mut dm.b1, conversation, gone, "editado");
+    dm.at(day + 3 * HOUR);
+    let stays = say(&mut dm.server, &mut dm.b1, conversation, "se queda");
+    dm.deliver();
+    dm.at(day + DAY_MS + HOUR);
+    let before = segment(&mut dm.a1, conversation, &utc_day(day));
+    let backup_key = backup_key_of(dm.a, &dm.identity);
+    let reencrypt = |deleted: &[Uuid]| json!({"cmd": "backup_reencrypt", "data": before["data"], "deleted": deleted});
+    let held = |moved: &Value| -> Vec<Uuid> {
+        Segment::read(&bytes(&moved["data"]))
+            .open(&backup_key)
+            .iter()
+            .map(|record| record.id)
+            .collect()
+    };
+
+    // B1 deletes it. A1, which holds it deleted, moves the copy from before without the message or
+    // its edit.
+    delete(&mut dm.server, &mut dm.b1, conversation, gone);
+    dm.deliver();
+    assert_eq!(held(&ok(&mut dm.a1.core, reencrypt(&[]))), [stays]);
+
+    // A device recovered after the deletion knows of it from the IDs the API saw deleted alone.
+    let mut a2 = recovered(&mut dm.server, dm.a, &dm.identity);
+    assert_eq!(held(&ok(&mut a2.core, reencrypt(&[gone]))), [stays]);
+    assert_eq!(held(&ok(&mut a2.core, reencrypt(&[]))), [gone, gone, stays]);
+}
+
+#[test]
 fn an_import_leaves_out_records_of_other_days() {
     let mut dm = dm();
     let (conversation, day) = (dm.conversation, dm.day);

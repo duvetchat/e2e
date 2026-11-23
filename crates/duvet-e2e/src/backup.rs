@@ -63,14 +63,9 @@ pub(crate) struct Uploaded {
 pub(crate) struct SegmentData {
     #[serde(with = "b64")]
     data: Vec<u8>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ImportSegment {
-    #[serde(with = "b64")]
-    data: Vec<u8>,
     /// The IDs of the conversation's messages the API saw deleted (a deletion entry carries its
-    /// message's in the clear): a copy from before a deletion brings none of them back.
+    /// message's in the clear): a copy from before a deletion brings none of them back, nor moves
+    /// them to the current key.
     #[serde(default)]
     deleted: Vec<Uuid>,
 }
@@ -227,7 +222,7 @@ pub(crate) fn backup_uploaded(tx: &Tx<'_>, request: Uploaded) -> Result<Empty, E
 /// holds deleted stays deleted, as does one the API saw deleted (`deleted`). How many records
 /// changed something. The segment counts as the server's copy of the day: the day isn't due when
 /// this device holds the same as it, and is when it holds more or other than it.
-pub(crate) fn backup_import(tx: &Tx<'_>, request: ImportSegment) -> Result<Imported, Error> {
+pub(crate) fn backup_import(tx: &Tx<'_>, request: SegmentData) -> Result<Imported, Error> {
     let opened = open(tx, &request.data)?;
     let conversation = opened.wire.conversation;
     let all = records_in(&opened.deflated, MAX_SEGMENT)?;
@@ -257,16 +252,24 @@ pub(crate) fn backup_import(tx: &Tx<'_>, request: ImportSegment) -> Result<Impor
 /// A segment of the user's backup sealed anew with the current backup key, the same day and records
 /// in it: after a rotation, a device that kept the keys before it moves the backup to the new key,
 /// segment by segment, each segment saying which key it's under meanwhile. It reads what it moves as
-/// an import does: a segment an import refuses doesn't move, and a record outside the day is left
-/// out.
+/// an import does: a segment an import refuses doesn't move, and what an import doesn't bring in is
+/// left out: a record outside the day, and a message the API saw deleted (`deleted`) or this device
+/// holds deleted by its author, with its edits.
 pub(crate) fn backup_reencrypt(tx: &Tx<'_>, request: SegmentData) -> Result<Reencrypted, Error> {
     let opened = open(tx, &request.data)?;
+    let conversation = opened.wire.conversation;
     let all = records_in(&opened.deflated, MAX_SEGMENT)?;
     let count = all.len();
-    let records: Vec<Record> = all
-        .into_iter()
-        .filter(|record| opened.day.holds(record))
-        .collect();
+    let deleted: HashSet<Uuid> = request.deleted.into_iter().collect();
+    let mut records = Vec::with_capacity(count);
+    for record in all {
+        if opened.day.holds(&record)
+            && !deleted.contains(&record.id)
+            && !deleted_here(tx, conversation, &record)?
+        {
+            records.push(record);
+        }
+    }
     let deflated = if records.len() == count {
         opened.deflated
     } else {
@@ -394,6 +397,25 @@ fn complete(tx: &Tx<'_>, conversation: Uuid, day: Day) -> Result<bool, Error> {
 fn carried(tx: &Tx<'_>, conversation: Uuid, day: Day) -> Result<Vec<Record>, Error> {
     let (start, end) = day.bounds();
     messages::records_for(tx, conversation, start, end)
+}
+
+/// Whether this device holds the message `record` is of (or edits) deleted by the record's author,
+/// which an import never brings back.
+fn deleted_here(tx: &Tx<'_>, conversation: Uuid, record: &Record) -> Result<bool, Error> {
+    Ok(tx
+        .conn()
+        .prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM messages WHERE message_id = ?1 \
+             AND conversation_id = ?2 AND deleted = 1 AND user_id = ?3)",
+        )?
+        .query_row(
+            params![
+                record.id.as_bytes().as_slice(),
+                conversation.as_bytes().as_slice(),
+                record.user.as_bytes().as_slice()
+            ],
+            |row| row.get(0),
+        )?)
 }
 
 /// Whether this device carries anything of `conversation`'s `day`, without reading it: what
