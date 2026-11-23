@@ -19,6 +19,7 @@ use duvet_e2e_rules::{
     CommitAad, Committer, DeviceCertificate, Entry, Kind, LeaveStatement, Leaves,
     MEMBER_LIST_EXTENSION, MemberList, MembershipChange, Place, RuleContext, RuleViolation, SUITE,
     certified, check_change, extract_change, group_id, leaves, signed_for, statement_user,
+    unlisted_candidates,
 };
 use openmls::prelude::tls_codec::{DeserializeBytes as _, Serialize as _};
 use openmls::prelude::{
@@ -31,7 +32,7 @@ use serde_bytes::ByteBuf;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::identity::{from_cbor, not_found, to_cbor};
+use crate::identity::{from_cbor, not_found, renewed_at, to_cbor};
 use crate::protocol::b64;
 use crate::{Error, OwnDevice, SqlStorageError, Tx};
 
@@ -263,15 +264,53 @@ pub fn load_group(tx: &Tx<'_>, conversation: Uuid) -> Result<(MlsGroup, GroupRow
 /// encrypts. What stops it from committing stops it from sending: its own commit waiting for
 /// `commit_result` or the queue (`pending_commit`), a blocked group (`rule_violation`,
 /// `group_blocked`), and its own removal proposed (`not_found`, `membership`). Beyond those, a
-/// removal the server proposed waits for its commit first, `pending_proposals`: then
-/// `commit_pending` makes it, so no message reaches a device on its way out.
+/// removal the server proposed waits for its commit first, `pending_proposals`, and so does a leaf
+/// of this device's own user whose device is off the user's latest list, whose removal the server
+/// may never propose: then `commit_pending` makes them, so no message reaches a device on its way
+/// out.
 pub fn ready_to_send(tx: &Tx<'_>, conversation: Uuid) -> Result<(), Error> {
     let (group, row) = load_group(tx, conversation)?;
     can_commit(&group, &row)?;
     if group.has_pending_proposals() {
         return Err(Error::PendingProposals);
     }
+    if !unlisted_own_leaves(tx, &group)?.is_empty() {
+        ask_about_own_list(tx)?;
+        return Err(Error::PendingProposals);
+    }
     Ok(())
+}
+
+/// The ask's key before this device takes out a device of its own user: one for every group, as
+/// what it checks, the own list, is the same everywhere.
+const OWN_LIST_ASK: &[u8] = b"own devices off the list";
+
+/// Before this device takes out a leaf of its own user whose device is off the user's list as it
+/// holds it: `needs_identities` for the own user, once per state of that list, as a device of the
+/// user may have been set up since this device last saw it. `Ok` once the client observed its own
+/// user at what this device knows of the list now.
+fn ask_about_own_list(tx: &Tx<'_>) -> Result<(), Error> {
+    let user = tx.own_user()?.ok_or_else(|| not_found("device"))?;
+    ask_first(tx, OWN_LIST_ASK, BTreeSet::from([user]))
+}
+
+/// The leaves in `group` of this device's own user whose devices are off the user's latest list
+/// as this device holds it (removed from it, or left out of a rotation), this device's own aside.
+fn unlisted_own_leaves(tx: &Tx<'_>, group: &MlsGroup) -> Result<Vec<LeafNodeIndex>, Error> {
+    let (Some(user), own) = (tx.own_user()?, group.own_leaf_index()) else {
+        return Ok(Vec::new());
+    };
+    let Some(list) = tx.device_list_of(user)? else {
+        return Ok(Vec::new());
+    };
+    Ok(leaves(group.members())
+        .map_err(|_| stored_state())?
+        .into_iter()
+        .filter(|(index, leaf)| {
+            *index != own.u32() && leaf.user == user && !list.contains(leaf.device)
+        })
+        .map(|(index, _)| LeafNodeIndex::new(index))
+        .collect())
 }
 
 /// Whether this device can commit in its group now: not while its own commit waits for
@@ -300,13 +339,14 @@ pub(crate) fn can_commit(group: &MlsGroup, row: &GroupRow) -> Result<(), Error> 
 }
 
 /// The row once this device's own commit is merged: the members and epoch its group has now, no
-/// statement left to carry, and its leaf new, as every commit of this device's renews it.
+/// statement left to carry, and its leaf new, as every commit of this device's renews it (but one
+/// made before the identity changed, whose leaf is due at once: `renewed_at`).
 pub(crate) fn own_merged(tx: &Tx<'_>, row: &mut GroupRow, group: &MlsGroup) -> Result<(), Error> {
     row.members = MemberList::from_group_context(group.public_group().group_context())
         .map_err(|_| stored_state())?;
     row.epoch = group.epoch().as_u64();
     row.statements.clear();
-    row.leaf_updated_at = tx.now();
+    row.leaf_updated_at = renewed_at(tx, group)?;
     Ok(())
 }
 
@@ -361,8 +401,9 @@ pub(crate) fn rule_context(
     }
 }
 
-/// The users whose identities and lists the rules read for `change`: those of the leaves it brings
-/// and of its members' leave statements, and at epoch 0 those of every leaf it starts from.
+/// The users whose identities and lists the rules read for `change`: those of the leaves it brings,
+/// of its members' leave statements and of the leaves a member removes from users who stay
+/// ([`unlisted_candidates`]), and at epoch 0 those of every leaf it starts from.
 fn needed_users(change: &MembershipChange) -> BTreeSet<Uuid> {
     let brought = change
         .added
@@ -382,6 +423,7 @@ fn needed_users(change: &MembershipChange) -> BTreeSet<Uuid> {
             .map(|statement| statement.user)
             .filter(|user| change.before.contains(*user)),
     );
+    users.extend(unlisted_candidates(change));
     if change.epoch == 0 {
         users.extend(change.leaves.values().map(|leaf| leaf.user));
     }
@@ -392,9 +434,11 @@ fn needed_users(change: &MembershipChange) -> BTreeSet<Uuid> {
 /// own knowledge may be what refuses it, the users it refuses for are to be observed anew first,
 /// `needs_identities` ([`ask_first`]). Those are the users of the leaves the commit brings that
 /// this device can't certify (`device_not_listed`, `leaf_not_signed`: a member that hasn't seen a
-/// user's newest list or identity refuses their new device), and the users whose leave statement
-/// is missing or doesn't verify (`leave_without_statement`: a statement signed by a device this
-/// device doesn't know as listed).
+/// user's newest list or identity refuses their new device), the users whose leave statement is
+/// missing or doesn't verify (`leave_without_statement`: a statement signed by a device this
+/// device doesn't know as listed), and the users of the leaves a member removes
+/// (`leaf_removed_without_reason`: a member that hasn't seen a user's newest list doesn't know the
+/// device is off it).
 pub(crate) fn commit_asks_first(
     tx: &Tx<'_>,
     entry: &[u8],
@@ -413,14 +457,16 @@ pub(crate) fn commit_asks_first(
             uncertified(&ctx, &brought, true)
         }
         RuleViolation::LeaveWithoutStatement => unconfirmed_leavers(tx, change)?,
+        RuleViolation::LeafRemovedWithoutReason => unlisted_candidates(change).collect(),
         _ => return Ok(()),
     };
     ask_first(tx, entry, users)
 }
 
 /// Before a welcome refused for `violation` counts as refused: the users of its leaves this device
-/// can't certify by their pinned identity (`leaf_not_signed`, a welcome holds leaves to nothing
-/// more) are to be observed anew first, as for a commit.
+/// can't certify by their pinned identity (`leaf_not_signed`: a welcome holds a leaf to that
+/// identity alone, or to the certificate it signed for the same device) are to be observed anew
+/// first, as for a commit.
 pub(crate) fn welcome_asks_first(
     tx: &Tx<'_>,
     entry: &[u8],
@@ -562,6 +608,79 @@ fn ask_first(tx: &Tx<'_>, entry: &[u8], users: BTreeSet<Uuid>) -> Result<(), Err
     Err(Error::NeedsIdentities { users })
 }
 
+/// Drops from another device's commit the leaves it renews with the credential and signature key
+/// they had. Such a leaf asserts nothing new: it was certified as it entered, and only its own key
+/// signs it. So it isn't certified again under its user's identity as this device pins it now,
+/// which may have changed since the server took the commit (a rotation, a reset): that commit broke
+/// no rule then, and refusing it would block the group. The validator, which checks each commit as
+/// it comes, still certifies every leaf a commit brings.
+pub(crate) fn skip_unchanged_leaves(change: &mut MembershipChange) {
+    change.updated.retain(|(index, leaf)| {
+        change.leaves.get(index).is_none_or(|before| {
+            before.certificate != leaf.credential || before.signature_key != leaf.signature_key
+        })
+    });
+}
+
+/// For each leaf another device's commit brings, added or updated, whose certificate an identity its
+/// user had before signed, not the one this device pins now: the certificate the identity pinned
+/// signed for the same device, in its place for the rules, when this device keeps one. Such a leaf
+/// was made before the change (a device set up then, joining its groups), and the identity pinned
+/// now vouches for the same device; the rules then hold the leaf's signature key to that
+/// certificate's. A leaf that identity hasn't certified, or certified with other keys, is refused,
+/// and so is one of an identity this device hasn't seen yet, which it asks about first. The
+/// validator, which checks each commit as it comes, holds every leaf to its own certificate.
+pub(crate) fn certify_by_pinned(tx: &Tx<'_>, change: &mut MembershipChange) -> Result<(), Error> {
+    let updated = change.updated.iter_mut().map(|(_, leaf)| leaf);
+    for leaf in change.added.iter_mut().chain(updated) {
+        if let Some(current) = pinned_in_place_of(tx, &leaf.credential, true)? {
+            leaf.credential = current;
+        }
+    }
+    Ok(())
+}
+
+/// As [`certify_by_pinned`], for each leaf of a group this device enters, by a welcome or its own
+/// external commit. A new member may never have seen the identity a leaf's user had before, so a
+/// leaf's certificate needn't be one this device knows: the identity pinned now vouching for the
+/// same device, with the leaf's own key, is what lets it in.
+pub(crate) fn certify_leaves_by_pinned(tx: &Tx<'_>, leaves: &mut Leaves) -> Result<(), Error> {
+    for leaf in leaves.values_mut() {
+        if let Some(current) = pinned_in_place_of(tx, &leaf.certificate, false)? {
+            leaf.certificate = current;
+        }
+    }
+    Ok(())
+}
+
+/// The certificate the identity pinned for `credential`'s user signed for the same device, when
+/// this device keeps one and that identity didn't sign `credential`: when `earlier`, only if an
+/// identity this device knows the user had before did.
+fn pinned_in_place_of(
+    tx: &Tx<'_>,
+    credential: &[u8],
+    earlier: bool,
+) -> Result<Option<Vec<u8>>, Error> {
+    let Ok(claimed) = DeviceCertificate::read_unverified(credential) else {
+        return Ok(None);
+    };
+    let Some(pinned) = tx.identity_of(claimed.user)? else {
+        return Ok(None);
+    };
+    if DeviceCertificate::verify(credential, &pinned).is_ok() {
+        return Ok(None);
+    }
+    if earlier
+        && !tx
+            .earlier_identities_of(claimed.user)?
+            .iter()
+            .any(|key| DeviceCertificate::verify(credential, key).is_ok())
+    {
+        return Ok(None);
+    }
+    tx.certificate_of(claimed.user, claimed.device)
+}
+
 /// What the rules go by for a commit beyond its users' identities and lists.
 #[derive(Default)]
 pub(crate) struct Extra {
@@ -597,9 +716,10 @@ pub(crate) struct Draft {
 
 /// This device's next commit in `group`: the key packages it adds and the users it adds and
 /// removes, and what goes with any commit of this epoch. The removals the server proposed go in
-/// (OpenMLS takes them from the proposal store), and with them the leave statements of the users
-/// whose leaves all go, who leave the list, a leaving owner handing over to the first user to have
-/// entered of those who stay.
+/// (OpenMLS takes them from the proposal store), and so do the leaves of this device's own user
+/// whose devices are off the user's latest list, proposed or not; with them, the leave statements
+/// of the users whose leaves all go, who leave the list, a leaving owner handing over to the first
+/// user to have entered of those who stay.
 pub(crate) fn draft(
     tx: &Tx<'_>,
     group: &MlsGroup,
@@ -611,7 +731,7 @@ pub(crate) fn draft(
     let list = MemberList::from_group_context(group.public_group().group_context())
         .map_err(|_| stored_state())?;
     let leaves = leaves(group.members()).map_err(|_| stored_state())?;
-    let removes: Vec<LeafNodeIndex> = leaves
+    let mut removes: Vec<LeafNodeIndex> = leaves
         .iter()
         .filter(|(_, leaf)| users_removed.contains(&leaf.user))
         .map(|(&index, _)| LeafNodeIndex::new(index))
@@ -624,6 +744,14 @@ pub(crate) fn draft(
             _ => None,
         })
         .collect();
+    let unlisted: Vec<LeafNodeIndex> = unlisted_own_leaves(tx, group)?
+        .into_iter()
+        .filter(|leaf| !going.contains(&leaf.u32()) && !removes.contains(leaf))
+        .collect();
+    if !unlisted.is_empty() {
+        ask_about_own_list(tx)?;
+        removes.extend(unlisted);
+    }
     going.extend(removes.iter().map(|leaf| leaf.u32()));
 
     let place = Place {

@@ -20,8 +20,8 @@ pub use extract::{
 pub use identity::{DeviceCertificate, DeviceList, LeaveStatement};
 pub use members::{CommitAad, Entry, Kind, MAX_MEMBERS, MEMBER_LIST_EXTENSION, MemberList};
 pub use rules::{
-    Place, RuleContext, RuleViolation, certified, check_change, check_joined_state, check_state,
-    signed_for, statement_user,
+    Place, Record, RuleContext, RuleViolation, certified, check_change, check_joined_state,
+    check_state, is_record, keeps_record, signed_for, statement_user, unlisted_candidates,
 };
 pub use signed::{
     DEVICE_CERTIFICATE, DEVICE_LIST, DIRECT_MESSAGE, HISTORY_SHARE, LEAVE, sign, verify,
@@ -31,7 +31,7 @@ pub use signed::{
 pub const SUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
 /// The past epochs a group keeps secrets for, so a message that arrives late still opens.
-const MAX_PAST_EPOCHS: usize = 5;
+pub const MAX_PAST_EPOCHS: usize = 5;
 
 /// A conversation's MLS group ID: its 16 bytes, then its generation (u32, big-endian).
 pub fn group_id(conversation: Uuid, generation: u32) -> GroupId {

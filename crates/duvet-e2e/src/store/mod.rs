@@ -20,6 +20,9 @@ pub(crate) struct Db {
     conn: Connection,
     #[cfg(not(target_family = "wasm"))]
     _lock: std::fs::File,
+    /// Tests only: the next transaction fails right before its commit.
+    #[cfg(feature = "test-hooks")]
+    fail_next_commit: bool,
 }
 
 impl Db {
@@ -28,13 +31,23 @@ impl Db {
         let lock = lock(path)?;
         let mut conn = Connection::open(path)?;
         unlock(&conn, key)?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        // What's deleted (a message's text, a key OpenMLS used) is overwritten, not left in the
+        // pages' free space.
+        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA secure_delete = ON;")?;
         migrations::run(&mut conn)?;
         Ok(Db {
             conn,
             #[cfg(not(target_family = "wasm"))]
             _lock: lock,
+            #[cfg(feature = "test-hooks")]
+            fail_next_commit: false,
         })
+    }
+
+    /// Tests only: the next transaction does all its work, then fails just before its commit.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn fail_next_commit(&mut self) {
+        self.fail_next_commit = true;
     }
 
     /// Runs `f` in one transaction, committed only when it returns `Ok`. What `f` asked to keep
@@ -46,6 +59,8 @@ impl Db {
         key_storage: KeyStorage,
         f: impl FnOnce(&mut Tx<'_>) -> Result<T, Error>,
     ) -> Result<T, Error> {
+        #[cfg(feature = "test-hooks")]
+        let fail = std::mem::take(&mut self.fail_next_commit);
         let txn = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -57,6 +72,11 @@ impl Db {
             kept: RefCell::new(Vec::new()),
         };
         let result = f(&mut tx);
+        #[cfg(feature = "test-hooks")]
+        let result = match result {
+            Ok(_) if fail => Err(Error::Internal("the test hook failed this commit".into())),
+            result => result,
+        };
         let kept = tx.kept.take();
         drop(tx);
         match result {

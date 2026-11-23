@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use duvet_e2e_rules::{
     CommitAad, DeviceCertificate, DeviceList, Entry, Kind, LeaveStatement, MEMBER_LIST_EXTENSION,
     MemberList, MembershipChange, Removed, RuleContext, RuleViolation, SUITE, check_change,
-    check_joined_state, check_state, extract_change, group_config, group_id, join_config,
-    leaf_capabilities, leaves,
+    check_joined_state, check_state, extract_change, group_config, group_id, is_record,
+    join_config, keeps_record, leaf_capabilities, leaves,
 };
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
@@ -1394,6 +1394,112 @@ fn legacy_creator_moving_itself_first_is_rejected() {
 }
 
 #[test]
+fn joined_list_keeps_to_the_record() {
+    // A device's record of a group from before the cutover, O its owner, and the lists of groups
+    // it joins past the founding: every user listed must be the record's, in any order and whatever
+    // their entries say, and O, while listed, the owner.
+    let (o, a, b, x) = (new_id(), new_id(), new_id(), new_id());
+    let list = |kind, owner, users: &[(Uuid, u64)]| {
+        let users = users
+            .iter()
+            .map(|&(user, epoch)| Entry {
+                user,
+                generation: 0,
+                epoch,
+            })
+            .collect();
+        MemberList::new(kind, owner, users)
+    };
+    let record = list(Kind::Group, Some(o), &[(o, 0), (a, 0), (b, 0)]);
+    let keeps = |owner, users: &[(Uuid, u64)]| {
+        keeps_record(&list(Kind::Group, Some(owner), users), &record)
+    };
+    assert!(keeps(o, &[(o, 0), (a, 0), (b, 0)]), "the record");
+    assert!(keeps(o, &[(o, 0), (b, 0), (a, 4)]), "A added back");
+    assert!(keeps(o, &[(o, 0), (b, 0), (a, 0)]), "in another order");
+    assert!(keeps(a, &[(a, 0), (b, 0)]), "O gone, A its successor");
+    assert!(
+        !keeps(o, &[(o, 0), (a, 0), (b, 0), (x, 2)]),
+        "X added later"
+    );
+    assert!(
+        !keeps(o, &[(o, 0), (a, 0), (b, 0), (x, 0)]),
+        "X entered first"
+    );
+    assert!(
+        !keeps(a, &[(o, 0), (a, 0), (b, 0)]),
+        "A the owner, O listed"
+    );
+    assert!(
+        !keeps(a, &[(a, 0), (b, 0), (o, 5)]),
+        "O added back, A still the owner"
+    );
+    let dm = list(Kind::Dm, None, &[(o, 0), (a, 0)]);
+    assert!(!keeps_record(&dm, &record), "a DM");
+}
+
+#[test]
+fn joined_dm_keeps_to_the_record() {
+    // A device's record of a DM from before the cutover, and the lists of DMs it joins past the
+    // founding: a DM's users never change, so they must be the record's, in any order, whatever the
+    // entries say.
+    let (o, a, x) = (new_id(), new_id(), new_id());
+    let dm = |users: &[(Uuid, u64)]| {
+        let users = users
+            .iter()
+            .map(|&(user, epoch)| Entry {
+                user,
+                generation: 0,
+                epoch,
+            })
+            .collect();
+        MemberList::new(Kind::Dm, None, users)
+    };
+    let record = dm(&[(o, 0), (a, 0)]);
+    assert!(keeps_record(&dm(&[(o, 0), (a, 0)]), &record), "the record");
+    assert!(
+        !keeps_record(&dm(&[(o, 0), (x, 2)]), &record),
+        "X in A's place, entered later"
+    );
+    assert!(
+        !keeps_record(&dm(&[(o, 0), (x, 0)]), &record),
+        "X in A's place"
+    );
+    assert!(
+        keeps_record(&dm(&[(a, 0), (o, 0)]), &record),
+        "the users the other way round"
+    );
+}
+
+#[test]
+fn founded_list_is_the_record() {
+    // A device's record of a conversation from before the cutover, O its owner, and the lists a
+    // group the device founds may have: the record's users in any order, with its kind and owner.
+    let (o, a, b, x) = (new_id(), new_id(), new_id(), new_id());
+    let list = |kind, owner, users: &[Uuid]| {
+        let users = users
+            .iter()
+            .map(|&user| Entry {
+                user,
+                generation: 0,
+                epoch: 0,
+            })
+            .collect();
+        MemberList::new(kind, owner, users)
+    };
+    let group = |users: &[Uuid]| list(Kind::Group, Some(o), users);
+    let record = group(&[o, a, b]);
+    assert!(is_record(&group(&[o, a, b]), &record), "the record");
+    assert!(is_record(&group(&[b, o, a]), &record), "in another order");
+    assert!(!is_record(&group(&[o, a, b, x]), &record), "X too");
+    assert!(!is_record(&group(&[o, a]), &record), "B left out");
+    let owned_by_a = list(Kind::Group, Some(a), &[o, a, b]);
+    assert!(!is_record(&owned_by_a, &record), "another owner");
+    let dm = list(Kind::Dm, None, &[o, a]);
+    assert!(!is_record(&dm, &group(&[o, a])), "a DM for a group");
+}
+
+#[test]
 fn member_list_rewrites_are_rejected() {
     let mut s = Scene::group();
     let ctx = s.world.context();
@@ -1447,6 +1553,35 @@ fn leaf_removed_without_reason_is_rejected() {
     };
     assert_eq!(
         s.verdict((O, 0), commit, &ctx),
+        Err(RuleViolation::LeafRemovedWithoutReason)
+    );
+}
+
+#[test]
+fn a_device_off_its_list_goes_by_any_members_commit() {
+    // The owner takes its second device off its list, and the server proposes nothing.
+    let mut s = Scene::group();
+    let stale = s.world.context();
+    let mut ctx = s.world.context();
+    let owner = &s.world.users[O];
+    let list = DeviceList::new(
+        owner.id,
+        public(&owner.identity),
+        2,
+        vec![owner.devices[0].id],
+    );
+    ctx.device_lists.insert(owner.id, list);
+    let removing_it = || Commit {
+        removes: vec![(O, 1)],
+        ..Commit::default()
+    };
+
+    // Any member's commit takes that device's leaf out, another user's as well as its own user's.
+    assert_eq!(s.verdict((B, 0), removing_it(), &ctx), Ok(()));
+    assert_eq!(s.verdict((O, 0), removing_it(), &ctx), Ok(()));
+    // Not while the list the checker holds still has the device.
+    assert_eq!(
+        s.verdict((B, 0), removing_it(), &stale),
         Err(RuleViolation::LeafRemovedWithoutReason)
     );
 }

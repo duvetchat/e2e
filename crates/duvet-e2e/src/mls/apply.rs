@@ -4,8 +4,9 @@
 //! Each kind of entry has its handler ([`EntryHandler`]); the order is this module's alone.
 
 use duvet_e2e_rules::{
-    Entry as ListEntry, Kind, LeaveStatement, MemberList, Place, RuleViolation, check_joined_state,
-    extract_change, group_id_parts, join_config, leaves, statement_user,
+    Entry as ListEntry, Kind, LeaveStatement, MemberList, Place, Record, RuleContext,
+    RuleViolation, check_joined_state, extract_change, group_id_parts, join_config, leaves,
+    statement_user,
 };
 use openmls::prelude::tls_codec::DeserializeBytes as _;
 use openmls::prelude::{
@@ -18,8 +19,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    Extra, GroupRow, check, commit_asks_first, delete_group, digest, openmls_error, own_merged,
-    rule_context, storage_error, stored_group, stored_state, welcome_asks_first,
+    Extra, GroupRow, certify_by_pinned, certify_leaves_by_pinned, check, commit_asks_first,
+    delete_group, digest, openmls_error, own_merged, rule_context, skip_unchanged_leaves,
+    storage_error, stored_group, stored_state, welcome_asks_first,
 };
 use crate::identity::{invalid, not_found};
 use crate::protocol::b64;
@@ -40,15 +42,34 @@ pub(crate) struct Entry {
     #[serde(with = "b64")]
     pub(crate) data: Vec<u8>,
     /// On the welcome of a conversation from before the cutover: its owner and members as this
-    /// device's client showed them then, from the client's own record (the API never gives it),
-    /// which the group must have. Only a welcome of generation 0, the conversation's first group,
-    /// is held to it; at a later generation it's ignored.
+    /// device's client showed them then, from the client's own record (the API never gives it).
+    /// The founding welcome must have its users, in any order, kind and owner, and any other join
+    /// keep to it ([`Expected::hold`]), but a reset's welcome to a device that holds the group,
+    /// which goes by the members it had.
     #[serde(default)]
     pub(crate) expected: Option<Expected>,
     /// On the server's proposal to remove a leaf of a user who leaves: their signed statement, for
     /// the commit that takes them out.
     #[serde(default, with = "b64::option")]
     pub(crate) statement: Option<Vec<u8>>,
+    /// On a message, an edit or a deletion: the message's ID, as the API gives it (an edit's or a
+    /// deletion's is the ID of the message it changes).
+    #[serde(default)]
+    pub(crate) message_id: Option<Uuid>,
+    /// Who sent it, as the API says: a message this device can't open is shown as theirs.
+    #[serde(default)]
+    pub(crate) sender_user: Option<Uuid>,
+    #[serde(default)]
+    pub(crate) sender_device: Option<Uuid>,
+    /// When the API took it, in Unix milliseconds.
+    #[serde(default)]
+    pub(crate) sent_at: Option<i64>,
+    /// The users a message mentions, as its sender listed them for the API.
+    #[serde(default)]
+    pub(crate) mentions: Vec<Uuid>,
+    /// The message a message answers, as the API gives it: replies go in the clear.
+    #[serde(default)]
+    pub(crate) reply_to: Option<Uuid>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,8 +93,9 @@ pub(crate) struct Expected {
 }
 
 impl Expected {
-    /// The list epoch 0 must have: a group's when there's an owner, a DM's when there isn't.
-    fn list(&self, generation: u32) -> MemberList {
+    /// The record as a list at `generation`'s start: a group's when there's an owner, a DM's when
+    /// there isn't.
+    pub(crate) fn list(&self, generation: u32) -> MemberList {
         let kind = if self.owner.is_some() {
             Kind::Group
         } else {
@@ -81,30 +103,49 @@ impl Expected {
         };
         entered_at_start(kind, self.owner, &self.members, generation)
     }
+
+    /// Holds a group this device joins at `generation` to this record, in `ctx`: the founding
+    /// welcome, the first commit's at generation 0, to the record's members (`is_record`); any
+    /// other join, at any generation, with a row for the conversation or without, to
+    /// `keeps_record`.
+    pub(crate) fn hold(&self, ctx: &mut RuleContext, generation: u32, founding: bool) {
+        let list = self.list(generation);
+        ctx.record = Some(if founding {
+            Record::Founding(list)
+        } else {
+            Record::Joined(list)
+        });
+    }
 }
 
 /// What an entry did.
 #[derive(Debug, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub(crate) enum Applied {
-    /// It took effect: a commit merged, a welcome joined, a proposal kept for the next commit.
-    /// The group's epoch after it.
+    /// It took effect: a commit merged, a welcome joined, a proposal kept for the next commit, a
+    /// message, an edit or a deletion opened and kept. The group's epoch after it.
     #[serde(rename = "applied")]
     Done { epoch: u64 },
     /// This device's own commit: merged by `commit_result`, or now, when the server took the commit
-    /// it answered as refused.
+    /// it answered as refused. Or its own message, edit or deletion, kept as it was made.
     Own,
+    /// A message, an edit or a deletion this device couldn't open, for the `reason` the client
+    /// reports: `message` (MLS refused it), `envelope` (what it held isn't an envelope) or
+    /// `too_large` (over 32 KiB, unread). A message is kept as waiting, for an import to replace.
+    Undecryptable { reason: &'static str },
     /// A commit that took this device out of the group.
     Removed,
     /// Refused, for the rule it breaks (or `malformed`, `invalid_commit`, `invalid_welcome`,
     /// `invalid_proposal`, `wrong_group` for what isn't a valid message of this group, and
-    /// `stale_welcome` for a welcome to an epoch this device held or saw pass). Another
-    /// device's commit refused for a rule, or one OpenMLS can't process, also blocks the group,
-    /// and nothing goes on it but a reset; a malformed entry, a commit entry that holds no
-    /// commit, and a refused welcome or proposal leave the group as it was.
+    /// `stale_welcome` for a welcome to an epoch this device held or saw pass; `not_author` for an
+    /// edit or a deletion of another user's message). Another device's commit refused for a rule,
+    /// or one OpenMLS can't process, also blocks the group, and nothing goes on it but a reset; a
+    /// malformed entry, a commit entry that holds no commit, and a refused welcome or proposal
+    /// leave the group as it was.
     Rejected { rule: String },
     /// Not for this device, or not now: a welcome for other devices, an entry of another generation
-    /// or epoch, of a group this device isn't in, or after its group was blocked.
+    /// or epoch, of a group this device isn't in, or after its group was blocked; a message this
+    /// device has already, or an edit or a deletion of one deleted.
     Ignored,
 }
 
@@ -146,7 +187,7 @@ fn handler(kind: EntryKind) -> &'static dyn EntryHandler {
         EntryKind::Commit => &Commits,
         EntryKind::Welcome => &Welcomes,
         EntryKind::Proposal => &Proposals,
-        EntryKind::Message | EntryKind::Edit | EntryKind::Delete => &Messages,
+        EntryKind::Message | EntryKind::Edit | EntryKind::Delete => &crate::messages::Messages,
     }
 }
 
@@ -219,7 +260,7 @@ pub(crate) fn apply(tx: &Tx<'_>, request: ApplyRequest) -> Result<ApplyReply, Er
     Ok(ApplyReply {
         applied_through: at.last_seq(),
         results,
-        catch_up_due: Vec::new(),
+        catch_up_due: crate::messages::catch_up_due(tx, at.id, at.row.as_ref())?,
     })
 }
 
@@ -294,10 +335,12 @@ impl EntryHandler for Commits {
             }
             _ => return Ok(rejected("invalid_commit")),
         };
-        let change = match extract_change(&context, &leaves, &staged, &sender, &aad) {
+        let mut change = match extract_change(&context, &leaves, &staged, &sender, &aad) {
             Ok(change) => change,
             Err(violation) => return Ok(block(row, violation.name())),
         };
+        skip_unchanged_leaves(&mut change);
+        certify_by_pinned(tx, &mut change)?;
         if let Err(violation) = check(tx, &change, Extra::default())? {
             commit_asks_first(tx, &digest(&entry.data), &change, violation)?;
             return Ok(block(row, violation.name()));
@@ -308,6 +351,8 @@ impl EntryHandler for Commits {
         group
             .merge_staged_commit(provider, *staged)
             .map_err(openmls_error)?;
+        // A member without a device whose device it brings is due a catch-up.
+        crate::messages::entered(tx, at.id, &change.added)?;
         row.echo = None;
         row.members = after;
         row.statements.clear();
@@ -387,21 +432,25 @@ impl EntryHandler for Welcomes {
             Err(WelcomeError::StorageError(error)) => return Err(storage_error(error)),
             Err(_) => return Ok(rejected("invalid_welcome")),
         };
-        let leaves = match leaves(staged.members()) {
+        let mut leaves = match leaves(staged.members()) {
             Ok(leaves) => leaves,
             Err(violation) => return Ok(rejected(violation.name())),
         };
+        certify_leaves_by_pinned(tx, &mut leaves)?;
         let context = staged.group_context();
         let epoch = context.epoch().as_u64();
-        // A client's record from before the cutover holds the conversation's first group alone;
-        // at a later generation a reset's expectation decides.
-        let expected = entry
-            .expected
-            .as_ref()
-            .filter(|_| generation == 0)
-            .map(|expected| expected.list(generation));
         let mut ctx = rule_context(tx, leaves.values().map(|leaf| leaf.user))?;
-        ctx.expected_initial = expected.or(reset);
+        match (reset, &entry.expected) {
+            // A reset's welcome to a device that holds the group goes by the members it had: they
+            // carry the legitimate changes since the cutover, which the record doesn't.
+            (Some(members), _) => ctx.expected_initial = Some(members),
+            (None, Some(record)) => {
+                // The founding welcome is the first commit's, at generation 0.
+                let founding = (generation, epoch) == (0, 1);
+                record.hold(&mut ctx, generation, founding);
+            }
+            (None, None) => {}
+        }
         if let Err(violation) = check_joined_state(&ctx, context, &leaves) {
             welcome_asks_first(tx, &digest(&entry.data), &ctx, &leaves, violation)?;
             return Ok(rejected(violation.name()));
@@ -551,17 +600,7 @@ fn keep_statement(
     Ok(())
 }
 
-/// Messages, edits and deletes are the messages' handlers' to apply; until those exist here, they
-/// change nothing, and the queue goes on past them.
-struct Messages;
-
-impl EntryHandler for Messages {
-    fn apply(&self, _: &Tx<'_>, _: &mut Conversation, _: &Entry) -> Result<Applied, Error> {
-        Ok(Applied::Ignored)
-    }
-}
-
-fn rejected(rule: &str) -> Applied {
+pub(crate) fn rejected(rule: &str) -> Applied {
     Applied::Rejected { rule: rule.into() }
 }
 
@@ -589,7 +628,7 @@ fn entered_at_start(
     MemberList::new(kind, owner, entries)
 }
 
-fn protocol_message(bytes: &[u8]) -> Option<ProtocolMessage> {
+pub(crate) fn protocol_message(bytes: &[u8]) -> Option<ProtocolMessage> {
     MlsMessageIn::tls_deserialize_exact_bytes(bytes)
         .ok()?
         .try_into_protocol_message()

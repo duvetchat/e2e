@@ -1,16 +1,31 @@
 //! The user's identity and this device: its keys, its certificate and the user's device list, the
 //! other users' identities this device pinned, and the key packages it hands out.
 
+mod approval;
+mod certificates;
 mod contacts;
 mod device;
 // The plan's layout: create_identity and sign_device_list are in identity/identity.rs.
 #[allow(clippy::module_inception)]
 mod identity;
+mod recover;
 pub mod recovery;
+mod rotate;
 
+pub(crate) use approval::{
+    ApprovalAccept, ApprovalCheck, ApprovalConfirm, ApprovalFromQr, ApprovalOffer, ApprovalReceive,
+    ApprovalReveal, Enrolled, TRANSFER as APPROVAL_TRANSFER, approval_accept, approval_begin,
+    approval_check, approval_confirm, approval_from_qr, approval_offer, approval_receive,
+    approval_reveal, receive_transfer,
+};
+pub(crate) use certificates::{keep_certificates, keep_earlier_identity};
 pub(crate) use contacts::{observe_user, safety_number, verify_user};
 pub(crate) use device::{create_device, key_packages};
 pub(crate) use identity::{create_identity, sign_device_list};
+pub(crate) use recover::{Recover, recover};
+pub(crate) use rotate::{
+    ROTATION_TRANSFER, Transferred, receive_rotation, renewed_at, reset_identity, rotate_keys,
+};
 
 use duvet_e2e_rules::DeviceList;
 use openmls::prelude::{BasicCredential, CredentialWithKey, SignatureScheme};

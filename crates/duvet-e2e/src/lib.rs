@@ -7,6 +7,7 @@ mod direct;
 mod envelope;
 mod error;
 mod identity;
+pub mod messages;
 pub mod mls;
 pub mod parts;
 mod protocol;
@@ -171,6 +172,13 @@ impl Core {
 
     /// Closes the database and lets another instance open it.
     pub fn close(self) {}
+
+    /// Tests only: the next command does all its work, then fails just before its transaction
+    /// commits, which leaves the database as any failure does.
+    #[cfg(feature = "test-hooks")]
+    pub fn fail_next_commit(&mut self) {
+        self.db.fail_next_commit();
+    }
 
     /// Runs `f` in one `BEGIN IMMEDIATE` transaction, committed only when it returns `Ok`; what
     /// `f` keeps whatever happens ([`Tx`]'s `keep`, as `apply`'s note of a `needs_identities`)

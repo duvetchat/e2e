@@ -43,7 +43,9 @@ pub enum RuleViolation {
         "the member list isn't well formed or the expected one, or isn't the previous one without the users who left and with the new ones at its end"
     )]
     MemberListMismatch,
-    #[error("a leaf goes without its user leaving or being removed, or the server removing it")]
+    #[error(
+        "a leaf goes without its user leaving or being removed, the server removing it, or its device leaving its user's list"
+    )]
     LeafRemovedWithoutReason,
     #[error("a signature doesn't verify")]
     InvalidSignature,
@@ -87,8 +89,20 @@ pub struct RuleContext {
     pub enforce_pending: bool,
     /// The list epoch 0 must have, when any member may make it: a conversation from before the cutover.
     pub expected_initial: Option<MemberList>,
+    /// A device's record of a conversation from before the cutover, and how the group it joins is
+    /// held to it.
+    pub record: Option<Record>,
     /// The API's signature key, the group's one external sender; not compared when unknown.
     pub external_sender: Option<Vec<u8>>,
+}
+
+/// A device's record of a conversation from before the cutover, as a group it joins is held to it.
+#[derive(Clone, Debug)]
+pub enum Record {
+    /// The group's founding welcome, which must have the record's members ([`is_record`]).
+    Founding(MemberList),
+    /// Any other join, which must keep to the record ([`keeps_record`]).
+    Joined(MemberList),
 }
 
 /// Whether a commit keeps every rule. Checked in this order, so a commit breaking several gets the
@@ -235,13 +249,20 @@ pub fn check_change(ctx: &RuleContext, change: &MembershipChange) -> Result<(), 
         return Err(UserNotMember);
     }
 
-    // A leaf goes when its user does, when the server proposes it, or when its own device rejoins
-    // (checked above for external commits).
+    // A leaf goes when its user does, when the server proposes it, when its own device rejoins
+    // (checked above for external commits), or when its device is off its user's latest list as
+    // the checker holds it, by any member's commit: a device taken off its list stops reading what
+    // comes next, whether or not the server proposes its removal.
     for removal in &change.removed {
         let leaf = change.leaves.get(&removal.index).ok_or(Malformed)?;
+        let unlisted = ctx
+            .device_lists
+            .get(&leaf.user)
+            .is_some_and(|list| !list.contains(leaf.device));
         let cause = removal.by_server
             || removed_users.contains(&leaf.user)
-            || matches!(change.committer, Committer::NewMember);
+            || matches!(change.committer, Committer::NewMember)
+            || unlisted;
         if !cause {
             return Err(LeafRemovedWithoutReason);
         }
@@ -249,11 +270,24 @@ pub fn check_change(ctx: &RuleContext, change: &MembershipChange) -> Result<(), 
     Ok(())
 }
 
+/// The users whose latest lists say whether `change` may take out the leaves it removes: those of
+/// the leaves a member removes, without the server proposing it, from users who stay. The rules
+/// read their lists only for that.
+pub fn unlisted_candidates(change: &MembershipChange) -> impl Iterator<Item = Uuid> + '_ {
+    change
+        .removed
+        .iter()
+        .filter(|removal| !removal.by_server)
+        .filter_map(|removal| change.leaves.get(&removal.index))
+        .map(|leaf| leaf.user)
+        .filter(|user| change.after.contains(*user))
+}
+
 /// Whether a group's state, as a device finds it, is one Duvet makes: Duvet's context, a
-/// well-formed member list (exactly `expected_initial`, when given), and every leaf certified for
-/// its own key, its device on its user's latest list, its user a member. Checked in this order.
-/// Where a state enters through no commit, this is what checks it: `check_change` from epoch 0 and
-/// the validator's `create`.
+/// well-formed member list (exactly `expected_initial`, and held to `record`, when given), and
+/// every leaf certified for its own key, its device on its user's latest list, its user a member.
+/// Checked in this order. Where a state enters through no commit, this is what checks it:
+/// `check_change` from epoch 0 and the validator's `create`.
 pub fn check_state(
     ctx: &RuleContext,
     context: &GroupContext,
@@ -306,6 +340,14 @@ fn state(
         {
             return Err(MemberListMismatch);
         }
+    }
+    let kept = match &ctx.record {
+        Some(Record::Founding(record)) => is_record(&list, record),
+        Some(Record::Joined(record)) => keeps_record(&list, record),
+        None => true,
+    };
+    if !kept {
+        return Err(MemberListMismatch);
     }
 
     for leaf in leaves.values() {
@@ -364,6 +406,39 @@ fn sender_key(sender: &ExternalSender) -> Result<Vec<u8>, RuleViolation> {
     let key =
         VLBytes::tls_deserialize(&mut encoded.as_slice()).map_err(|_| RuleViolation::Malformed)?;
     Ok(key.as_slice().to_vec())
+}
+
+/// Whether `list` is `record`, a device's record of a conversation from before the cutover, as a
+/// group the device founds, and a founding welcome it takes, must be: the same kind and owner, and
+/// the same users, in any order, as a record keeps none.
+pub fn is_record(list: &MemberList, record: &MemberList) -> bool {
+    let users = |list: &MemberList| {
+        list.users
+            .iter()
+            .map(|entry| entry.user)
+            .collect::<BTreeSet<_>>()
+    };
+    (list.kind, list.owner) == (record.kind, record.owner) && users(list) == users(record)
+}
+
+/// Whether `list`, the member list of a group a device joins past the founding, keeps to `record`,
+/// the device's record of the conversation from before the cutover. The list's entries are
+/// whatever the last commit's maker wrote, so only its kind and who it lists count. A DM's two
+/// users never change: the list is the record ([`is_record`]). In a group, every user listed is the
+/// record's, in any order, and the record's owner, while listed, is the owner: a user the owner
+/// added since the cutover is refused too, as nothing in the list tells that addition from a
+/// planted one.
+pub fn keeps_record(list: &MemberList, record: &MemberList) -> bool {
+    if record.kind == Kind::Dm {
+        return is_record(list, record);
+    }
+    let owner_kept = record
+        .owner
+        .filter(|&owner| list.contains(owner))
+        .is_none_or(|owner| list.owner == Some(owner));
+    list.kind == record.kind
+        && list.users.iter().all(|entry| record.contains(entry.user))
+        && owner_kept
 }
 
 /// A member list as Duvet keeps it: at most 20 users, each once, entered in this generation and by

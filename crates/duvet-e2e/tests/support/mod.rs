@@ -158,8 +158,9 @@ pub struct QueueEntry {
     pub data: Vec<u8>,
     /// The leave statement a removal proposal brings.
     pub statement: Option<Vec<u8>>,
-    /// The generation of a welcome, as the server knows it.
-    pub generation: Option<u32>,
+    /// The fields the API adds to a message, an edit or a deletion: its `message_id`, who sent it
+    /// and when, whom it mentions.
+    pub meta: serde_json::Map<String, Value>,
 }
 
 impl QueueEntry {
@@ -169,6 +170,9 @@ impl QueueEntry {
         let mut entry = json!({"seq": self.seq, "kind": self.kind, "data": b64(&self.data)});
         if let Some(statement) = &self.statement {
             entry["statement"] = json!(b64(statement));
+        }
+        for (field, value) in &self.meta {
+            entry[field] = value.clone();
         }
         entry
     }
@@ -204,7 +208,7 @@ impl Chat {
             kind,
             data,
             statement,
-            generation: None,
+            meta: serde_json::Map::new(),
         });
         seq
     }
@@ -228,6 +232,8 @@ pub struct FakeServer {
     handed_out: BTreeSet<String>,
     pub chats: BTreeMap<Uuid, Chat>,
     inboxes: BTreeMap<Uuid, Vec<Vec<u8>>>,
+    /// The messages the API took, by their sender's device and nonce: its nonce window.
+    nonces: BTreeMap<(Uuid, String), (Uuid, u64)>,
 }
 
 impl Default for FakeServer {
@@ -248,6 +254,7 @@ impl FakeServer {
             handed_out: BTreeSet::new(),
             chats: BTreeMap::new(),
             inboxes: BTreeMap::new(),
+            nonces: BTreeMap::new(),
         }
     }
 
@@ -418,6 +425,53 @@ impl FakeServer {
         record.version = taken.version;
         record.devices = taken.devices.clone();
         record.list = signed;
+    }
+
+    /// The new identity a device of `user` made (`rotate_keys`, `reset_identity`'s `reply`), which
+    /// the server takes in place of the one it had: the key, the secret its blobs hold (opened as a
+    /// recovered device opens them), the list, the certificate of the device that made it, and
+    /// those of the devices that stay, whose transfers wait in their inboxes. Every device on the
+    /// list has its certificate.
+    pub fn take_identity(&mut self, user: Uuid, reply: &Value) {
+        let recovery_key = recovery::parse(reply["recovery_key"].as_str().unwrap()).unwrap();
+        let backup_key =
+            recovery::unwrap_backup_key(&recovery_key, user, &bytes(&reply["wrapped_backup_key"]))
+                .unwrap();
+        let seed =
+            recovery::decrypt_identity(&backup_key, user, &bytes(&reply["encrypted_identity"]))
+                .unwrap();
+        let identity_key: [u8; 32] = bytes(&reply["identity_key"]).try_into().unwrap();
+        let list = bytes(&reply["device_list"]);
+        let taken = DeviceList::verify(&list, &identity_key).unwrap();
+        let certificate = bytes(&reply["certificate"]);
+        let device = DeviceCertificate::verify(&certificate, &identity_key)
+            .unwrap()
+            .device;
+        let mut certificates = BTreeMap::from([(device, certificate)]);
+        for handed in reply["transfers"].as_array().into_iter().flatten() {
+            let staying: Uuid = handed["device_id"].as_str().unwrap().parse().unwrap();
+            let certificate = bytes(&handed["certificate"]);
+            let certified = DeviceCertificate::verify(&certificate, &identity_key).unwrap();
+            assert_eq!(certified.device, staying, "the device's own certificate");
+            certificates.insert(staying, certificate);
+            self.post(staying, bytes(&handed["transfer"]));
+        }
+        assert_eq!(
+            taken.devices,
+            certificates.keys().copied().collect::<Vec<_>>(),
+            "a certificate for each device on the list"
+        );
+        self.users.insert(
+            user,
+            User {
+                seed: *seed,
+                identity_key,
+                version: taken.version,
+                devices: taken.devices,
+                list,
+                certificates,
+            },
+        );
     }
 
     /// `device`'s key packages: all its live ones, which the server keeps.
@@ -706,7 +760,6 @@ impl FakeServer {
         }
         if let Some(welcome) = reply["welcome"].as_str() {
             let welcome_seq = chat.push("welcome", STANDARD.decode(welcome).unwrap(), None);
-            chat.queue.last_mut().unwrap().generation = Some(generation);
             // A device new to the conversation gets the queue from its welcome on; one that had it
             // (a reset brings everyone in again) goes on in order.
             for added in &change.devices_added {
@@ -787,7 +840,7 @@ impl FakeServer {
 
     /// Hands `device` the entries of each of its conversations it hasn't had yet, through `apply`:
     /// the replies. It adds the device's own record of a conversation from before the cutover to
-    /// that conversation's welcomes of generation 0, its first group, as their `expected`.
+    /// that conversation's welcomes, as their `expected`, which the core holds each one to.
     pub fn deliver(&mut self, device: &mut TestDevice) -> Vec<Value> {
         let mut replies = Vec::new();
         for (conversation, chat) in &mut self.chats {
@@ -801,9 +854,7 @@ impl FakeServer {
                 .filter(|entry| entry.seq >= next)
                 .map(|entry| {
                     let mut json = entry.json();
-                    if let (Some(record), "welcome", Some(0)) =
-                        (record, entry.kind, entry.generation)
-                    {
+                    if let (Some(record), "welcome") = (record, entry.kind) {
                         json["expected"] = record.clone();
                     }
                     json
@@ -837,6 +888,151 @@ impl FakeServer {
     /// What waits in `device`'s inbox, which it takes.
     pub fn inbox(&mut self, device: Uuid) -> Vec<Vec<u8>> {
         self.inboxes.remove(&device).unwrap_or_default()
+    }
+
+    /// A new installation of `user`: a device with no identity yet and on no list, as it is before
+    /// it's recovered or approved.
+    pub fn bare_device(&mut self, user: Uuid) -> TestDevice {
+        let dir = tempfile::tempdir().unwrap();
+        let mut core = Core::open(OpenConfig {
+            clock: Box::new(self.clock.clone()),
+            ..OpenConfig::new(dir.path().join("core.db"), [1; 32])
+        })
+        .unwrap();
+        let id = new_id();
+        ok(
+            &mut core,
+            json!({"cmd": "create_device", "user_id": user, "device_id": id}),
+        );
+        TestDevice {
+            core,
+            user,
+            id,
+            records: BTreeMap::new(),
+            _dir: dir,
+        }
+    }
+
+    /// `user`'s first device, which makes their identity, with `create_identity`'s reply: the
+    /// recovery key, and the blobs the server keeps for a new device to recover with.
+    pub fn first_device(&mut self, user: Uuid) -> (TestDevice, Value) {
+        assert!(
+            !self.users.contains_key(&user),
+            "a user with no identity yet"
+        );
+        let mut device = self.bare_device(user);
+        let identity = ok(&mut device.core, json!({"cmd": "create_identity"}));
+        let recovery_key = recovery::parse(identity["recovery_key"].as_str().unwrap()).unwrap();
+        let backup_key = recovery::unwrap_backup_key(
+            &recovery_key,
+            user,
+            &bytes(&identity["wrapped_backup_key"]),
+        )
+        .unwrap();
+        let seed =
+            recovery::decrypt_identity(&backup_key, user, &bytes(&identity["encrypted_identity"]))
+                .unwrap();
+        self.users.insert(
+            user,
+            User {
+                seed: *seed,
+                identity_key: bytes(&identity["identity_key"]).try_into().unwrap(),
+                version: 1,
+                devices: vec![device.id],
+                list: bytes(&identity["device_list"]),
+                certificates: BTreeMap::from([(device.id, bytes(&identity["certificate"]))]),
+            },
+        );
+        (device, identity)
+    }
+
+    /// The certificate and the device list a recovered or approved device of `user` brings, which
+    /// the server takes.
+    pub fn take_device(&mut self, user: Uuid, certificate: &Value, list: &Value) {
+        let record = self.users.get_mut(&user).unwrap();
+        let certificate = bytes(certificate);
+        let device = DeviceCertificate::verify(&certificate, &record.identity_key)
+            .unwrap()
+            .device;
+        let signed = bytes(list);
+        let taken = DeviceList::verify(&signed, &record.identity_key).unwrap();
+        assert!(taken.version > record.version, "a newer list");
+        assert!(taken.contains(device), "a list with the new device");
+        record.version = taken.version;
+        record.devices = taken.devices.clone();
+        record.list = signed;
+        record.certificates.insert(device, certificate);
+    }
+
+    /// `device` posts a message to `conversation`: its `ciphertext` goes in the queue as the API keeps
+    /// it, with a new message ID, who sent it and when, and whom it mentions. The API knows a message
+    /// by its sender's device and its `nonce`: posted again, it's the message the API has. The
+    /// message's ID and number.
+    pub fn post_message(
+        &mut self,
+        device: &TestDevice,
+        conversation: Uuid,
+        nonce: &str,
+        ciphertext: Vec<u8>,
+        mentions: &[Uuid],
+    ) -> (Uuid, u64) {
+        let key = (device.id, nonce.to_owned());
+        if let Some(&posted) = self.nonces.get(&key) {
+            return posted;
+        }
+        let message_id = new_id();
+        let seq = self.post_entry(
+            device,
+            conversation,
+            "message",
+            message_id,
+            ciphertext,
+            mentions,
+        );
+        self.nonces.insert(key, (message_id, seq));
+        (message_id, seq)
+    }
+
+    /// `device` posts an edit or a deletion (`kind`) of the message `message_id`, which goes in the
+    /// queue under that message's ID. Its number.
+    pub fn post_change(
+        &mut self,
+        device: &TestDevice,
+        conversation: Uuid,
+        kind: &'static str,
+        message_id: Uuid,
+        ciphertext: Vec<u8>,
+    ) -> u64 {
+        self.post_entry(device, conversation, kind, message_id, ciphertext, &[])
+    }
+
+    fn post_entry(
+        &mut self,
+        device: &TestDevice,
+        conversation: Uuid,
+        kind: &'static str,
+        message_id: Uuid,
+        ciphertext: Vec<u8>,
+        mentions: &[Uuid],
+    ) -> u64 {
+        let sent_at = self.clock.now_ms();
+        let chat = self.chats.get_mut(&conversation).unwrap();
+        let seq = chat.push(kind, ciphertext, None);
+        let meta = &mut chat.queue.last_mut().unwrap().meta;
+        meta.insert("message_id".into(), json!(message_id));
+        meta.insert("sender_user".into(), json!(device.user));
+        meta.insert("sender_device".into(), json!(device.id));
+        meta.insert("sent_at".into(), json!(sent_at));
+        if !mentions.is_empty() {
+            meta.insert("mentions".into(), json!(mentions));
+        }
+        seq
+    }
+
+    /// `user` starts over: the server forgets their identity and their devices, and their next
+    /// device makes a new identity.
+    pub fn forget_user(&mut self, user: Uuid) {
+        self.users.remove(&user);
     }
 
     fn identities(&self) -> BTreeMap<Uuid, ByteBuf> {

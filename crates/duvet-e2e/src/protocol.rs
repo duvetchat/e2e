@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{Error, KeyStorage, PROTOCOL, Tx, identity, mls, parts};
+use crate::{Error, KeyStorage, PROTOCOL, Tx, direct, identity, messages, mls, parts};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -40,10 +40,32 @@ pub(crate) enum Command {
     },
     KeyPackages,
 
+    // Starting over and changing the keys.
+    ResetIdentity,
+    RotateKeys {
+        remove: Vec<Uuid>,
+        /// The user's devices' certificates as the server serves them, for the devices that stay.
+        #[serde(default, with = "b64::list")]
+        certificates: Vec<Vec<u8>>,
+    },
+
     // Attachments' parts.
     AttachmentKey,
     AttachmentEncrypt(parts::AttachmentPart),
     AttachmentDecrypt(parts::AttachmentPart),
+
+    // New devices, by the recovery key or by another device's approval, and the messages devices
+    // send each other.
+    Recover(identity::Recover),
+    ApprovalBegin,
+    ApprovalOffer(identity::ApprovalOffer),
+    ApprovalReveal(identity::ApprovalReveal),
+    ApprovalCheck(identity::ApprovalCheck),
+    ApprovalConfirm(identity::ApprovalConfirm),
+    ApprovalAccept(identity::ApprovalAccept),
+    ApprovalFromQr(identity::ApprovalFromQr),
+    ApprovalReceive(identity::ApprovalReceive),
+    ReceiveDirect(direct::ReceiveDirect),
 
     // Conversations' groups.
     CreateGroup(mls::CreateGroup),
@@ -58,6 +80,16 @@ pub(crate) enum Command {
     ResetGroup(mls::ResetGroup),
     Group(mls::ConversationId),
     Apply(mls::ApplyRequest),
+
+    // Messages.
+    Encrypt(messages::Encrypt),
+    Sent(messages::Sent),
+    Discard(messages::Discard),
+    Edit(messages::Edit),
+    Delete(messages::Delete),
+    Messages(messages::ListMessages),
+    Search(messages::Search),
+    WithoutDevices(messages::WithoutDevices),
 }
 
 pub(crate) fn parse(command: &str) -> Result<Command, Error> {
@@ -91,9 +123,26 @@ pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error
         }
         Command::KeyPackages => reply(identity::key_packages(tx)?),
 
+        Command::ResetIdentity => reply(identity::reset_identity(tx)?),
+        Command::RotateKeys {
+            remove,
+            certificates,
+        } => reply(identity::rotate_keys(tx, &remove, &certificates)?),
+
         Command::AttachmentKey => reply(parts::attachment_key(tx)?),
         Command::AttachmentEncrypt(part) => reply(parts::attachment_encrypt(part)?),
         Command::AttachmentDecrypt(part) => reply(parts::attachment_decrypt(part)?),
+
+        Command::Recover(request) => reply(identity::recover(tx, request)?),
+        Command::ApprovalBegin => reply(identity::approval_begin(tx)?),
+        Command::ApprovalOffer(request) => reply(identity::approval_offer(tx, request)?),
+        Command::ApprovalReveal(request) => reply(identity::approval_reveal(tx, request)?),
+        Command::ApprovalCheck(request) => reply(identity::approval_check(tx, request)?),
+        Command::ApprovalConfirm(request) => reply(identity::approval_confirm(tx, request)?),
+        Command::ApprovalAccept(request) => reply(identity::approval_accept(tx, request)?),
+        Command::ApprovalFromQr(request) => reply(identity::approval_from_qr(tx, request)?),
+        Command::ApprovalReceive(request) => reply(identity::approval_receive(tx, request)?),
+        Command::ReceiveDirect(request) => reply(direct::receive_direct(tx, request)?),
 
         Command::CreateGroup(request) => reply(mls::create_group(tx, request)?),
         Command::CommitResult(request) => reply(mls::commit_result(tx, request)?),
@@ -107,6 +156,15 @@ pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error
         Command::ResetGroup(request) => reply(mls::reset_group(tx, request)?),
         Command::Group(request) => reply(mls::group(tx, request)?),
         Command::Apply(request) => reply(mls::apply(tx, request)?),
+
+        Command::Encrypt(request) => reply(messages::encrypt(tx, request)?),
+        Command::Sent(request) => reply(messages::sent(tx, request)?),
+        Command::Discard(request) => reply(messages::discard(tx, request)?),
+        Command::Edit(request) => reply(messages::edit(tx, request)?),
+        Command::Delete(request) => reply(messages::delete(tx, request)?),
+        Command::Messages(request) => reply(messages::messages(tx, request)?),
+        Command::Search(request) => reply(messages::search(tx, request)?),
+        Command::WithoutDevices(request) => reply(messages::without_devices(tx, request)?),
     }
 }
 

@@ -352,6 +352,8 @@ impl World {
 #[derive(Clone, Default)]
 struct Commit {
     adds: Vec<(usize, usize)>,
+    /// Devices whose leaves the commit removes.
+    removes: Vec<(usize, usize)>,
     /// The member list after the commit; the context's other extensions stay.
     members: Option<MemberList>,
     /// Leaves out the proposals the server made.
@@ -457,6 +459,11 @@ impl Chat {
 
     /// `by` stages `commit`.
     fn stage(&mut self, by: (usize, usize), commit: Commit) -> Staged {
+        let removes: Vec<LeafNodeIndex> = commit
+            .removes
+            .iter()
+            .map(|&device| self.leaf(device))
+            .collect();
         let Chat { world, groups, .. } = self;
         let device = world.device(by);
         let group = groups.get_mut(&by).unwrap();
@@ -469,6 +476,7 @@ impl Chat {
         let mut builder = group
             .commit_builder()
             .propose_adds(commit.adds.iter().map(|&d| world.device(d).key_package()))
+            .propose_removals(removes)
             .force_self_update(true);
         if let Some(extensions) = extensions {
             builder = builder
@@ -988,6 +996,38 @@ fn create_takes_the_api_as_the_external_sender() {
         random_key().verifying_key().to_bytes().to_vec(),
     ));
     assert_eq!(code(&run(&request)), "context_changed");
+}
+
+#[test]
+fn a_member_takes_out_a_device_off_its_users_list() {
+    // The owner's two devices are in the group, and the API proposes no removal.
+    let world = World::new(&[2, 1, 1, 1]);
+    let members = world.list(Kind::Group, Some(O), &[O, A, B]);
+    let mut chat = Chat::start(world, members, (O, 0), &[(O, 1), (A, 0), (B, 0)]);
+    let second = chat.device_leaf((O, 1));
+    let removing_it = || Commit {
+        removes: vec![(O, 1)],
+        ..Commit::default()
+    };
+
+    // While the owner's list has its second device, no member takes that device's leaf out.
+    let refused = chat.submit((B, 0), removing_it());
+    assert_eq!(code(&refused), "leaf_removed_without_reason");
+
+    // Once the list doesn't, any member does, B here, though its commit brings none of the owner's
+    // leaves.
+    let owner = &mut chat.world.users[O];
+    owner.list = DeviceList::new(
+        owner.id,
+        public(&owner.identity),
+        2,
+        vec![owner.devices[0].id],
+    )
+    .sign(&owner.identity)
+    .unwrap();
+    let taken = chat.submit((B, 0), removing_it());
+    assert!(taken.ok, "refused: {:?}", taken.error);
+    assert_eq!(taken.change.unwrap().devices_removed, vec![second]);
 }
 
 #[test]
