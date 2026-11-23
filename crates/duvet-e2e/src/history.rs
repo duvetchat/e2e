@@ -308,7 +308,8 @@ pub(crate) fn catch_up(tx: &Tx<'_>, request: CatchUp) -> Result<Shared, Error> {
 /// newest that fit, in one package sealed to their devices. The note stays: the messages the
 /// package carried are kept by its ID, and their notes go only once the client says it delivered
 /// it (`catch_up_delivered`). Until then the user stays due, and a catch-up whose reply was lost is
-/// made again. Nothing noted that a catch-up can carry is `not_found` (`catch_up`).
+/// made again. Nothing noted that a catch-up can carry, or a user the client still counts as
+/// without a device, is `not_found` (`catch_up`).
 pub fn catch_up_within(
     tx: &Tx<'_>,
     conversation: Uuid,
@@ -319,14 +320,7 @@ pub fn catch_up_within(
     let own = sharing_with(tx, conversation, user, "user_id")?;
     // While the client still counts them as without a device, they're due nothing: the key would
     // go to devices that may never come, and the package's delivery would forget its notes.
-    let without: bool = tx.conn().query_row(
-        "SELECT EXISTS (SELECT 1 FROM deviceless_users WHERE conversation_id = ?1 AND user_id = ?2)",
-        params![
-            conversation.as_bytes().as_slice(),
-            user.as_bytes().as_slice()
-        ],
-        |row| row.get(0),
-    )?;
+    let without = has_no_device(tx, conversation, user)?;
     let scope = Scope::Noted { conversation, user };
     let mut noted = false;
     if !without {
@@ -377,8 +371,25 @@ pub fn catch_up_within(
 /// The client uploaded the catch-up `share_id` that this device made for `user_id` in
 /// `conversation_id`, and posted its keys: the notes of the messages it carried go, those of any
 /// other message stay for the next catch-up. One this device didn't make for them, or one already
-/// delivered, is `not_found` (`share`).
+/// delivered, is `not_found` (`share`). While the client counts the user as without a device, it's
+/// `not_found` (`catch_up`), as `catch_up` is: the package went to devices that are gone, so its
+/// notes stay for the next catch-up, and it can't be delivered later.
 pub(crate) fn catch_up_delivered(tx: &Tx<'_>, request: CatchUpDelivered) -> Result<Empty, Error> {
+    if has_no_device(tx, request.conversation_id, request.user_id)? {
+        let (conversation, user, share) = (
+            request.conversation_id.as_bytes().to_vec(),
+            request.user_id.as_bytes().to_vec(),
+            request.share_id.as_bytes().to_vec(),
+        );
+        tx.keep(move |conn| {
+            conn.execute(
+                "DELETE FROM catch_ups WHERE share_id = ?3 AND conversation_id = ?1 \
+                 AND user_id = ?2",
+                params![conversation, user, share],
+            )
+        });
+        return Err(not_found("catch_up"));
+    }
     let (conversation, user, share) = (
         request.conversation_id.as_bytes().as_slice(),
         request.user_id.as_bytes().as_slice(),
@@ -399,6 +410,18 @@ pub(crate) fn catch_up_delivered(tx: &Tx<'_>, request: CatchUpDelivered) -> Resu
         return Err(not_found("share"));
     }
     Ok(Empty {})
+}
+
+/// Whether the client counts `user` as without a device in `conversation` now (`without_devices`).
+fn has_no_device(tx: &Tx<'_>, conversation: Uuid, user: Uuid) -> Result<bool, Error> {
+    Ok(tx.conn().query_row(
+        "SELECT EXISTS (SELECT 1 FROM deviceless_users WHERE conversation_id = ?1 AND user_id = ?2)",
+        params![
+            conversation.as_bytes().as_slice(),
+            user.as_bytes().as_slice()
+        ],
+        |row| row.get(0),
+    )?)
 }
 
 /// This device, sending a package of `conversation` to `to` (`field`): another user than its

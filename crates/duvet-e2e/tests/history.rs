@@ -891,13 +891,13 @@ fn a_note_taken_again_outlives_an_older_delivery() {
     );
     server.deliver(&mut a1);
 
-    // The older package's delivery leaves that note: once B has a device again, B is due, and
-    // the next catch-up carries the edit.
+    // Once B has a device again, the older package's delivery leaves that note: B is due, and the
+    // next catch-up carries the edit.
+    ok(&mut a1.core, without(json!([])));
     ok(
         &mut a1.core,
         delivered(conversation, b, &caught["share_id"]),
     );
-    ok(&mut a1.core, without(json!([])));
     assert_eq!(due(&mut a1, conversation), json!([b]));
     let next = ok(&mut a1.core, catch_up_command(&server, conversation, b));
     let from = certificate(&server, a, a1.id);
@@ -1661,6 +1661,44 @@ fn a_delivery_is_of_one_member_in_one_conversation() {
     assert_eq!(due(&mut a1, conversation), json!([c]));
     ok(&mut a1.core, delivered(conversation, c, &for_c["share_id"]));
     assert_eq!(due(&mut a1, conversation), json!([]));
+}
+
+#[test]
+fn a_delivery_after_the_member_lost_their_devices_forgets_nothing() {
+    let mut server = FakeServer::new();
+    let (conversation, [a, b], mut a1) = deviceless_b(&mut server);
+    let missed = say(&mut server, &mut a1, conversation, "para cuando llegues");
+    let _b1 = first_device_joins(&mut server, b, conversation);
+    server.introduce(&mut a1);
+    server.deliver(&mut a1);
+    let caught = ok(&mut a1.core, catch_up_command(&server, conversation, b));
+
+    // B1 is gone before it takes the key, and the client says so. The package's delivery comes
+    // after: it was sealed to a device that's gone, so it forgets nothing.
+    ok(
+        &mut a1.core,
+        json!({"cmd": "without_devices", "conversation_id": conversation, "users": [b]}),
+    );
+    let refused = error(
+        &mut a1.core,
+        delivered(conversation, b, &caught["share_id"]),
+    );
+    assert_eq!(refusal(&refused), json!(["not_found", "catch_up"]));
+
+    // B's next device is due the message, and that package can't be delivered any more.
+    let mut b2 = first_device_joins(&mut server, b, conversation);
+    server.introduce(&mut a1);
+    server.deliver(&mut a1);
+    assert_eq!(due(&mut a1, conversation), json!([b]));
+    let late = error(
+        &mut a1.core,
+        delivered(conversation, b, &caught["share_id"]),
+    );
+    assert_eq!(refusal(&late), json!(["not_found", "share"]));
+    let next = ok(&mut a1.core, catch_up_command(&server, conversation, b));
+    let from = certificate(&server, a, a1.id);
+    assert_eq!(take_package(&mut server, &mut b2, &from, &next), 1);
+    assert_eq!(ids(&messages_of(&mut b2, conversation)), [missed]);
 }
 
 fn cbor(value: &impl serde::Serialize) -> Vec<u8> {
