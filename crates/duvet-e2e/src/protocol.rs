@@ -75,6 +75,7 @@ pub(crate) enum Command {
     // Messages.
     Encrypt(messages::Encrypt),
     Sent(messages::Sent),
+    Discard(messages::Discard),
     Edit(messages::Edit),
     Delete(messages::Delete),
     Messages(messages::ListMessages),
@@ -143,6 +144,7 @@ pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error
 
         Command::Encrypt(request) => reply(messages::encrypt(tx, request)?),
         Command::Sent(request) => reply(messages::sent(tx, request)?),
+        Command::Discard(request) => reply(messages::discard(tx, request)?),
         Command::Edit(request) => reply(messages::edit(tx, request)?),
         Command::Delete(request) => reply(messages::delete(tx, request)?),
         Command::Messages(request) => reply(messages::messages(tx, request)?),

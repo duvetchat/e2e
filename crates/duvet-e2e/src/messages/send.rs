@@ -2,6 +2,7 @@
 //! own and a deletion of its own. Each is kept here as it's made, before it leaves: once it's
 //! encrypted, not even this device can open it.
 
+use duvet_e2e_rules::MAX_PAST_EPOCHS;
 use openmls::prelude::tls_codec::Serialize as _;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,9 @@ use crate::{Envelope, Error, OwnDevice, Tx, mls};
 
 /// The longest nonce the API keeps, in characters.
 const MAX_NONCE: usize = 64;
+
+/// What refuses a retry whose ciphertext no member can open any more.
+const STALE_MESSAGE: &str = "stale_message";
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct Encrypt {
@@ -42,6 +46,12 @@ pub(crate) struct Sent {
     message_id: Uuid,
     /// The message's number in the conversation's queue.
     seq: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct Discard {
+    /// The nonce the message was encrypted under.
+    nonce: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,6 +140,12 @@ pub(crate) fn encrypt(tx: &Tx<'_>, request: Encrypt) -> Result<Encrypted, Error>
 
 /// `encrypt` again under a nonce it took: the same ciphertext while the message waits in the outbox,
 /// for the same message in the same conversation. Once its copy came back, the nonce is spent.
+///
+/// A ciphertext no member can open any more is `stale_message`, and the message stays as it is:
+/// the group's generation changed since (a reset), or its epoch moved more than `MAX_PAST_EPOCHS`
+/// past the ciphertext's. The client then drops it (`discard`) and encrypts its text again under a
+/// new nonce. Clients resend what's still pending in the order it was encrypted, before anything
+/// new: OpenMLS opens a message at most 5 generations behind its sender's latest.
 fn retry(
     tx: &Tx<'_>,
     nonce: &str,
@@ -155,12 +171,33 @@ fn retry(
         return Err(invalid("nonce", "the nonce was used for another message"));
     }
     let stored = || Error::Internal("a message waiting to be sent is malformed".into());
+    let generation = u32::try_from(generation).map_err(|_| stored())?;
+    let epoch = u64::try_from(epoch).map_err(|_| stored())?;
+    let group = mls::GroupRow::read(tx, conversation)?.ok_or_else(|| not_found("group"))?;
+    if generation != group.generation || group.epoch.saturating_sub(epoch) > MAX_PAST_EPOCHS as u64
+    {
+        return Err(Error::RuleViolation {
+            rule: STALE_MESSAGE.into(),
+        });
+    }
     Ok(Encrypted {
         ciphertext,
-        generation: u32::try_from(generation).map_err(|_| stored())?,
-        epoch: u64::try_from(epoch).map_err(|_| stored())?,
+        generation,
+        epoch,
         sender_device_id: own.device,
     })
+}
+
+/// Drops a message this device encrypted that has no ID yet, for a send that can't complete: the
+/// API refused it for good, or no member can open its ciphertext any more (`stale_message`). Its
+/// row goes, with its ciphertext and what was noted of it. One with an ID is deleted for everyone
+/// instead (`delete`).
+pub(crate) fn discard(tx: &Tx<'_>, request: Discard) -> Result<Empty, Error> {
+    let row = store::by_nonce(tx, &request.nonce)?
+        .filter(|row| row.status == Status::Pending && row.message_id.is_none())
+        .ok_or_else(|| not_found("message"))?;
+    store::forget(tx, &row)?;
+    Ok(Empty {})
 }
 
 /// The API's answer to a message this device sent: its ID and its number, bound to its nonce. The

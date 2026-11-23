@@ -488,6 +488,19 @@ pub(crate) fn erase(tx: &Tx<'_>, row: &Row) -> Result<(), Error> {
     Ok(())
 }
 
+/// A message this device encrypted and never sent, dropped: its row goes, and with it its mentions
+/// and its notes (the tables' cascade) and its words in the search index (the trigger); its
+/// ciphertext leaves the outbox.
+pub(crate) fn forget(tx: &Tx<'_>, row: &Row) -> Result<(), Error> {
+    tx.conn()
+        .execute("DELETE FROM messages WHERE id = ?1", [row.id])?;
+    if let Some(nonce) = &row.nonce {
+        tx.conn()
+            .execute("DELETE FROM outbox WHERE nonce = ?1", [nonce])?;
+    }
+    Ok(())
+}
+
 pub(crate) fn forget_edits(tx: &Tx<'_>, conversation: Uuid, message_id: Uuid) -> Result<(), Error> {
     tx.conn().execute(
         "DELETE FROM edits WHERE conversation_id = ?1 AND message_id = ?2",

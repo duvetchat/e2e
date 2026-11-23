@@ -118,6 +118,21 @@ fn send(
     message_id
 }
 
+fn discard(nonce: &str) -> Value {
+    json!({"cmd": "discard", "nonce": nonce})
+}
+
+/// How many rows a table of the device's database has.
+fn rows_in(device: &mut TestDevice, table: &str) -> i64 {
+    device.rolled_back(|tx| {
+        Ok(tx
+            .conn()
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })?)
+    })
+}
+
 /// The server labels the entry `seq` of `conversation`'s queue as the message `message_id`.
 fn label(server: &mut FakeServer, conversation: Uuid, seq: u64, message_id: Uuid) {
     let queue = &mut server.chats.get_mut(&conversation).unwrap().queue;
@@ -645,6 +660,110 @@ fn a_deletion_this_user_made_first_holds() {
         );
         assert_eq!(stored(&mut b1, id), (None, None));
     }
+}
+
+#[test]
+fn discard_drops_a_message_the_api_never_took() {
+    let (mut server, conversation, [_, b], [mut a1, _]) = dm();
+    ok(
+        &mut a1.core,
+        json!({"cmd": "without_devices", "conversation_id": conversation, "users": [b]}),
+    );
+
+    // The API refuses A1's message for good: A1 drops it, with its ciphertext and its note for B.
+    let envelope = json!({"text": "no se pudo enviar"});
+    ok(
+        &mut a1.core,
+        encrypt(conversation, "refused", envelope.clone()),
+    );
+    assert_eq!(rows_in(&mut a1, "deviceless"), 1);
+    ok(&mut a1.core, discard("refused"));
+    assert_eq!(messages_of(&mut a1, conversation), Vec::<Value>::new());
+    for table in ["outbox", "deviceless"] {
+        assert_eq!(rows_in(&mut a1, table), 0, "{table}");
+    }
+    let gone = error(&mut a1.core, discard("refused"));
+    assert_eq!(
+        (&gone["code"], &gone["what"]),
+        (&json!("not_found"), &json!("message"))
+    );
+
+    // A message the API gave an ID isn't dropped: it's deleted for everyone.
+    let (nonce, id, seq) = posted(
+        &mut server,
+        &mut a1,
+        conversation,
+        json!({"text": "este sí"}),
+        &[],
+    );
+    ok(&mut a1.core, sent_command(conversation, &nonce, id, seq));
+    let refused = error(&mut a1.core, discard(&nonce));
+    assert_eq!(
+        (&refused["code"], &refused["what"]),
+        (&json!("not_found"), &json!("message"))
+    );
+    assert_eq!(
+        message(&mut a1, conversation, id).unwrap()["text"],
+        "este sí"
+    );
+}
+
+#[test]
+fn a_retry_no_one_could_open_is_stale() {
+    let (mut server, conversation, [a, b], [mut a1, mut b1]) = dm();
+    let envelope = json!({"text": "llega tarde"});
+    let first = ok(
+        &mut a1.core,
+        encrypt(conversation, "late", envelope.clone()),
+    );
+    assert_eq!(first["epoch"], 1);
+
+    // Five epochs on, the members still open it: the retry is the same ciphertext. Six, and none
+    // can: the retry is refused, and the message stays as it was.
+    for round in 1..=6 {
+        server
+            .commit(&mut a1, conversation, command("refresh", conversation))
+            .unwrap();
+        server.deliver_all(&mut [&mut a1, &mut b1]);
+        if round == 5 {
+            let again = ok(
+                &mut a1.core,
+                encrypt(conversation, "late", envelope.clone()),
+            );
+            assert_eq!(again, first);
+        }
+    }
+    let stale = error(
+        &mut a1.core,
+        encrypt(conversation, "late", envelope.clone()),
+    );
+    assert_eq!(
+        (&stale["code"], &stale["rule"]),
+        (&json!("rule_violation"), &json!("stale_message"))
+    );
+    assert_eq!(messages_of(&mut a1, conversation)[0]["status"], "pending");
+
+    // The client drops it and encrypts its text again, under a new nonce.
+    ok(&mut a1.core, discard("late"));
+    let renewed = ok(
+        &mut a1.core,
+        encrypt(conversation, &new_nonce(), envelope.clone()),
+    );
+    assert_eq!(renewed["epoch"], 7);
+
+    // After a reset, the group the ciphertext is of is gone.
+    ok(
+        &mut a1.core,
+        encrypt(conversation, "reset", envelope.clone()),
+    );
+    let reset = json!({
+        "cmd": "reset_group",
+        "conversation_id": conversation,
+        "key_packages": server.claim(&[a, b]),
+    });
+    server.commit(&mut a1, conversation, reset).unwrap();
+    let stale = error(&mut a1.core, encrypt(conversation, "reset", envelope));
+    assert_eq!(stale["rule"], "stale_message");
 }
 
 #[test]

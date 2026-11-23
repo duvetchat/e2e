@@ -31,7 +31,7 @@ pub use signed::{
 pub const SUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
 /// The past epochs a group keeps secrets for, so a message that arrives late still opens.
-const MAX_PAST_EPOCHS: usize = 5;
+pub const MAX_PAST_EPOCHS: usize = 5;
 
 /// A conversation's MLS group ID: its 16 bytes, then its generation (u32, big-endian).
 pub fn group_id(conversation: Uuid, generation: u32) -> GroupId {
