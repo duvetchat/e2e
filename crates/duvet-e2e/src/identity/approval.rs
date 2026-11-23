@@ -14,7 +14,8 @@
 //!   the two codes match:
 //!   1. the new device sends its request and the commitment, SHA-256("duvet approval commit v1"
 //!      || key || nonce), with its other key and 32 random bytes as the nonce, and keeps both;
-//!   2. the approver answers with its offer: its certificate, and 32 random bytes of its own;
+//!   2. the approver answers with its offer: its certificate, and 32 random bytes of its own (the
+//!      same commitment again gets the same offer);
 //!   3. only then does the new device reveal the key and the nonce, which the approver holds to
 //!      the commitment;
 //!   4. both show 6 digits: the first 8 bytes of SHA-256("duvet approval code v1" || key ||
@@ -335,7 +336,9 @@ pub(crate) struct Offered {
 
 /// The approver's answer to a new device's commitment: its certificate, and a nonce of its own
 /// drawn for this attempt. It approves only a device of its own user that isn't on the user's
-/// list yet. The approver's attempt before it, if any, is over.
+/// list yet. The approver's attempt before it, if any, is over; but the commitment of the attempt
+/// under way, sent again (the same request and hash), gets the same offer, its nonce included, so
+/// sending a commitment again is no new try at the code.
 pub(crate) fn approval_offer(tx: &mut Tx<'_>, request: ApprovalOffer) -> Result<Offered, Error> {
     let commitment: Commitment = from_cbor(&request.commitment)
         .filter(|commitment: &Commitment| commitment.v == 1)
@@ -348,16 +351,19 @@ pub(crate) fn approval_offer(tx: &mut Tx<'_>, request: ApprovalOffer) -> Result<
     };
     let approver = Approver::of(tx)?;
     approver.may_approve(&asked)?;
+    if let Some((_, _, approving)) = current::<Approving>(tx, APPROVER)?
+        && approving.hash == commitment.hash
+        && approving.asked == asked
+    {
+        return Ok(Offered {
+            offer: offer_of(&approving.hash, &approving.answer)?,
+        });
+    }
     let answer = Answer {
         certificate: approver.certificate,
         nonce: thirty_two(&random(tx.provider().rand(), 32)?)?,
     };
-    let offer = to_cbor(&Offer {
-        v: 1,
-        hash: commitment.hash,
-        certificate: answer.certificate.clone(),
-        nonce: answer.nonce,
-    })?;
+    let offer = offer_of(&commitment.hash, &answer)?;
     let capacity = FIXED_PARTS + answer.certificate.len();
     let approving = Approving {
         asked,
@@ -373,6 +379,16 @@ pub(crate) fn approval_offer(tx: &mut Tx<'_>, request: ApprovalOffer) -> Result<
         &to_secret_cbor(&approving, capacity)?,
     )?;
     Ok(Offered { offer })
+}
+
+/// The offer that answers the commitment `hash` with `answer`.
+fn offer_of(hash: &[u8; 32], answer: &Answer) -> Result<Vec<u8>, Error> {
+    to_cbor(&Offer {
+        v: 1,
+        hash: *hash,
+        certificate: answer.certificate.clone(),
+        nonce: answer.nonce,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -898,6 +914,14 @@ fn same_code(code: &str, typed: &str) -> bool {
 /// The attempt of `role` under way, with its row's ID and the time it ends. One 10 minutes old is
 /// gone (`not_found`, `approval`).
 fn under_way<T: DeserializeOwned>(tx: &Tx<'_>, role: &str) -> Result<(Vec<u8>, i64, T), Error> {
+    current(tx, role)?.ok_or_else(|| not_found("approval"))
+}
+
+/// The attempt of `role` under way, if there's one.
+fn current<T: DeserializeOwned>(
+    tx: &Tx<'_>,
+    role: &str,
+) -> Result<Option<(Vec<u8>, i64, T)>, Error> {
     forget_ended(tx)?;
     let row: Option<(Vec<u8>, i64, Vec<u8>)> = tx
         .conn()
@@ -907,11 +931,13 @@ fn under_way<T: DeserializeOwned>(tx: &Tx<'_>, role: &str) -> Result<(Vec<u8>, i
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let (id, expires_at, state) = row.ok_or_else(|| not_found("approval"))?;
+    let Some((id, expires_at, state)) = row else {
+        return Ok(None);
+    };
     let state = Zeroizing::new(state);
     let state = from_secret_cbor(&state)
         .ok_or_else(|| Error::Internal("a stored approval is malformed".into()))?;
-    Ok((id, expires_at, state))
+    Ok(Some((id, expires_at, state)))
 }
 
 /// Keeps `state` as the attempt of `role`, in place of any other, until `expires_at`.

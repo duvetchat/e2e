@@ -625,6 +625,34 @@ fn confirm_takes_the_code_the_person_compared() {
 }
 
 #[test]
+fn the_same_commitment_gets_the_same_offer() {
+    let mut server = FakeServer::new();
+    let a = new_id();
+    let (mut a1, _) = server.first_device(a);
+    let mut n = server.bare_device(a);
+    let begun = begin(&mut n);
+
+    // A commitment the approver answered, sent again within its attempt's lifetime, gets the same
+    // offer, its nonce included: no new try at the code.
+    let offered = ok(&mut a1.core, offer(&begun["commitment"]));
+    assert_eq!(ok(&mut a1.core, offer(&begun["commitment"])), offered);
+    // Also once its reveal held: the attempt the person compared stays as it was.
+    let revealed = ok(&mut n.core, reveal(&offered["offer"]));
+    let checked = ok(&mut a1.core, check(&revealed["reveal"]));
+    server.clock.advance(TEN_MINUTES_MS - 1);
+    assert_eq!(ok(&mut a1.core, offer(&begun["commitment"])), offered);
+    ok(&mut a1.core, confirm(checked["code"].as_str().unwrap()));
+
+    // Once the attempt is over, the same commitment begins another, with a nonce of its own.
+    let mut m = server.bare_device(a);
+    let begun = begin(&mut m);
+    let offered = ok(&mut a1.core, offer(&begun["commitment"]));
+    server.clock.advance(TEN_MINUTES_MS);
+    let again: Offer = read(&ok(&mut a1.core, offer(&begun["commitment"]))["offer"]);
+    assert_ne!(again.nonce, read::<Offer>(&offered["offer"]).nonce);
+}
+
+#[test]
 fn server_cannot_force_the_code() {
     let mut server = FakeServer::new();
     let a = new_id();
