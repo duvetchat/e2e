@@ -1744,6 +1744,82 @@ fn an_edit_from_another_members_share_leaves_the_text() {
     assert_eq!(imported, 0);
 }
 
+#[test]
+fn another_members_edit_under_the_authors_number_keeps_nothing_out() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let (conversation, [mut a1, mut c1]) = group_of(&mut server, [a, c]);
+
+    // A writes and edits it; C sees the edit's number in the queue.
+    let message = say(&mut server, &mut a1, conversation, "lo que A escribió");
+    let edited = ok(
+        &mut a1.core,
+        json!({
+            "cmd": "edit",
+            "conversation_id": conversation,
+            "message_id": message,
+            "text": "lo que A corrigió",
+        }),
+    );
+    let number = server.post_change(
+        &a1,
+        conversation,
+        "edit",
+        message,
+        bytes(&edited["ciphertext"]),
+    );
+    server.deliver_all(&mut [&mut a1, &mut c1]);
+
+    // B comes in after it.
+    let mut b1 = server.device(b);
+    server.publish(&mut b1);
+    server.introduce(&mut b1);
+    server.introduce(&mut a1);
+    server.introduce(&mut c1);
+    let add = adding(&mut server, conversation, b);
+    server.commit(&mut a1, conversation, add).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1]);
+
+    // C shares B an edit of A's message in C's own name, under the number of A's edit.
+    let forged = Record {
+        kind: RecordKind::Edit,
+        id: message,
+        seq: number,
+        user: c,
+        device: c1.id,
+        sent: server.clock.now_ms() as u64,
+        envelope: Envelope::Edit {
+            message_id: message,
+            text: "lo que C dice".into(),
+        }
+        .encode()
+        .unwrap(),
+        shared_by: None,
+        reply_to: None,
+    };
+    let deflated = miniz_oxide::deflate::compress_to_vec(&cbor(&vec![forged]), 6);
+    let command = package_of(&mut server, &mut c1, &mut b1, conversation, &deflated);
+    ok(&mut b1.core, command);
+
+    // A's share brings the message and A's own edit: B1 shows the edit, whatever C's under its
+    // number.
+    let shared = ok(
+        &mut a1.core,
+        json!({
+            "cmd": "history_share",
+            "conversation_id": conversation,
+            "to_user": b,
+            "range": "all",
+            "devices": certificates(&server, b),
+        }),
+    );
+    let from = certificate(&server, a, a1.id);
+    take_package(&mut server, &mut b1, &from, &shared);
+    let shown = messages_of(&mut b1, conversation);
+    assert_eq!(shown[0]["text"], "lo que A corrigió");
+    assert!(shown[0]["edited_at"].is_i64(), "{}", shown[0]);
+}
+
 fn cbor(value: &impl serde::Serialize) -> Vec<u8> {
     let mut out = Vec::new();
     ciborium::into_writer(value, &mut out).unwrap();

@@ -939,14 +939,18 @@ fn import_edit(
     if message_id != record.id {
         return Ok(false);
     }
+    // An edit is known by its message, its number and its author: another user's row under the
+    // same number neither stands in for the author's edit nor keeps it out.
     let known: Option<i64> = tx
         .conn()
         .query_row(
-            "SELECT id FROM edits WHERE conversation_id = ?1 AND message_id = ?2 AND seq = ?3",
+            "SELECT id FROM edits WHERE conversation_id = ?1 AND message_id = ?2 AND seq = ?3 \
+             AND user_id = ?4",
             params![
                 conversation.as_bytes().as_slice(),
                 message_id.as_bytes().as_slice(),
-                seq
+                seq,
+                record.user.as_bytes().as_slice()
             ],
             |row| row.get(0),
         )
