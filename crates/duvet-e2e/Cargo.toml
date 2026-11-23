@@ -41,6 +41,8 @@ web-time.workspace = true
 [features]
 # Hooks only tests reach (`Core::fail_next_commit`); the crate's own tests turn it on below.
 test-hooks = []
+# The private decoders, for the fuzz targets in `fuzz/` (`duvet_e2e::fuzzing`).
+fuzzing = []
 
 [dev-dependencies]
 duvet-e2e = { workspace = true, features = ["test-hooks"] }

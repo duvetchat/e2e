@@ -7,6 +7,8 @@ mod backup;
 mod direct;
 mod envelope;
 mod error;
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing;
 pub mod history;
 mod identity;
 pub mod messages;

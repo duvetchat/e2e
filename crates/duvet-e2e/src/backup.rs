@@ -558,12 +558,7 @@ struct Opened {
 /// another user's, or under an earlier key for a day on or after the one that key was replaced on),
 /// `decrypt_failed` (`segment`).
 fn open(tx: &Tx<'_>, data: &[u8]) -> Result<Opened, Error> {
-    let not_a_segment = || invalid("data", "the data isn't a segment this core reads");
-    let wire: Wire = from_cbor(data).ok_or_else(not_a_segment)?;
-    if wire.v != 1 || wire.key_id.len() != KEY_ID || wire.nonce.len() != NONCE {
-        return Err(not_a_segment());
-    }
-    let day = Day::parse(&wire.day).ok_or_else(not_a_segment)?;
+    let (wire, day) = read(data)?;
     let user = tx.own_user()?.ok_or_else(|| not_found("device"))?;
     if wire.user != user {
         return Err(unopened());
@@ -595,6 +590,24 @@ fn open(tx: &Tx<'_>, data: &[u8]) -> Result<Opened, Error> {
     })
 }
 
+/// A segment's header and its day, read before any key: what isn't a segment this core reads is
+/// `bad_command` (`data`).
+fn read(data: &[u8]) -> Result<(Wire, Day), Error> {
+    let not_a_segment = || invalid("data", "the data isn't a segment this core reads");
+    let wire: Wire = from_cbor(data).ok_or_else(not_a_segment)?;
+    if wire.v != 1 || wire.key_id.len() != KEY_ID || wire.nonce.len() != NONCE {
+        return Err(not_a_segment());
+    }
+    let day = Day::parse(&wire.day).ok_or_else(not_a_segment)?;
+    Ok((wire, day))
+}
+
+/// `read`, for the fuzz targets.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn read_segment(data: &[u8]) -> Result<(), Error> {
+    read(data).map(drop)
+}
+
 /// The deflate of `records`' CBOR, which takes `limit` bytes at most: past it, `too_large`.
 fn deflate(records: &[Record], limit: usize) -> Result<Zeroizing<Vec<u8>>, Error> {
     let plain = Zeroizing::new(to_cbor(&records)?);
@@ -609,7 +622,7 @@ fn deflate(records: &[Record], limit: usize) -> Result<Zeroizing<Vec<u8>>, Error
 }
 
 /// The records `deflated` holds, inflated to `limit` bytes at most: past it, `too_large`.
-fn records_in(deflated: &[u8], limit: usize) -> Result<Vec<Record>, Error> {
+pub(crate) fn records_in(deflated: &[u8], limit: usize) -> Result<Vec<Record>, Error> {
     let plain = match miniz_oxide::inflate::decompress_to_vec_with_limit(deflated, limit) {
         Ok(plain) => Zeroizing::new(plain),
         Err(mut error) => {

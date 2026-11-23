@@ -1261,3 +1261,106 @@ impl TestDevice {
         }
     }
 }
+
+impl TestDevice {
+    /// The file of the device's database, which every command commits to before it answers.
+    pub fn db_path(&self) -> std::path::PathBuf {
+        self._dir.path().join("core.db")
+    }
+}
+
+// A history package's import, for the tests that bound what an import holds (history_memory.rs,
+// hostile.rs).
+
+/// A group of A and B, a device each, both in it: its conversation and the devices.
+pub fn group(server: &mut FakeServer, a: Uuid, b: Uuid) -> (Uuid, TestDevice, TestDevice) {
+    let mut devices = [a, b].map(|user| server.device(user));
+    for device in &mut devices {
+        server.publish(device);
+    }
+    for device in &mut devices {
+        server.introduce(device);
+    }
+    let [mut a1, mut b1] = devices;
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+    let create = server.create_group(conversation);
+    server.commit(&mut a1, conversation, create).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    (conversation, a1, b1)
+}
+
+/// The certificates of `user`'s devices as the server serves them.
+pub fn certificates(server: &FakeServer, user: Uuid) -> Vec<Vec<u8>> {
+    server.observed(user)["certificates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(bytes)
+        .collect()
+}
+
+/// The certificate of `user`'s `device`, in base64.
+pub fn certificate(server: &FakeServer, user: Uuid, device: Uuid) -> String {
+    let found = certificates(server, user)
+        .into_iter()
+        .find(|signed| DeviceCertificate::read_unverified(signed).unwrap().device == device)
+        .expect("the device's certificate");
+    b64(&found)
+}
+
+/// A1's package of `deflated` records for B, whose key B1 takes: the command that imports it.
+pub fn import_of(
+    server: &FakeServer,
+    a1: &mut TestDevice,
+    b1: &mut TestDevice,
+    conversation: Uuid,
+    deflated: &[u8],
+) -> String {
+    import_package(server, a1, b1, conversation, |own, header| {
+        duvet_e2e::history::package(&own.signer, header, deflated)
+    })
+}
+
+/// The package `make` makes on A1 from its device and the share's header, sealed for B, whose key
+/// B1 takes: the command that imports it.
+pub fn import_package(
+    server: &FakeServer,
+    a1: &mut TestDevice,
+    b1: &mut TestDevice,
+    conversation: Uuid,
+    make: impl FnOnce(&duvet_e2e::OwnDevice, &duvet_e2e::history::Header) -> Result<Vec<u8>, Error>,
+) -> String {
+    use duvet_e2e::history::{self, Header, ShareKind};
+
+    let (a, b) = (a1.user, b1.user);
+    let devices = certificates(server, b);
+    let sealed = a1
+        .core
+        .transaction(|tx| {
+            let own = tx.own_device()?;
+            let header = Header {
+                kind: ShareKind::Share,
+                conversation,
+                user: a,
+                device: own.device,
+                to: b,
+            };
+            let package = make(&own, &header)?;
+            history::seal(tx, ShareKind::Share, conversation, b, &package, &devices)
+        })
+        .unwrap();
+    let shared = serde_json::to_value(&sealed).unwrap();
+    let key = json!({
+        "cmd": "receive_direct",
+        "message": shared["keys"][0]["message"],
+        "from_certificate": certificate(server, a, a1.id),
+    });
+    ok(&mut b1.core, key);
+    json!({
+        "cmd": "history_import",
+        "share_id": shared["share_id"],
+        "parts": shared["parts"],
+    })
+    .to_string()
+}

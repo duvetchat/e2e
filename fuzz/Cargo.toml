@@ -1,0 +1,72 @@
+[package]
+name = "duvet-e2e-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+ciborium = "0.2.2"
+duvet-e2e = { path = "../crates/duvet-e2e", features = ["fuzzing"] }
+duvet-e2e-rules = { path = "../crates/duvet-e2e-rules" }
+duvet-e2e-validator = { path = "../crates/duvet-e2e-validator" }
+libfuzzer-sys = "0.4"
+openmls_basic_credential = "=0.6.0"
+openmls_rust_crypto = "=0.6.0"
+openmls_traits = "=0.6.0"
+uuid = { version = "1", default-features = false, features = ["std"] }
+
+# A workspace of its own, with its own Cargo.lock: the repository's gates and `cargo deny` don't
+# build it.
+[workspace]
+
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parts"
+path = "fuzz_targets/parts.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "direct"
+path = "fuzz_targets/direct.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "segment"
+path = "fuzz_targets/segment.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "history"
+path = "fuzz_targets/history.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "validator_input"
+path = "fuzz_targets/validator_input.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signed"
+path = "fuzz_targets/signed.rs"
+test = false
+doc = false
+bench = false

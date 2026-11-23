@@ -1,1 +1,3 @@
 * text=auto eol=lf
+# The databases the compatibility test opens, kept byte for byte.
+*.sqlite binary

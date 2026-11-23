@@ -4,164 +4,17 @@
 //! counts them itself, and the tests read that count too.
 
 mod bombs;
+mod memory;
 mod support;
-
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use bombs::{bomb, record_head};
 use duvet_e2e::Envelope;
-use duvet_e2e::history::{self, Header, ShareKind};
+use duvet_e2e::history;
 use duvet_e2e::messages::{Record, RecordKind};
-use duvet_e2e_rules::{DeviceCertificate, Kind};
+use memory::{MIB, ONE_AT_A_TIME, peak_during};
 use serde_json::{Value, json};
 use support::*;
 use uuid::Uuid;
-
-/// What this binary holds now, and the most it held since the last measure began.
-static HELD: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
-
-struct Counting;
-
-// SAFETY: every call goes to the system's allocator as it came; the counters only watch.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: as the caller of `alloc` promised.
-        let block = unsafe { System.alloc(layout) };
-        if !block.is_null() {
-            grew(layout.size());
-        }
-        block
-    }
-
-    unsafe fn dealloc(&self, block: *mut u8, layout: Layout) {
-        // SAFETY: as the caller of `dealloc` promised.
-        unsafe { System.dealloc(block, layout) };
-        HELD.fetch_sub(layout.size(), Relaxed);
-    }
-
-    unsafe fn realloc(&self, block: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        // SAFETY: as the caller of `realloc` promised.
-        let moved = unsafe { System.realloc(block, layout, size) };
-        if !moved.is_null() {
-            if size > layout.size() {
-                grew(size - layout.size());
-            } else {
-                HELD.fetch_sub(layout.size() - size, Relaxed);
-            }
-        }
-        moved
-    }
-}
-
-fn grew(bytes: usize) {
-    let held = HELD.fetch_add(bytes, Relaxed) + bytes;
-    PEAK.fetch_max(held, Relaxed);
-}
-
-#[global_allocator]
-static COUNTING: Counting = Counting;
-
-/// One test at a time: each measures the whole binary.
-static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-
-const MIB: usize = 1024 * 1024;
-
-/// What `f` returns, and the most held at once while it ran beyond what was held as it began: by
-/// this binary's allocator, then by SQLite's, which keeps its own count (its pages, its sorts).
-fn peak_during<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
-    let base = HELD.load(Relaxed);
-    PEAK.store(base, Relaxed);
-    // SAFETY: SQLite reads and resets its memory counters under its own mutex, from any thread.
-    let sqlite_base = unsafe { rusqlite::ffi::sqlite3_memory_used() };
-    // SAFETY: as above; the reset makes the high-water mark what SQLite holds now.
-    unsafe { rusqlite::ffi::sqlite3_memory_highwater(1) };
-    let out = f();
-    // SAFETY: as above.
-    let sqlite_peak = unsafe { rusqlite::ffi::sqlite3_memory_highwater(0) };
-    let held = PEAK.load(Relaxed).saturating_sub(base);
-    let sqlite_held = usize::try_from(sqlite_peak - sqlite_base).unwrap_or(0);
-    (out, held, sqlite_held)
-}
-
-/// A group of A and B, a device each, both in it: its conversation and the devices.
-fn group(server: &mut FakeServer, a: Uuid, b: Uuid) -> (Uuid, TestDevice, TestDevice) {
-    let mut devices = [a, b].map(|user| server.device(user));
-    for device in &mut devices {
-        server.publish(device);
-    }
-    for device in &mut devices {
-        server.introduce(device);
-    }
-    let [mut a1, mut b1] = devices;
-    let conversation = new_id();
-    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
-    let create = server.create_group(conversation);
-    server.commit(&mut a1, conversation, create).unwrap();
-    server.deliver_all(&mut [&mut a1, &mut b1]);
-    (conversation, a1, b1)
-}
-
-/// The certificates of `user`'s devices as the server serves them.
-fn certificates(server: &FakeServer, user: Uuid) -> Vec<Vec<u8>> {
-    server.observed(user)["certificates"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(bytes)
-        .collect()
-}
-
-/// The certificate of `user`'s `device`, in base64.
-fn certificate(server: &FakeServer, user: Uuid, device: Uuid) -> String {
-    let found = certificates(server, user)
-        .into_iter()
-        .find(|signed| DeviceCertificate::read_unverified(signed).unwrap().device == device)
-        .expect("the device's certificate");
-    b64(&found)
-}
-
-/// A1's package of `deflated` records for B, whose key B1 takes: the command that imports it.
-fn import_of(
-    server: &FakeServer,
-    a1: &mut TestDevice,
-    b1: &mut TestDevice,
-    conversation: Uuid,
-    deflated: &[u8],
-) -> String {
-    let (a, b) = (a1.user, b1.user);
-    let devices = certificates(server, b);
-    let sealed = a1
-        .core
-        .transaction(|tx| {
-            let own = tx.own_device()?;
-            let header = Header {
-                kind: ShareKind::Share,
-                conversation,
-                user: a,
-                device: own.device,
-                to: b,
-            };
-            let package = history::package(&own.signer, &header, deflated)?;
-            history::seal(tx, ShareKind::Share, conversation, b, &package, &devices)
-        })
-        .unwrap();
-    let shared = serde_json::to_value(&sealed).unwrap();
-    let key = json!({
-        "cmd": "receive_direct",
-        "message": shared["keys"][0]["message"],
-        "from_certificate": certificate(server, a, a1.id),
-    });
-    ok(&mut b1.core, key);
-    json!({
-        "cmd": "history_import",
-        "share_id": shared["share_id"],
-        "parts": shared["parts"],
-    })
-    .to_string()
-}
 
 /// `count` messages of A1's of 4 KiB each, sent a millisecond apart: what deflates to little.
 fn messages_of_a(a: Uuid, a1: &TestDevice, count: u64) -> Vec<Record> {
