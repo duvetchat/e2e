@@ -1859,6 +1859,67 @@ fn a_delivery_to_devices_no_longer_listed_forgets_nothing() {
     assert_eq!(ids(&messages_of(&mut b2, conversation)), [missed]);
 }
 
+#[test]
+fn another_members_package_moves_no_message_to_another_author() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let (conversation, [mut a1, mut c1]) = group_of(&mut server, [a, c]);
+    let message = say(&mut server, &mut a1, conversation, "lo que A escribió");
+    server.deliver_all(&mut [&mut a1, &mut c1]);
+
+    // B comes in after it, and A's own share brings it.
+    let mut b1 = server.device(b);
+    server.publish(&mut b1);
+    server.introduce(&mut b1);
+    server.introduce(&mut a1);
+    server.introduce(&mut c1);
+    let add = adding(&mut server, conversation, b);
+    server.commit(&mut a1, conversation, add).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1]);
+    let shared = ok(
+        &mut a1.core,
+        json!({
+            "cmd": "history_share",
+            "conversation_id": conversation,
+            "to_user": b,
+            "range": "all",
+            "devices": certificates(&server, b),
+        }),
+    );
+    let from = certificate(&server, a, a1.id);
+    take_package(&mut server, &mut b1, &from, &shared);
+
+    // C then shares B a record of that message under C's own name.
+    let original = a1
+        .core
+        .transaction(|tx| duvet_e2e::messages::records_for(tx, conversation, 0, i64::MAX))
+        .unwrap()
+        .into_iter()
+        .find(|record| record.id == message)
+        .unwrap();
+    let claimed = Record {
+        user: c,
+        device: c1.id,
+        envelope: Envelope::Message {
+            text: Some("lo que C dice".into()),
+            attachments: Vec::new(),
+        }
+        .encode()
+        .unwrap(),
+        ..original
+    };
+    let deflated = miniz_oxide::deflate::compress_to_vec(&cbor(&vec![claimed]), 6);
+    let command = package_of(&mut server, &mut c1, &mut b1, conversation, &deflated);
+    let imported = ok(&mut b1.core, command)["imported"].clone();
+
+    // B1 keeps A's message, with A's text and its mark.
+    let shown = messages_of(&mut b1, conversation);
+    assert_eq!(shown[0]["user_id"], json!(a));
+    assert_eq!(shown[0]["text"], "lo que A escribió");
+    assert_eq!(shown[0]["shared_by"], json!(a));
+    assert_eq!(imported, 0);
+}
+
 fn cbor(value: &impl serde::Serialize) -> Vec<u8> {
     let mut out = Vec::new();
     ciborium::into_writer(value, &mut out).unwrap();

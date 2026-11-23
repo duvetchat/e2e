@@ -894,12 +894,15 @@ fn import_message(
         {
             return Ok(false);
         }
-        // Its author's own package outweighs a copy another member shared.
+        // Its author's own package outweighs a copy another member shared of their message: a copy
+        // of the same user's, as no package moves a message to another author.
         Some(row)
             if row.deleted
                 || row.status == Status::Waiting
                 || package.is_some_and(|sharer| {
-                    sharer == record.user && row.shared_by.is_some_and(|by| by != sharer)
+                    sharer == record.user
+                        && row.user == record.user
+                        && row.shared_by.is_some_and(|by| by != sharer)
                 }) =>
         {
             fill(
