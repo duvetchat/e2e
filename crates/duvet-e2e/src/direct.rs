@@ -220,6 +220,7 @@ pub(crate) fn receive_direct(tx: &mut Tx<'_>, request: ReceiveDirect) -> Result<
         identity::APPROVAL_TRANSFER => Ok(Received::ApprovalTransfer(identity::receive_transfer(
             tx,
             &request.message,
+            None,
         )?)),
         identity::ROTATION_TRANSFER => Ok(Received::RotationTransfer(identity::receive_rotation(
             tx,

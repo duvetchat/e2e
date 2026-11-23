@@ -52,6 +52,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::recover::{install, rule, signing, thirty_two};
+use super::rotate::{keep_previous, opened_previous};
 use super::{
     BACKUP_KEY, DEVICE_LIST, IDENTITY_SECRET, Identity, OwnDevice, from_cbor, invalid, meta_get,
     meta_put, not_found, random, to_cbor, unix_ms,
@@ -783,6 +784,11 @@ fn approve(tx: &Tx<'_>, asked: &Asked, key: &[u8; 32]) -> Result<Approved, Error
 pub(crate) struct ApprovalReceive {
     #[serde(with = "b64")]
     transfer: Vec<u8>,
+    /// The backup keys from before the current one that the server keeps for the user
+    /// (`rotate_keys`' `wrapped_previous_backup_keys`), when a rotation left any: the device keeps
+    /// them, to open the segments they encrypted.
+    #[serde(default, with = "b64::option")]
+    wrapped_previous_backup_keys: Option<Vec<u8>>,
 }
 
 #[derive(Serialize)]
@@ -793,7 +799,9 @@ pub(crate) struct Enrolled {
     certificate: Vec<u8>,
 }
 
-/// The transfer an approver sent this device, as `receive_direct` takes it.
+/// The transfer an approver sent this device, as `receive_direct` takes it, with the earlier backup
+/// keys the server keeps when given: what doesn't open with the transfer's backup key fails it whole,
+/// as `recover` does.
 pub(crate) fn approval_receive(
     tx: &mut Tx<'_>,
     request: ApprovalReceive,
@@ -805,7 +813,11 @@ pub(crate) fn approval_receive(
             "the message isn't an approval's transfer",
         ));
     }
-    receive_transfer(tx, &request.transfer)
+    receive_transfer(
+        tx,
+        &request.transfer,
+        request.wrapped_previous_backup_keys.as_deref(),
+    )
 }
 
 /// The transfer an approver sent this device, for its attempt under way. It counts only if it holds
@@ -814,8 +826,13 @@ pub(crate) fn approval_receive(
 /// both devices on it. Sealed to the QR's key, it comes from the device that scanned the QR. Sealed
 /// to the key the reveal disclosed, it counts only once the person typed here the approver's code
 /// (`not_found`, `code`, until then), and only from that approver. Then this device has the
-/// identity, its certificate, the list and the backup key.
-pub(crate) fn receive_transfer(tx: &Tx<'_>, message: &[u8]) -> Result<Enrolled, Error> {
+/// identity, its certificate, the list and the backup key, and the backup keys from before that
+/// `previous` seals, when given.
+pub(crate) fn receive_transfer(
+    tx: &Tx<'_>,
+    message: &[u8],
+    previous: Option<&[u8]>,
+) -> Result<Enrolled, Error> {
     let own = tx.own_device()?;
     if tx.own_identity_key()?.is_some() {
         return Err(Error::Exists {
@@ -902,6 +919,9 @@ pub(crate) fn receive_transfer(tx: &Tx<'_>, message: &[u8]) -> Result<Enrolled, 
     {
         return Err(rule("wrong_device"));
     }
+    let previous = previous
+        .map(|sealed| opened_previous(sealed, own.user, &transfer.backup_key.0))
+        .transpose()?;
 
     install(
         tx,
@@ -911,6 +931,9 @@ pub(crate) fn receive_transfer(tx: &Tx<'_>, message: &[u8]) -> Result<Enrolled, 
         &transfer.device_list,
         &transfer.backup_key.0,
     )?;
+    if let Some(keys) = &previous {
+        keep_previous(tx, own.user, &transfer.backup_key.0[..], keys)?;
+    }
     Ok(Enrolled {
         identity_key: identity.public.to_vec(),
         certificate: transfer.certificate,

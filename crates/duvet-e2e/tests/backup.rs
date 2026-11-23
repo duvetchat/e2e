@@ -1426,6 +1426,63 @@ fn a_device_late_to_a_rotation_builds_again_what_it_sealed_under_the_old_key() {
     assert_eq!(shown_ids(&mut a3, conversation), [hello]);
 }
 
+/// A new device of A, which A1 approves by its QR: the device, and `approval_from_qr`'s reply.
+fn approving(dm: &mut Dm) -> (TestDevice, Value) {
+    let mut device = dm.server.bare_device(dm.a);
+    let begun = ok(&mut device.core, json!({"cmd": "approval_begin"}));
+    let approved = ok(
+        &mut dm.a1.core,
+        json!({"cmd": "approval_from_qr", "qr": begun["qr"]}),
+    );
+    dm.server
+        .take_device(dm.a, &approved["certificate"], &approved["device_list"]);
+    (device, approved)
+}
+
+/// `approval_receive` of the transfer `approved` holds, with the earlier backup keys the server
+/// keeps.
+fn approval_taking(approved: &Value, previous: &Value) -> Value {
+    json!({
+        "cmd": "approval_receive",
+        "transfer": approved["transfer"],
+        "wrapped_previous_backup_keys": previous,
+    })
+}
+
+#[test]
+fn a_device_approved_after_a_rotation_opens_old_segments() {
+    let mut dm = dm();
+    let conversation = dm.conversation;
+    let (hello, old, old_key, rotated) = old_segment_then_rotation(&mut dm);
+    let sealed = rotated["wrapped_previous_backup_keys"].clone();
+
+    // A1 approves A2 after the change: A2 takes the transfer with the earlier keys the server
+    // keeps, and opens the segment written under the old key.
+    let (mut a2, approved) = approving(&mut dm);
+    ok(&mut a2.core, approval_taking(&approved, &sealed));
+    assert_eq!(earlier_keys(&mut a2), [old_key]);
+    assert_eq!(imported(&mut a2, &old["data"]), 1);
+    assert_eq!(shown_ids(&mut a2, conversation), [hello]);
+
+    // Earlier keys that don't open fail the approval whole: the device takes it again with the
+    // right ones.
+    let (mut a3, approved) = approving(&mut dm);
+    let mut tampered = bytes(&sealed);
+    *tampered.last_mut().unwrap() ^= 1;
+    let refused = error(
+        &mut a3.core,
+        approval_taking(&approved, &json!(b64(&tampered))),
+    );
+    assert_eq!(
+        refusal(&refused),
+        expect("decrypt_failed", "previous_backup_keys")
+    );
+    let status = ok(&mut a3.core, json!({"cmd": "status"}));
+    assert_eq!(status["has_identity"], false);
+    ok(&mut a3.core, approval_taking(&approved, &sealed));
+    assert_eq!(imported(&mut a3, &old["data"]), 1);
+}
+
 #[test]
 fn recovery_refuses_earlier_keys_that_dont_open() {
     let mut dm = dm();
