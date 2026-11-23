@@ -1820,6 +1820,45 @@ fn another_members_edit_under_the_authors_number_keeps_nothing_out() {
     assert!(shown[0]["edited_at"].is_i64(), "{}", shown[0]);
 }
 
+#[test]
+fn a_delivery_to_devices_no_longer_listed_forgets_nothing() {
+    let mut server = FakeServer::new();
+    let (conversation, [a, b], mut a1) = deviceless_b(&mut server);
+    let missed = say(&mut server, &mut a1, conversation, "para cuando llegues");
+    let b1 = first_device_joins(&mut server, b, conversation);
+    server.introduce(&mut a1);
+    server.deliver(&mut a1);
+    let caught = ok(&mut a1.core, catch_up_command(&server, conversation, b));
+
+    // Before it's delivered, B sets up B2, which enters the group and takes B1 off B's list. A1
+    // observes B, as a client does before confirming a delivery, and applies B2's commit.
+    let mut b2 = first_device_joins(&mut server, b, conversation);
+    let signed = ok(
+        &mut b2.core,
+        json!({"cmd": "sign_device_list", "remove": [b1.id]}),
+    );
+    server.take_list(b, &signed["device_list"]);
+    ok(&mut a1.core, server.observed(b));
+    server.deliver(&mut a1);
+    assert_eq!(due(&mut a1, conversation), json!([b]));
+
+    // The package went to B1 alone, which is no longer B's: its delivery forgets nothing.
+    let refused = error(
+        &mut a1.core,
+        delivered(conversation, b, &caught["share_id"]),
+    );
+    assert_eq!(refusal(&refused), json!(["not_found", "catch_up"]));
+    assert_eq!(due(&mut a1, conversation), json!([b]));
+
+    // The next goes to B2, which is listed: its delivery forgets the note, as before.
+    let next = ok(&mut a1.core, catch_up_command(&server, conversation, b));
+    let from = certificate(&server, a, a1.id);
+    assert_eq!(take_package(&mut server, &mut b2, &from, &next), 1);
+    ok(&mut a1.core, delivered(conversation, b, &next["share_id"]));
+    assert_eq!(due(&mut a1, conversation), json!([]));
+    assert_eq!(ids(&messages_of(&mut b2, conversation)), [missed]);
+}
+
 fn cbor(value: &impl serde::Serialize) -> Vec<u8> {
     let mut out = Vec::new();
     ciborium::into_writer(value, &mut out).unwrap();

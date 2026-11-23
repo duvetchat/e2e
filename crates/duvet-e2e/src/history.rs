@@ -33,7 +33,7 @@ use miniz_oxide::inflate::stream::{InflateState, inflate};
 use miniz_oxide::{DataFormat, MZFlush, MZStatus};
 use openmls_traits::OpenMlsProvider;
 use openmls_traits::signatures::Signer;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -308,10 +308,10 @@ pub(crate) fn catch_up(tx: &Tx<'_>, request: CatchUp) -> Result<Shared, Error> {
 /// `catch_up` with the sealed package held to `limit` bytes (the command's is `MAX_PACKAGE`): what
 /// this device noted for `user` in `conversation` under the identity it pins for them now, the
 /// newest that fit, in one package sealed to their devices. The note stays: the messages the
-/// package carried are kept by its ID, and their notes go only once the client says it delivered
-/// it (`catch_up_delivered`). Until then the user stays due, and a catch-up whose reply was lost is
-/// made again. Nothing noted that a catch-up can carry, or a user the client still counts as
-/// without a device, is `not_found` (`catch_up`).
+/// package carried, and the devices it was sealed to, are kept by its ID, and the notes go only
+/// once the client says it delivered it (`catch_up_delivered`). Until then the user stays due, and
+/// a catch-up whose reply was lost is made again. Nothing noted that a catch-up can carry, or a
+/// user the client still counts as without a device, is `not_found` (`catch_up`).
 pub fn catch_up_within(
     tx: &Tx<'_>,
     conversation: Uuid,
@@ -345,10 +345,25 @@ pub fn catch_up_within(
     let (shared, from) = pack(tx, &own, &header, &scope, None, limit, &recipients)?;
     // A catch-up the server no longer keeps can't be delivered: its record goes, and its messages'
     // notes stay for another.
+    let kept_since = tx.now().saturating_sub(PACKAGE_KEPT_MS);
+    tx.conn()
+        .execute("DELETE FROM catch_ups WHERE created_at < ?1", [kept_since])?;
     tx.conn().execute(
-        "DELETE FROM catch_ups WHERE created_at < ?1",
-        [tx.now().saturating_sub(PACKAGE_KEPT_MS)],
+        "DELETE FROM catch_up_devices WHERE created_at < ?1",
+        [kept_since],
     )?;
+    // The devices it was sealed to: its delivery forgets notes only while one of them is theirs.
+    for key in &shared.sealed.keys {
+        tx.conn().execute(
+            "INSERT OR IGNORE INTO catch_up_devices (share_id, device_id, created_at) \
+             VALUES (?1, ?2, ?3)",
+            params![
+                shared.sealed.share_id.as_bytes().as_slice(),
+                key.device_id.as_bytes().as_slice(),
+                tx.now(),
+            ],
+        )?;
+    }
     // The messages it carried, as `each_record` chose them, with their notes' count.
     tx.conn().execute(
         &format!(
@@ -373,30 +388,33 @@ pub fn catch_up_within(
 /// The client uploaded the catch-up `share_id` that this device made for `user_id` in
 /// `conversation_id`, and posted its keys: the notes of the messages it carried go, those of any
 /// other message stay for the next catch-up. One this device didn't make for them, or one already
-/// delivered, is `not_found` (`share`). While the client counts the user as without a device, it's
-/// `not_found` (`catch_up`), as `catch_up` is: the package went to devices that are gone, so its
-/// notes stay for the next catch-up, and it can't be delivered later.
+/// delivered, is `not_found` (`share`). When no device of theirs may open it, it's `not_found`
+/// (`catch_up`), as `catch_up` is: the client counts the user as without a device, or none of the
+/// devices it was sealed to is on their list as this device holds it (the client observes them
+/// before confirming, so the list is current). Then its notes stay for the next catch-up, and it
+/// can't be delivered later.
 pub(crate) fn catch_up_delivered(tx: &Tx<'_>, request: CatchUpDelivered) -> Result<Empty, Error> {
-    if has_no_device(tx, request.conversation_id, request.user_id)? {
-        let (conversation, user, share) = (
-            request.conversation_id.as_bytes().to_vec(),
-            request.user_id.as_bytes().to_vec(),
-            request.share_id.as_bytes().to_vec(),
-        );
-        tx.keep(move |conn| {
-            conn.execute(
-                "DELETE FROM catch_ups WHERE share_id = ?3 AND conversation_id = ?1 \
-                 AND user_id = ?2",
-                params![conversation, user, share],
-            )
-        });
-        return Err(not_found("catch_up"));
-    }
     let (conversation, user, share) = (
         request.conversation_id.as_bytes().as_slice(),
         request.user_id.as_bytes().as_slice(),
         request.share_id.as_bytes().as_slice(),
     );
+    let made: bool = tx.conn().query_row(
+        "SELECT EXISTS (SELECT 1 FROM catch_ups WHERE share_id = ?3 AND conversation_id = ?1 \
+         AND user_id = ?2)",
+        params![conversation, user, share],
+        |row| row.get(0),
+    )?;
+    if !made {
+        return Err(not_found("share"));
+    }
+    if has_no_device(tx, request.conversation_id, request.user_id)?
+        || !sealed_to_listed(tx, request.share_id, request.user_id)?
+    {
+        let (conversation, user, share) = (conversation.to_vec(), user.to_vec(), share.to_vec());
+        tx.keep(move |conn| forget_package(conn, &conversation, &user, &share));
+        return Err(not_found("catch_up"));
+    }
     // A note taken again since the package was made (an edit) has more to bring: it stays.
     tx.conn().execute(
         "DELETE FROM deviceless WHERE conversation_id = ?1 AND user_id = ?2 AND EXISTS \
@@ -404,14 +422,45 @@ pub(crate) fn catch_up_delivered(tx: &Tx<'_>, request: CatchUpDelivered) -> Resu
          AND c.user_id = ?2 AND c.message = deviceless.message AND c.taken = deviceless.taken)",
         params![conversation, user, share],
     )?;
-    let delivered = tx.conn().execute(
+    forget_package(tx.conn(), conversation, user, share)?;
+    Ok(Empty {})
+}
+
+/// Whether one of the devices the catch-up `share` was sealed to is on `user`'s list, as this
+/// device holds it.
+fn sealed_to_listed(tx: &Tx<'_>, share: Uuid, user: Uuid) -> Result<bool, Error> {
+    let Some(list) = tx.device_list_of(user)? else {
+        return Ok(false);
+    };
+    let mut statement = tx
+        .conn()
+        .prepare("SELECT device_id FROM catch_up_devices WHERE share_id = ?1")?;
+    let devices = statement
+        .query_map([share.as_bytes().as_slice()], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for device in devices {
+        if list.contains(stored_uuid(&device)?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Drops the record of the catch-up `share` made for `user` in `conversation`: the messages it
+/// carried and the devices it was sealed to.
+fn forget_package(
+    conn: &Connection,
+    conversation: &[u8],
+    user: &[u8],
+    share: &[u8],
+) -> rusqlite::Result<usize> {
+    conn.execute("DELETE FROM catch_up_devices WHERE share_id = ?1", [share])?;
+    conn.execute(
         "DELETE FROM catch_ups WHERE share_id = ?3 AND conversation_id = ?1 AND user_id = ?2",
         params![conversation, user, share],
-    )?;
-    if delivered == 0 {
-        return Err(not_found("share"));
-    }
-    Ok(Empty {})
+    )
 }
 
 /// Whether the client counts `user` as without a device in `conversation` now (`without_devices`).

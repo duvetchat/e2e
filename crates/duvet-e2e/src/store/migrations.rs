@@ -233,6 +233,15 @@ CREATE TABLE catch_ups (
     PRIMARY KEY (share_id, message)
 );
 
+-- The devices each catch-up this device made was sealed to: its delivery forgets notes only while
+-- one of them is on the member's list.
+CREATE TABLE catch_up_devices (
+    share_id BLOB NOT NULL,
+    device_id BLOB NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (share_id, device_id)
+);
+
 -- A conversation's messages and edits by time, then number: the order a history package carries
 -- them in, which a share or a catch-up reads without a sort.
 CREATE INDEX messages_by_time ON messages (conversation_id, sent_at, seq);
