@@ -399,22 +399,22 @@ fn sender_key(sender: &ExternalSender) -> Result<Vec<u8>, RuleViolation> {
 }
 
 /// Whether `list`, the member list of a group a device joins past the founding, keeps to `record`,
-/// the device's record of the conversation from before the cutover: the same kind and, in a group,
-/// every user listed the record's, in any order, and the record's owner, while listed, the owner.
-/// A group's entries are whatever the last commit's maker wrote, so only who is listed counts: a
-/// user the owner added since the cutover is refused too, as nothing in the list tells that
-/// addition from a planted one. In a DM, the users listed as entered at the generation's start are
-/// the record's, in its order.
+/// the device's record of the conversation from before the cutover. The list's entries are
+/// whatever the last commit's maker wrote, so only its kind and who it lists count. A DM's two
+/// users never change: they're the record's, in its order. In a group, every user listed is the
+/// record's, in any order, and the record's owner, while listed, is the owner: a user the owner
+/// added since the cutover is refused too, as nothing in the list tells that addition from a
+/// planted one.
 pub fn keeps_record(list: &MemberList, record: &MemberList) -> bool {
+    let users = |list: &MemberList| {
+        list.users
+            .iter()
+            .map(|entry| entry.user)
+            .collect::<Vec<_>>()
+    };
     let users_kept = match record.kind {
+        Kind::Dm => users(list) == users(record),
         Kind::Group => list.users.iter().all(|entry| record.contains(entry.user)),
-        Kind::Dm => {
-            let mut recorded = record.users.iter().map(|entry| entry.user);
-            list.users
-                .iter()
-                .filter(|entry| entry.epoch == 0)
-                .all(|entry| recorded.any(|user| user == entry.user))
-        }
     };
     let owner_kept = record
         .owner

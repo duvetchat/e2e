@@ -616,6 +616,36 @@ fn planted_founder_is_refused_on_an_external_join() {
 }
 
 #[test]
+fn swapped_dm_user_is_refused_in_a_later_welcome() {
+    let mut server = FakeServer::new();
+    let (mut a1, _, conversation, entry, _) = planted_founder(&mut server, Kind::Dm);
+
+    // A's client recorded the DM with B. The server's device made it with X, and lists X as
+    // entered at the commit that brings A1. A DM's users never change: A1 refuses the welcome.
+    let seq = entry["seq"].clone();
+    let refused = ok(&mut a1.core, apply(conversation, &[entry]));
+    assert_eq!(
+        results(&[refused]),
+        [json!([seq, "welcome", "rejected", "member_list_mismatch"])]
+    );
+    assert_eq!(a1.no_group(conversation)["what"], "group");
+}
+
+#[test]
+fn swapped_dm_user_is_refused_on_an_external_join() {
+    let mut server = FakeServer::new();
+    let (_, mut a2, conversation, _, join) = planted_founder(&mut server, Kind::Dm);
+
+    // A2 joins that DM by external commit, with A's record of it with B: refused.
+    let refused = error(&mut a2.core, join);
+    assert_eq!(
+        (&refused["code"], &refused["rule"]),
+        (&json!("rule_violation"), &json!("member_list_mismatch"))
+    );
+    assert_eq!(a2.no_group(conversation)["what"], "group");
+}
+
+#[test]
 fn planted_founder_is_refused_after_a_reset() {
     let mut server = FakeServer::new();
     let (a, b, x) = (new_id(), new_id(), new_id());

@@ -1439,6 +1439,38 @@ fn joined_list_keeps_to_the_record() {
 }
 
 #[test]
+fn joined_dm_keeps_to_the_record() {
+    // A device's record of a DM from before the cutover, and the lists of DMs it joins past the
+    // founding: a DM's users never change, so they must be the record's, whatever the entries say.
+    let (o, a, x) = (new_id(), new_id(), new_id());
+    let dm = |users: &[(Uuid, u64)]| {
+        let users = users
+            .iter()
+            .map(|&(user, epoch)| Entry {
+                user,
+                generation: 0,
+                epoch,
+            })
+            .collect();
+        MemberList::new(Kind::Dm, None, users)
+    };
+    let record = dm(&[(o, 0), (a, 0)]);
+    assert!(keeps_record(&dm(&[(o, 0), (a, 0)]), &record), "the record");
+    assert!(
+        !keeps_record(&dm(&[(o, 0), (x, 2)]), &record),
+        "X in A's place, entered later"
+    );
+    assert!(
+        !keeps_record(&dm(&[(o, 0), (x, 0)]), &record),
+        "X in A's place"
+    );
+    assert!(
+        !keeps_record(&dm(&[(a, 0), (o, 0)]), &record),
+        "the users the other way round"
+    );
+}
+
+#[test]
 fn member_list_rewrites_are_rejected() {
     let mut s = Scene::group();
     let ctx = s.world.context();
