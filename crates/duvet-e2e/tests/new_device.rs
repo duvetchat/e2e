@@ -665,21 +665,29 @@ fn the_same_commitment_gets_the_same_offer() {
     let mut server = FakeServer::new();
     let a = new_id();
     let (mut a1, _) = server.first_device(a);
-    let mut n = server.bare_device(a);
+    let (mut n, mut other) = (server.bare_device(a), server.bare_device(a));
     let begun = begin(&mut n);
+    let theirs = begin(&mut other);
 
-    // A commitment the approver answered, sent again within its attempt's lifetime, gets the same
-    // offer, its nonce included: no new try at the code.
+    // A commitment the approver answered, sent again within its 10 minutes, gets the same offer,
+    // its nonce included, whatever came between: no new try at the code.
     let offered = ok(&mut a1.core, offer(&begun["commitment"]));
     assert_eq!(ok(&mut a1.core, offer(&begun["commitment"])), offered);
-    // Also once its reveal held: the attempt the person compared stays as it was.
+    let between = ok(&mut a1.core, offer(&theirs["commitment"]));
+    assert_eq!(ok(&mut a1.core, offer(&begun["commitment"])), offered);
+    // It's the attempt under way again: its reveal holds. Then the one that came between gets its
+    // own answer again too, and back to the first, the code the person compared confirms it.
     let revealed = ok(&mut n.core, reveal(&offered["offer"]));
     let checked = ok(&mut a1.core, check(&revealed["reveal"]));
     server.clock.advance(TEN_MINUTES_MS - 1);
+    assert_eq!(ok(&mut a1.core, offer(&theirs["commitment"])), between);
     assert_eq!(ok(&mut a1.core, offer(&begun["commitment"])), offered);
-    ok(&mut a1.core, confirm(checked["code"].as_str().unwrap()));
+    let approved = ok(&mut a1.core, confirm(checked["code"].as_str().unwrap()));
+    let certificate = DeviceCertificate::read_unverified(&bytes(&approved["certificate"])).unwrap();
+    assert_eq!(certificate.device, n.id);
 
-    // Once the attempt is over, the same commitment begins another, with a nonce of its own.
+    // Once its 10 minutes are over, the same commitment begins another attempt, with a nonce of its
+    // own.
     let mut m = server.bare_device(a);
     let begun = begin(&mut m);
     let offered = ok(&mut a1.core, offer(&begun["commitment"]));

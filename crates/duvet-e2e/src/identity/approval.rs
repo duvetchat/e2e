@@ -33,8 +33,10 @@
 //!
 //! An attempt's state lasts 10 minutes by the core's clock, in `approvals`: the new device's
 //! (`new`) from `approval_begin`, and once it takes an offer, from that offer; the approver's
-//! (`approver`) from `approval_offer`, so the approver's window ends first. Each device has one at
-//! a time: a new attempt replaces the one before.
+//! (`approver`) from `approval_offer`, so the approver's window ends first. Each device has one
+//! attempt under way at a time: a new one replaces the one before. The approver's row also keeps
+//! each commitment it answered, with its answer, until that commitment's 10 minutes end, so one
+//! sent again gets the same answer.
 
 use std::fmt;
 
@@ -197,8 +199,64 @@ struct Attempt {
     accepted: bool,
 }
 
-/// The approver's attempt: the device it would approve, the commitment, its own answer, and what a
-/// reveal that held to the commitment settled.
+/// The approver's side: each commitment it answered, until that commitment's 10 minutes end, and
+/// among them, the attempt under way.
+#[derive(Default, Serialize, Deserialize)]
+struct Approvals {
+    answered: Vec<Approving>,
+}
+
+impl Approvals {
+    /// The commitments this device answered whose 10 minutes haven't ended.
+    fn of(tx: &Tx<'_>) -> Result<Approvals, Error> {
+        let mut approvals = current::<Approvals>(tx, APPROVER)?
+            .map(|(_, _, approvals)| approvals)
+            .unwrap_or_default();
+        let now = tx.now();
+        approvals
+            .answered
+            .retain(|approving| approving.expires_at > now);
+        Ok(approvals)
+    }
+
+    /// The attempt under way (`not_found`, `approval`, without one).
+    fn under_way(&mut self) -> Result<&mut Approving, Error> {
+        self.answered
+            .iter_mut()
+            .find(|approving| approving.under_way)
+            .ok_or_else(|| not_found("approval"))
+    }
+
+    /// Kept as one row, until the last commitment's 10 minutes end.
+    fn keep(&self, tx: &Tx<'_>) -> Result<(), Error> {
+        let Some(last) = self
+            .answered
+            .iter()
+            .map(|approving| approving.expires_at)
+            .max()
+        else {
+            tx.conn()
+                .execute("DELETE FROM approvals WHERE role = ?1", [APPROVER])?;
+            return Ok(());
+        };
+        let capacity = self
+            .answered
+            .iter()
+            .map(|approving| FIXED_PARTS + approving.answer.certificate.len())
+            .sum();
+        store(
+            tx,
+            APPROVER,
+            APPROVER.as_bytes(),
+            last,
+            &to_secret_cbor(self, capacity)?,
+        )
+    }
+}
+
+/// A commitment the approver answered: the device it would approve, the commitment's hash, the
+/// approver's answer, what a reveal that held to the commitment settled, when the commitment's 10
+/// minutes end, and whether it's the attempt under way.
 #[derive(Serialize, Deserialize)]
 struct Approving {
     asked: Asked,
@@ -206,6 +264,8 @@ struct Approving {
     hash: [u8; 32],
     answer: Answer,
     held: Option<Held>,
+    expires_at: i64,
+    under_way: bool,
 }
 
 /// What a reveal that held to the commitment settled: the key the transfer is sealed to, and the
@@ -336,10 +396,10 @@ pub(crate) struct Offered {
 }
 
 /// The approver's answer to a new device's commitment: its certificate, and a nonce of its own
-/// drawn for this attempt. It approves only a device of its own user that isn't on the user's
-/// list yet. The approver's attempt before it, if any, is over; but the commitment of the attempt
-/// under way, sent again (the same request and hash), gets the same offer, its nonce included, so
-/// sending a commitment again is no new try at the code.
+/// drawn for this commitment. It approves only a device of its own user that isn't on the user's
+/// list yet. The commitment becomes the attempt under way. One it answered before (the same
+/// request and hash) gets that same answer again, nonce included, until its 10 minutes end,
+/// whatever came between: sending a commitment again is no new try at the code.
 pub(crate) fn approval_offer(tx: &mut Tx<'_>, request: ApprovalOffer) -> Result<Offered, Error> {
     let commitment: Commitment = from_cbor(&request.commitment)
         .filter(|commitment: &Commitment| commitment.v == 1)
@@ -352,33 +412,34 @@ pub(crate) fn approval_offer(tx: &mut Tx<'_>, request: ApprovalOffer) -> Result<
     };
     let approver = Approver::of(tx)?;
     approver.may_approve(&asked)?;
-    if let Some((_, _, approving)) = current::<Approving>(tx, APPROVER)?
-        && approving.hash == commitment.hash
-        && approving.asked == asked
-    {
-        return Ok(Offered {
-            offer: offer_of(&approving.hash, &approving.answer)?,
-        });
+    let mut approvals = Approvals::of(tx)?;
+    let answered = approvals
+        .answered
+        .iter()
+        .position(|approving| approving.hash == commitment.hash && approving.asked == asked);
+    let at = match answered {
+        Some(at) => at,
+        None => {
+            approvals.answered.push(Approving {
+                asked,
+                hash: commitment.hash,
+                answer: Answer {
+                    certificate: approver.certificate,
+                    nonce: thirty_two(&random(tx.provider().rand(), 32)?)?,
+                },
+                held: None,
+                expires_at: tx.now().saturating_add(LIFETIME_MS),
+                under_way: false,
+            });
+            approvals.answered.len() - 1
+        }
+    };
+    for (index, approving) in approvals.answered.iter_mut().enumerate() {
+        approving.under_way = index == at;
     }
-    let answer = Answer {
-        certificate: approver.certificate,
-        nonce: thirty_two(&random(tx.provider().rand(), 32)?)?,
-    };
-    let offer = offer_of(&commitment.hash, &answer)?;
-    let capacity = FIXED_PARTS + answer.certificate.len();
-    let approving = Approving {
-        asked,
-        hash: commitment.hash,
-        answer,
-        held: None,
-    };
-    store(
-        tx,
-        APPROVER,
-        &commitment.hash,
-        tx.now().saturating_add(LIFETIME_MS),
-        &to_secret_cbor(&approving, capacity)?,
-    )?;
+    let approving = &approvals.answered[at];
+    let offer = offer_of(&approving.hash, &approving.answer)?;
+    approvals.keep(tx)?;
     Ok(Offered { offer })
 }
 
@@ -523,7 +584,8 @@ pub(crate) struct Checked {
 /// the new device's. A reveal that doesn't hold is `invalid_signature` (`reveal`), and leaves the
 /// attempt as it was.
 pub(crate) fn approval_check(tx: &mut Tx<'_>, request: ApprovalCheck) -> Result<Checked, Error> {
-    let (id, expires_at, mut approving) = under_way::<Approving>(tx, APPROVER)?;
+    let mut approvals = Approvals::of(tx)?;
+    let approving = approvals.under_way()?;
     let reveal: Reveal = from_cbor(&request.reveal)
         .filter(|reveal: &Reveal| reveal.v == 1)
         .ok_or_else(|| invalid("reveal", "the reveal isn't an approval's"))?;
@@ -544,14 +606,7 @@ pub(crate) fn approval_check(tx: &mut Tx<'_>, request: ApprovalCheck) -> Result<
             key: Bytes32(reveal.key),
             code: code.clone(),
         });
-        let capacity = FIXED_PARTS + approving.answer.certificate.len();
-        store(
-            tx,
-            APPROVER,
-            &id,
-            expires_at,
-            &to_secret_cbor(&approving, capacity)?,
-        )?;
+        approvals.keep(tx)?;
     }
     Ok(Checked { code })
 }
@@ -581,16 +636,19 @@ pub(crate) fn approval_confirm(
     tx: &mut Tx<'_>,
     request: ApprovalConfirm,
 ) -> Result<Approved, Error> {
-    let (_, _, approving) = under_way::<Approving>(tx, APPROVER)?;
+    let mut approvals = Approvals::of(tx)?;
+    let approving = approvals.under_way()?;
     let key = approving
         .held
         .as_ref()
         .filter(|held| same_code(&held.code, &request.code))
         .map(|held| held.key)
         .ok_or_else(|| not_found("code"))?;
-    tx.conn()
-        .execute("DELETE FROM approvals WHERE role = ?1", [APPROVER])?;
-    approve(tx, &approving.asked, &key.0)
+    let asked = approving.asked.clone();
+    // The attempt is over. The other commitments keep their answers until their 10 minutes end.
+    approvals.answered.retain(|approving| !approving.under_way);
+    approvals.keep(tx)?;
+    approve(tx, &asked, &key.0)
 }
 
 #[derive(Debug, Deserialize)]
