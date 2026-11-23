@@ -195,15 +195,23 @@ struct Attempt {
     accepted: bool,
 }
 
-/// The approver's attempt: the device it would approve, the commitment, its own answer, and the
-/// attempt's key once a reveal held to the commitment.
+/// The approver's attempt: the device it would approve, the commitment, its own answer, and what a
+/// reveal that held to the commitment settled.
 #[derive(Serialize, Deserialize)]
 struct Approving {
     asked: Asked,
     #[serde(with = "serde_bytes")]
     hash: [u8; 32],
     answer: Answer,
-    key: Option<Bytes32>,
+    held: Option<Held>,
+}
+
+/// What a reveal that held to the commitment settled: the key the transfer is sealed to, and the
+/// code both screens show.
+#[derive(Serialize, Deserialize)]
+struct Held {
+    key: Bytes32,
+    code: String,
 }
 
 /// 32 secret bytes, a key, wiped as they drop.
@@ -355,7 +363,7 @@ pub(crate) fn approval_offer(tx: &mut Tx<'_>, request: ApprovalOffer) -> Result<
         asked,
         hash: commitment.hash,
         answer,
-        key: None,
+        held: None,
     };
     store(
         tx,
@@ -505,8 +513,18 @@ pub(crate) fn approval_check(tx: &mut Tx<'_>, request: ApprovalCheck) -> Result<
             what: "reveal".into(),
         });
     }
-    if approving.key.is_none() {
-        approving.key = Some(Bytes32(reveal.key));
+    let code = code_digits(
+        &reveal.key,
+        &reveal.nonce,
+        &approving.answer.certificate,
+        &approving.asked,
+        &approving.answer.nonce,
+    );
+    if approving.held.is_none() {
+        approving.held = Some(Held {
+            key: Bytes32(reveal.key),
+            code: code.clone(),
+        });
         let capacity = FIXED_PARTS + approving.answer.certificate.len();
         store(
             tx,
@@ -516,15 +534,7 @@ pub(crate) fn approval_check(tx: &mut Tx<'_>, request: ApprovalCheck) -> Result<
             &to_secret_cbor(&approving, capacity)?,
         )?;
     }
-    Ok(Checked {
-        code: code_digits(
-            &reveal.key,
-            &reveal.nonce,
-            &approving.answer.certificate,
-            &approving.asked,
-            &approving.answer.nonce,
-        ),
-    })
+    Ok(Checked { code })
 }
 
 #[derive(Serialize)]
@@ -537,13 +547,28 @@ pub(crate) struct Approved {
     transfer: Vec<u8>,
 }
 
-/// The person saw both codes match: the approver certifies the new device, signs the user's next
-/// list with it on it, and seals the transfer to the attempt's key. The certificate and the list are
-/// for the server, the transfer for the new device's inbox. Before a reveal held to the commitment,
-/// there's no code that could have matched (`not_found`, `code`).
-pub(crate) fn approval_confirm(tx: &mut Tx<'_>) -> Result<Approved, Error> {
+#[derive(Debug, Deserialize)]
+pub(crate) struct ApprovalConfirm {
+    code: String,
+}
+
+/// The person saw both codes match, and confirms with the code they compared: the approver
+/// certifies the new device, signs the user's next list with it on it, and seals the transfer to
+/// the attempt's key. The certificate and the list are for the server, the transfer for the new
+/// device's inbox. A code that isn't the current attempt's confirms nothing (`not_found`, `code`):
+/// a notice taken after the person read the code has replaced the attempt they compared. Nor does
+/// one before a reveal held to the commitment, when no code could have matched.
+pub(crate) fn approval_confirm(
+    tx: &mut Tx<'_>,
+    request: ApprovalConfirm,
+) -> Result<Approved, Error> {
     let (_, _, approving) = under_way::<Approving>(tx, APPROVER)?;
-    let key = approving.key.ok_or_else(|| not_found("code"))?;
+    let key = approving
+        .held
+        .as_ref()
+        .filter(|held| same_code(&held.code, &request.code))
+        .map(|held| held.key)
+        .ok_or_else(|| not_found("code"))?;
     tx.conn()
         .execute("DELETE FROM approvals WHERE role = ?1", [APPROVER])?;
     approve(tx, &approving.asked, &key.0)

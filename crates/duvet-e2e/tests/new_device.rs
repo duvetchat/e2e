@@ -190,8 +190,9 @@ fn check(reveal: &Value) -> Value {
     json!({"cmd": "approval_check", "reveal": reveal})
 }
 
-fn confirm() -> Value {
-    json!({"cmd": "approval_confirm"})
+/// The person confirms on the approver, with the code they compared.
+fn confirm(code: &str) -> Value {
+    json!({"cmd": "approval_confirm", "code": code})
 }
 
 /// The person types on the new device the code the approver shows.
@@ -430,7 +431,7 @@ fn approval_by_code() {
         refusal(&refused),
         expect("exists", "identity exists already")
     );
-    let refused = error(&mut n.core, confirm());
+    let refused = error(&mut n.core, confirm("000000"));
     assert_eq!(refusal(&refused), expect("not_found", "approval"));
     // Nor is there a code to accept before an attempt, or before it took an offer.
     let refused = error(&mut n.core, accept("000000"));
@@ -487,7 +488,7 @@ fn approval_by_code() {
     // The person sees the codes match, and confirms on the approver: it hands the server the new
     // device's certificate and the next list, and the transfer for the new device's inbox. On the
     // new device, they type the code the approver shows.
-    let approved = ok(&mut a1.core, confirm());
+    let approved = ok(&mut a1.core, confirm(code));
     server.take_device(a, &approved["certificate"], &approved["device_list"]);
     server.post(n.id, bytes(&approved["transfer"]));
     let inbox = server.inbox(n.id);
@@ -538,7 +539,7 @@ fn approval_by_code() {
 
     // The attempt is over on both sides.
     assert_eq!(
-        refusal(&error(&mut a1.core, confirm())),
+        refusal(&error(&mut a1.core, confirm(code))),
         expect("not_found", "approval")
     );
     assert_eq!(
@@ -584,13 +585,43 @@ fn approval_rejects_a_reveal_that_breaks_the_commitment() {
     let refused = error(&mut a1.core, check(&json!(b64(b"not a reveal"))));
     assert_eq!(refusal(&refused), expect("bad_command", "reveal"));
 
-    // Nothing held, so there's no code to confirm.
-    let refused = error(&mut a1.core, confirm());
+    // Nothing held, so there's no code to confirm, not even the new device's own.
+    let refused = error(&mut a1.core, confirm(revealed["code"].as_str().unwrap()));
     assert_eq!(refusal(&refused), expect("not_found", "code"));
 
     // The new device's own reveal holds, and both show its code.
     let checked = ok(&mut a1.core, check(&revealed["reveal"]));
     assert_eq!(checked["code"], revealed["code"]);
+}
+
+#[test]
+fn confirm_takes_the_code_the_person_compared() {
+    let mut server = FakeServer::new();
+    let a = new_id();
+    let (mut a1, _) = server.first_device(a);
+    let (mut n1, mut n2) = (server.bare_device(a), server.bare_device(a));
+
+    // The person reads the code of a first request on the approver...
+    let first = begin(&mut n1);
+    let offered = ok(&mut a1.core, offer(&first["commitment"]));
+    let revealed = ok(&mut n1.core, reveal(&offered["offer"]));
+    let shown = ok(&mut a1.core, check(&revealed["reveal"]));
+    // ...and before they tap, they take a second notice, whose attempt replaces the first.
+    let second = begin(&mut n2);
+    let offered = ok(&mut a1.core, offer(&second["commitment"]));
+    let revealed = ok(&mut n2.core, reveal(&offered["offer"]));
+    let current = ok(&mut a1.core, check(&revealed["reveal"]));
+
+    // The tap with the code they compared approves nothing: it's not the current attempt's.
+    let before = identity_rows(&mut a1);
+    let refused = error(&mut a1.core, confirm(shown["code"].as_str().unwrap()));
+    assert_eq!(refusal(&refused), expect("not_found", "code"));
+    assert_eq!(identity_rows(&mut a1), before);
+
+    // With the current attempt's code, it approves that attempt's device.
+    let approved = ok(&mut a1.core, confirm(current["code"].as_str().unwrap()));
+    let certificate = DeviceCertificate::read_unverified(&bytes(&approved["certificate"])).unwrap();
+    assert_eq!(certificate.device, n2.id);
 }
 
 #[test]
@@ -1014,7 +1045,7 @@ fn transfer_from_a_forged_identity_is_rejected() {
     let refused = error(&mut n2.core, receive_direct(&consistent));
     assert_eq!(refusal(&refused), expect("invalid_signature", "transfer"));
     assert_eq!(status(&mut n2)["has_identity"], false);
-    let approved = ok(&mut a1.core, confirm());
+    let approved = ok(&mut a1.core, confirm(checked["code"].as_str().unwrap()));
     let received = ok(&mut n2.core, receive_direct(&bytes(&approved["transfer"])));
     assert_eq!(received["identity_key"], identity["identity_key"]);
 }
@@ -1114,8 +1145,8 @@ fn approval_state_lasts_ten_minutes() {
     let offered = ok(&mut a1.core, offer(&begun["commitment"]));
     let revealed = ok(&mut n.core, reveal(&offered["offer"]));
     server.clock.advance(1);
-    ok(&mut a1.core, check(&revealed["reveal"]));
-    let approved = ok(&mut a1.core, confirm());
+    let checked = ok(&mut a1.core, check(&revealed["reveal"]));
+    let approved = ok(&mut a1.core, confirm(checked["code"].as_str().unwrap()));
     let refused = error(&mut n.core, approval_receive(&approved["transfer"]));
     assert_eq!(refusal(&refused), expect("not_found", "approval"));
 
