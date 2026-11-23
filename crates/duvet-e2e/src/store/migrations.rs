@@ -258,11 +258,13 @@ CREATE INDEX edits_by_day ON edits (conversation_id, sent_at);
 
 -- When this device was in each conversation's group, for the backup's complete days: from when it
 -- entered to the latest time it knows it was still in (the newest entry it applied there, or the
--- commit that took it out). A row each time it enters; `open` while it's in.
+-- commit that took it out). A row each time it enters; `open` while it's in. A stay whose start only
+-- the device's own clock knew (an external join, a welcome without the API's time) begins at the
+-- first time the API gives after it: both are NULL until then.
 CREATE TABLE memberships (
     conversation_id BLOB NOT NULL,
-    entered_at INTEGER NOT NULL,
-    seen_until INTEGER NOT NULL,
+    entered_at INTEGER,
+    seen_until INTEGER,
     open INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX memberships_by_conversation ON memberships (conversation_id);

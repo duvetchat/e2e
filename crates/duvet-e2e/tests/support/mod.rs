@@ -212,6 +212,12 @@ impl Chat {
         });
         seq
     }
+
+    /// The time the API took the last entry, as it gives every entry's.
+    fn stamp(&mut self, sent_at: i64) {
+        let entry = self.queue.last_mut().expect("an entry");
+        entry.meta.insert("sent_at".into(), json!(sent_at));
+    }
 }
 
 /// Why the server didn't take a commit.
@@ -746,6 +752,7 @@ impl FakeServer {
             chat.leaves.insert(added.device, added.leaf);
         }
         let seq = chat.push("commit", commit, None);
+        chat.stamp(self.clock.now_ms());
         // The committer gets the queue from its own commit on, when it had none of it before, as
         // does a device that joins by external commit.
         let joined = !create
@@ -760,6 +767,7 @@ impl FakeServer {
         }
         if let Some(welcome) = reply["welcome"].as_str() {
             let welcome_seq = chat.push("welcome", STANDARD.decode(welcome).unwrap(), None);
+            chat.stamp(self.clock.now_ms());
             // A device new to the conversation gets the queue from its welcome on; one that had it
             // (a reset brings everyone in again) goes on in order.
             for added in &change.devices_added {
@@ -827,6 +835,7 @@ impl FakeServer {
         chat.state = response.state;
         let statement = chat.removals[&device].clone();
         chat.push("proposal", response.message.unwrap().into_vec(), statement);
+        chat.stamp(self.clock.now_ms());
     }
 
     /// Puts an entry in `conversation`'s queue without the validator, as a server that skips it
@@ -1125,5 +1134,29 @@ pub fn welcome_of(reply: &Value) -> openmls::prelude::Welcome {
     {
         MlsMessageBodyIn::Welcome(welcome) => welcome,
         _ => panic!("not a welcome"),
+    }
+}
+
+impl FakeServer {
+    /// As `bare_device`, on a clock of its own instead of the server's: a device whose clock is off.
+    pub fn bare_device_on(&mut self, user: Uuid, clock: FakeClock) -> TestDevice {
+        let dir = tempfile::tempdir().unwrap();
+        let mut core = Core::open(OpenConfig {
+            clock: Box::new(clock),
+            ..OpenConfig::new(dir.path().join("core.db"), [1; 32])
+        })
+        .unwrap();
+        let id = new_id();
+        ok(
+            &mut core,
+            json!({"cmd": "create_device", "user_id": user, "device_id": id}),
+        );
+        TestDevice {
+            core,
+            user,
+            id,
+            records: BTreeMap::new(),
+            _dir: dir,
+        }
     }
 }

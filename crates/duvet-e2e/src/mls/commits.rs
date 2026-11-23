@@ -164,7 +164,10 @@ pub(crate) fn commit_result(tx: &Tx<'_>, request: CommitResult) -> Result<Epoch,
     // counts it already takes the commit there, in order, after what comes before it.
     if matches!(pending, Pending::Create | Pending::External) {
         row.last_seq = request.seq;
-        crate::backup::entered(tx, conversation, tx.now())?;
+        // A creator's clock can't misplace its start: nothing comes before epoch 0. An external
+        // joiner's could, so its stay begins at the first time the API gives.
+        let at = (pending == Pending::Create).then(|| tx.now());
+        crate::backup::entered(tx, conversation, at)?;
     }
     row.write(tx)?;
     Ok(Epoch {

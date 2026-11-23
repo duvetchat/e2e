@@ -281,8 +281,8 @@ pub(crate) fn backup_reencrypt(tx: &Tx<'_>, request: SegmentData) -> Result<Reen
 /// What an entry of `conversation`'s queue shows of this device's place in its group, by whether it
 /// held the group before the entry and holds it after, and when the API took the entry: it entered
 /// then (a welcome brought it in), it was still in then, or it left then (a commit took it out). An
-/// entry without that time shows no more than what it did, and one that brings the device in, that
-/// it entered by the core's clock.
+/// entry without that time shows no more than what it did: a stay it begins has no known start, until
+/// the first time the API gives after it.
 pub(crate) fn followed(
     tx: &Tx<'_>,
     conversation: Uuid,
@@ -291,31 +291,37 @@ pub(crate) fn followed(
     sent_at: Option<i64>,
 ) -> Result<(), Error> {
     let id = conversation.as_bytes().as_slice();
-    match (held, holds, sent_at) {
-        (false, true, _) => entered(tx, conversation, sent_at.unwrap_or_else(|| tx.now())),
-        (true, true, Some(at)) => {
+    // The open stay seen at `?2`, when given: the first time it gets is its start.
+    const SEEN: &str = "entered_at = coalesce(entered_at, ?2), seen_until = CASE \
+         WHEN ?2 IS NULL THEN seen_until WHEN seen_until IS NULL OR seen_until < ?2 THEN ?2 \
+         ELSE seen_until END";
+    match (held, holds) {
+        (false, true) => entered(tx, conversation, sent_at),
+        (true, true) => {
             tx.conn().execute(
-                "UPDATE memberships SET seen_until = max(seen_until, ?2) \
-                 WHERE conversation_id = ?1 AND open = 1",
-                params![id, at],
-            )?;
-            Ok(())
-        }
-        (true, false, _) => {
-            tx.conn().execute(
-                "UPDATE memberships SET seen_until = max(seen_until, coalesce(?2, seen_until)), \
-                 open = 0 WHERE conversation_id = ?1 AND open = 1",
+                &format!("UPDATE memberships SET {SEEN} WHERE conversation_id = ?1 AND open = 1"),
                 params![id, sent_at],
             )?;
             Ok(())
         }
-        _ => Ok(()),
+        (true, false) => {
+            tx.conn().execute(
+                &format!(
+                    "UPDATE memberships SET {SEEN}, open = 0 WHERE conversation_id = ?1 AND open = 1"
+                ),
+                params![id, sent_at],
+            )?;
+            Ok(())
+        }
+        (false, false) => Ok(()),
     }
 }
 
-/// This device entered `conversation`'s group at `at`: a stay of its own begins then, and one it
-/// still had there ends where it was last seen in.
-pub(crate) fn entered(tx: &Tx<'_>, conversation: Uuid, at: i64) -> Result<(), Error> {
+/// This device entered `conversation`'s group at `at`, by the API's time, or at a time only its own
+/// clock knew (`None`): a stay of its own begins then, with no known start in the second case, and
+/// one it still had there ends where it was last seen in. A stay that begins with no known start
+/// never holds the day it began in.
+pub(crate) fn entered(tx: &Tx<'_>, conversation: Uuid, at: Option<i64>) -> Result<(), Error> {
     let id = conversation.as_bytes().as_slice();
     tx.conn().execute(
         "UPDATE memberships SET open = 0 WHERE conversation_id = ?1 AND open = 1",

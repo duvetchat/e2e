@@ -11,7 +11,7 @@ mod support;
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use duvet_e2e::messages::{self, Record, RecordKind};
-use duvet_e2e::{Clock, SystemClock, recovery};
+use duvet_e2e::{Clock, FakeClock, SystemClock, recovery};
 use duvet_e2e_rules::Kind;
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
@@ -1183,6 +1183,56 @@ fn a_deletion_replaces_the_servers_complete_copy() {
         .collect();
     assert_eq!(ids, [stays]);
     assert_eq!(due(&mut a2), []);
+}
+
+#[test]
+fn a_slow_clock_doesnt_complete_the_join_day() {
+    let mut dm = dm();
+    let (conversation, day) = (dm.conversation, dm.day);
+    // B1 writes at 01:00. At 10:00 a second device of A's joins by external commit; its clock runs
+    // 13 hours behind the API's, so as it joins it reads the day before.
+    dm.at(day + HOUR);
+    say(
+        &mut dm.server,
+        &mut dm.b1,
+        conversation,
+        "antes de que entre",
+    );
+    dm.deliver();
+    dm.at(day + 10 * HOUR);
+    let slow = FakeClock::at(day + 10 * HOUR - 13 * HOUR);
+    let mut a2 = dm.server.bare_device_on(dm.a, slow.clone());
+    let recovered = ok(
+        &mut a2.core,
+        recovering(&dm.server, dm.a, &dm.identity, None),
+    );
+    dm.server
+        .take_device(dm.a, &recovered["certificate"], &recovered["device_list"]);
+    for device in [&mut dm.a1, &mut dm.b1, &mut a2] {
+        dm.server.introduce(device);
+    }
+    let join = json!({
+        "cmd": "join_external",
+        "conversation_id": conversation,
+        "generation": 0,
+        "group_info": dm.server.group_info(conversation),
+    });
+    dm.server
+        .commit(&mut a2, conversation, join)
+        .expect("the server takes the external commit");
+    dm.server
+        .deliver_all(&mut [&mut dm.a1, &mut dm.b1, &mut a2]);
+    dm.at(day + 11 * HOUR);
+    say(&mut dm.server, &mut dm.b1, conversation, "después");
+    dm.at(day + DAY_MS + HOUR);
+    say(&mut dm.server, &mut dm.b1, conversation, "al día siguiente");
+    dm.server
+        .deliver_all(&mut [&mut dm.a1, &mut dm.b1, &mut a2]);
+
+    // Once its own clock has passed that day too, A2 lists the day incomplete: it never had what
+    // came before it joined, whatever its clock said then.
+    slow.set(day + DAY_MS + HOUR);
+    assert_eq!(due(&mut a2), [(conversation, utc_day(day), false)]);
 }
 
 /// A day of A's under A's first backup key, then A's change of keys: the old day's segment, the
