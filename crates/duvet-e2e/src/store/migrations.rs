@@ -111,7 +111,9 @@ CREATE TABLE groups (
 );
 
 -- Messages as decrypted, with their edits applied. message_id is the API's, unknown while one is being sent.
--- envelope is the message as it was sent, text its author's latest; a deleted message keeps neither.
+-- envelope is the message as it was sent, text its author's latest edit that counts here
+-- (refresh_text), else the envelope's; a deleted message keeps neither. shared_by is the member
+-- whose package brought this copy, none for one this device read itself.
 -- reply_to is the message it answers, as the API gives it: replies go in the clear.
 CREATE TABLE messages (
     id INTEGER PRIMARY KEY,
@@ -153,8 +155,11 @@ CREATE TRIGGER messages_fts_update AFTER UPDATE OF text ON messages BEGIN
     INSERT INTO messages_fts (rowid, text) VALUES (new.id, new.text);
 END;
 
--- Each edit of a message as it came: a message's text is its author's latest. An edit of a message
--- this device can't read yet (waiting, or not here at all) waits here for it.
+-- Each edit of a message as it came, shared_by the member whose package brought it (none for one
+-- this device holds itself: from the queue, or its own). A message's text is its author's latest
+-- edit that counts (refresh_text): one on the author's word (held here, or from the author's own
+-- package) outranks any another member shared, which counts only on that member's copy. An edit of
+-- a message this device can't read yet (waiting, or not here at all) waits here for it.
 CREATE TABLE edits (
     id INTEGER PRIMARY KEY,
     conversation_id BLOB NOT NULL,

@@ -1,7 +1,8 @@
-//! The messages as this device keeps them: one row each, its text its author's latest edit, and the
-//! edits apart, each as it came. The search index follows the text by itself (`messages_fts`, kept
-//! by the table's triggers). Also the history a client shows (`messages`), and the records a backup
-//! or a history share carries out and brings in (`records_for`, `import`).
+//! The messages as this device keeps them: one row each, its text its author's latest edit that
+//! counts (`refresh_text`), and the edits apart, each as it came. The search index follows the text
+//! by itself (`messages_fts`, kept by the table's triggers). Also the history a client shows
+//! (`messages`), and the records a backup or a history share carries out and brings in
+//! (`records_for`, `import`).
 
 use std::collections::BTreeSet;
 

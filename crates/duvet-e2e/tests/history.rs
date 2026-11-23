@@ -1801,23 +1801,13 @@ fn another_members_edit_under_the_authors_number_keeps_nothing_out() {
     let command = package_of(&mut server, &mut c1, &mut b1, conversation, &deflated);
     ok(&mut b1.core, command);
 
-    // A's share brings the message and A's own edit: B1 shows the edit, whatever C's under its
-    // number.
-    let shared = ok(
-        &mut a1.core,
-        json!({
-            "cmd": "history_share",
-            "conversation_id": conversation,
-            "to_user": b,
-            "range": "all",
-            "devices": certificates(&server, b),
-        }),
-    );
-    let from = certificate(&server, a, a1.id);
-    take_package(&mut server, &mut b1, &from, &shared);
+    // C's own share then brings the message and A's edit, onto C's copy: B1 shows A's edit,
+    // whatever C's row under its number, which the same sharer brought.
+    share_all(&mut server, &mut c1, &mut b1, conversation);
     let shown = messages_of(&mut b1, conversation);
     assert_eq!(shown[0]["text"], "lo que A corrigió");
     assert!(shown[0]["edited_at"].is_i64(), "{}", shown[0]);
+    assert_eq!(shown[0]["shared_by"], json!(c));
 }
 
 #[test]
