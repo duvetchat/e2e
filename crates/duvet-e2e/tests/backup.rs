@@ -1281,6 +1281,57 @@ fn reencrypt_moves_only_what_an_import_takes() {
 }
 
 #[test]
+fn deleted_ids_erase_what_a_device_already_holds() {
+    let mut dm = dm();
+    let (conversation, day) = (dm.conversation, dm.day);
+    // On the day A1 writes and edits a message, which B1 gets a copy of it can't read, and B1
+    // writes too.
+    dm.at(day + HOUR);
+    let gone = say(&mut dm.server, &mut dm.a1, conversation, "lo borraré");
+    hand_unreadable(&dm.server, &mut dm.b1, conversation);
+    dm.at(day + 2 * HOUR);
+    edit(&mut dm.server, &mut dm.a1, conversation, gone, "editado");
+    dm.at(day + 3 * HOUR);
+    let stays = say(&mut dm.server, &mut dm.b1, conversation, "esto queda");
+    dm.deliver();
+    dm.at(day + DAY_MS + HOUR);
+    let the_day = utc_day(day);
+    // A device recovered the next day takes A1's copy of the day, the message and its edit in it.
+    let before = back_up(&mut dm.a1, conversation, &the_day);
+    let mut a2 = recovered(&mut dm.server, dm.a, &dm.identity);
+    assert_eq!(imported(&mut a2, &before["data"]), 3);
+    assert_eq!(shown_ids(&mut a2, conversation), [stays, gone]);
+
+    // A1 deletes it, which A2, out of the group, never hears of, and backs the day up without it.
+    // A2 imports that copy with the IDs the API saw deleted: the message it held goes, with its
+    // edit, and the day is what the server holds.
+    delete(&mut dm.server, &mut dm.a1, conversation, gone);
+    let after = back_up(&mut dm.a1, conversation, &the_day);
+    let taken = ok(
+        &mut a2.core,
+        json!({"cmd": "backup_import", "data": after["data"], "deleted": [gone]}),
+    );
+    assert_eq!(taken, json!({"imported": 0}));
+    assert_eq!(shown_ids(&mut a2, conversation), [stays]);
+    assert_eq!(due(&mut a2), []);
+
+    // B1 held only the copy it couldn't read. An import of its own copy of the day with the same
+    // IDs, before its queue brings the deletion, takes that copy as the deletion does, and the
+    // deletion then changes nothing. Nothing of the day waits any more: once its end is seen, B1
+    // holds it whole, which the server's copy isn't.
+    assert_eq!(shown_ids(&mut dm.b1, conversation), [stays, gone]);
+    let theirs = segment(&mut dm.b1, conversation, &the_day);
+    ok(
+        &mut dm.b1.core,
+        json!({"cmd": "backup_import", "data": theirs["data"], "deleted": [gone]}),
+    );
+    assert_eq!(shown_ids(&mut dm.b1, conversation), [stays]);
+    dm.server.deliver(&mut dm.b1);
+    assert_eq!(shown_ids(&mut dm.b1, conversation), [stays]);
+    assert_eq!(due(&mut dm.b1), [(conversation, the_day, true)]);
+}
+
+#[test]
 fn reencrypt_leaves_out_what_was_deleted() {
     let mut dm = dm();
     let (conversation, day) = (dm.conversation, dm.day);

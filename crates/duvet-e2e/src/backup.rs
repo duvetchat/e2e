@@ -219,17 +219,19 @@ pub(crate) fn backup_uploaded(tx: &Tx<'_>, request: Uploaded) -> Result<Empty, E
 
 /// Brings in a segment of the user's backup, as the server holds it, under the backup key or one
 /// before it: what this device lacks of the day, never overwriting what it has, and a message it
-/// holds deleted stays deleted, as does one the API saw deleted (`deleted`). How many records
-/// changed something. The segment counts as the server's copy of the day: the day isn't due when
-/// this device holds the same as it, and is when it holds more or other than it.
+/// holds deleted stays deleted. One the API saw deleted (`deleted`) goes from this device too, as
+/// its author's deletion takes it, wherever it lies. How many records changed something. The
+/// segment counts as the server's copy of the day: the day isn't due when this device holds the
+/// same as it, and is when it holds more or other than it.
 pub(crate) fn backup_import(tx: &Tx<'_>, request: SegmentData) -> Result<Imported, Error> {
     let opened = open(tx, &request.data)?;
     let conversation = opened.wire.conversation;
     let all = records_in(&opened.deflated, MAX_SEGMENT)?;
+    let deleted: HashSet<Uuid> = request.deleted.into_iter().collect();
+    messages::erase_deleted(tx, conversation, &deleted)?;
     // A record outside the segment's day isn't the day's, and a message the API saw deleted doesn't
     // come back, nor do its edits: they're left out, and the day is due again, to upload without
     // them.
-    let deleted: HashSet<Uuid> = request.deleted.into_iter().collect();
     let (records, left_out): (Vec<Record>, Vec<Record>) = all
         .into_iter()
         .partition(|record| opened.day.holds(record) && !deleted.contains(&record.id));

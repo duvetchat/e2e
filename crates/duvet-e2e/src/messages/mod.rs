@@ -24,7 +24,7 @@ use crate::{Attachment, Envelope, Error, ThumbnailRef};
 
 pub(crate) use deviceless::{WithoutDevices, catch_up_due, entered, without_devices};
 pub use deviceless::{forget_noted, noted_records};
-pub(crate) use receive::Messages;
+pub(crate) use receive::{Messages, erase_deleted};
 pub(crate) use search::{Search, search};
 pub(crate) use send::{Delete, Discard, Edit, Encrypt, Sent, delete, discard, edit, encrypt, sent};
 pub(crate) use store::{ListMessages, messages};
