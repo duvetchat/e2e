@@ -206,6 +206,7 @@ pub(crate) fn discard(tx: &Tx<'_>, request: Discard) -> Result<Empty, Error> {
 
 /// The API's answer to a message this device sent: its ID and its number, bound to its nonce. The
 /// same answer again changes nothing, and another is refused, as is the ID of another message.
+/// What a reply answers counts from either the answer or the queue's copy, whichever says it.
 pub(crate) fn sent(tx: &Tx<'_>, request: Sent) -> Result<Empty, Error> {
     if i64::try_from(request.seq).is_err() {
         return Err(invalid("seq", "the message's number is out of range"));
@@ -229,7 +230,11 @@ pub(crate) fn sent(tx: &Tx<'_>, request: Sent) -> Result<Empty, Error> {
         Some(_) if row.seq != Some(request.seq) => {
             return Err(invalid("seq", "the message was sent under another number"));
         }
-        Some(_) => {}
+        Some(_) => {
+            if let Some(reply_to) = request.reply_to {
+                store::fill_reply_to(tx, row.id, reply_to)?;
+            }
+        }
     }
     Ok(Empty {})
 }

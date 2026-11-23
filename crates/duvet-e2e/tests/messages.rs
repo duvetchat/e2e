@@ -1277,6 +1277,35 @@ fn a_reply_keeps_the_message_it_answers() {
 }
 
 #[test]
+fn the_answer_fills_what_a_reply_answers() {
+    let (mut server, conversation, _, [mut a1, mut b1]) = dm();
+    let asked = say(&mut server, &mut a1, conversation, "¿vienes?");
+    server.deliver(&mut b1);
+
+    // B1's reply comes back from the queue before the API's answer, and its copy doesn't say what
+    // it answers. The answer does, and the reply keeps it.
+    let (nonce, reply, seq) = posted(
+        &mut server,
+        &mut b1,
+        conversation,
+        json!({"text": "sí"}),
+        &[],
+    );
+    server.deliver(&mut b1);
+    assert_eq!(
+        message(&mut b1, conversation, reply).unwrap()["reply_to"],
+        Value::Null
+    );
+    let mut answered = sent_command(conversation, &nonce, reply, seq);
+    answered["reply_to"] = json!(asked);
+    ok(&mut b1.core, answered);
+    assert_eq!(
+        message(&mut b1, conversation, reply).unwrap()["reply_to"],
+        json!(asked)
+    );
+}
+
+#[test]
 fn undecryptable_message_waits_until_imported() {
     let (mut server, conversation, [a, _], [mut a1, mut b1]) = dm();
     let late = say(&mut server, &mut a1, conversation, "llega tarde");

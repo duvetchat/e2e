@@ -368,6 +368,16 @@ fn takes_over(row: &Row, other: &Row) -> Option<bool> {
     copy.then_some(false)
 }
 
+/// What a message answers, when nothing said it yet: the API's answer to this device's message can
+/// say it after the queue's copy didn't. A deleted message takes none.
+pub(crate) fn fill_reply_to(tx: &Tx<'_>, id: i64, reply_to: Uuid) -> Result<(), Error> {
+    tx.conn().execute(
+        "UPDATE messages SET reply_to = COALESCE(reply_to, ?2) WHERE id = ?1 AND deleted = 0",
+        params![id, reply_to.as_bytes().as_slice()],
+    )?;
+    Ok(())
+}
+
 /// The users a message mentions, as its sender listed them for the API: as many as a conversation
 /// has members, at most.
 pub(crate) fn set_mentions(tx: &Tx<'_>, id: i64, users: &[Uuid]) -> Result<(), Error> {
