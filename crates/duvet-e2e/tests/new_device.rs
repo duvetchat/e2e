@@ -363,6 +363,42 @@ fn recover_with_key_signs_the_new_device() {
         refusal(&refused),
         expect("invalid_signature", "device_list")
     );
+    // The right key, with what isn't a list, or a list the identity signs for another user.
+    let key = identity["recovery_key"].as_str().unwrap();
+    let backup_key = recovery::unwrap_backup_key(
+        &recovery::parse(key).unwrap(),
+        a,
+        &bytes(&identity["wrapped_backup_key"]),
+    )
+    .unwrap();
+    let seed = recovery::decrypt_identity(&backup_key, a, &bytes(&identity["encrypted_identity"]))
+        .unwrap();
+    let signer = SignatureKeyPair::from_raw(
+        SignatureScheme::ED25519,
+        seed.to_vec(),
+        bytes(&identity["identity_key"]),
+    );
+    let elsewhere = DeviceList::new(
+        new_id(),
+        key32(&bytes(&identity["identity_key"])),
+        9,
+        vec![a1.id],
+    )
+    .sign(&signer)
+    .unwrap();
+    for (device_list, expected) in [
+        (
+            json!(b64(b"not a list")),
+            expect("bad_command", "device_list"),
+        ),
+        (
+            json!(b64(&elsewhere)),
+            expect("rule_violation", "wrong_user"),
+        ),
+    ] {
+        let refused = error(&mut a2.core, recovering(key, &identity, &device_list));
+        assert_eq!(refusal(&refused), expected);
+    }
     // None of it changed anything.
     assert_eq!(identity_rows(&mut a2), before);
     assert_eq!(status(&mut a2)["has_identity"], false);
@@ -653,6 +689,127 @@ fn the_same_commitment_gets_the_same_offer() {
 }
 
 #[test]
+fn each_approval_step_refuses_what_it_cant_take() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let (mut a1, _) = server.first_device(a);
+    let mut n = server.bare_device(a);
+    let mut stranger = server.bare_device(b);
+    let begun = begin(&mut n);
+    let theirs = begin(&mut stranger);
+    let commitment: Commitment = read(&begun["commitment"]);
+    let qr: Qr = read(&begun["qr"]);
+
+    // The approver offers and approves by QR only for an approval's blob of this version, and
+    // only for a device of its own user, one whose QR it scanned included.
+    let cases = [
+        (
+            offer(&json!(b64(b"not a commitment"))),
+            expect("bad_command", "commitment"),
+        ),
+        (
+            offer(&json!(b64(&cbor(&Commitment {
+                v: 2,
+                ..commitment.clone()
+            })))),
+            expect("bad_command", "commitment"),
+        ),
+        (
+            offer(&theirs["commitment"]),
+            expect("rule_violation", "wrong_user"),
+        ),
+        (
+            from_qr(&json!(b64(b"not a QR"))),
+            expect("bad_command", "qr"),
+        ),
+        (
+            from_qr(&json!(b64(&cbor(&Qr { v: 2, ..qr.clone() })))),
+            expect("bad_command", "qr"),
+        ),
+        (
+            from_qr(&theirs["qr"]),
+            expect("rule_violation", "wrong_user"),
+        ),
+    ];
+    let before = identity_rows(&mut a1);
+    for (command, expected) in cases {
+        let refused = error(&mut a1.core, command.clone());
+        assert_eq!(refusal(&refused), expected, "{command}");
+    }
+    assert_eq!(identity_rows(&mut a1), before);
+
+    // The new device reveals only for an offer of this version, to its own commitment, whose
+    // certificate is one, of another device of its user.
+    let offered = ok(&mut a1.core, offer(&begun["commitment"]));
+    let honest: Offer = read(&offered["offer"]);
+    let certificate = |user, device| {
+        DeviceCertificate::new(user, device, [1; 32], [2; 32], 1)
+            .sign(&Forger::new().identity)
+            .unwrap()
+    };
+    let cases = [
+        (json!(b64(b"not an offer")), expect("bad_command", "offer")),
+        (
+            json!(b64(&cbor(&Offer {
+                v: 2,
+                ..honest.clone()
+            }))),
+            expect("bad_command", "offer"),
+        ),
+        (
+            json!(b64(&cbor(&Offer {
+                certificate: b"not a certificate".to_vec(),
+                ..honest.clone()
+            }))),
+            expect("bad_command", "offer"),
+        ),
+        (
+            json!(b64(&cbor(&Offer {
+                hash: random32().to_vec(),
+                ..honest.clone()
+            }))),
+            expect("not_found", "approval"),
+        ),
+        (
+            json!(b64(&cbor(&Offer {
+                certificate: certificate(b, new_id()),
+                ..honest.clone()
+            }))),
+            expect("rule_violation", "wrong_user"),
+        ),
+        (
+            json!(b64(&cbor(&Offer {
+                certificate: certificate(a, n.id),
+                ..honest.clone()
+            }))),
+            expect("rule_violation", "wrong_device"),
+        ),
+    ];
+    let before = identity_rows(&mut n);
+    for (blob, expected) in cases {
+        let refused = error(&mut n.core, reveal(&blob));
+        assert_eq!(refusal(&refused), expected, "{blob}");
+    }
+    assert_eq!(identity_rows(&mut n), before);
+    ok(&mut n.core, reveal(&offered["offer"]));
+
+    // An approver that its user's list no longer holds approves nothing.
+    ok(
+        &mut a1.core,
+        json!({"cmd": "sign_device_list", "remove": [a1.id]}),
+    );
+    let begun = begin(&mut n);
+    for command in [offer(&begun["commitment"]), from_qr(&begun["qr"])] {
+        let refused = error(&mut a1.core, command.clone());
+        assert_eq!(
+            refusal(&refused),
+            expect("rule_violation", "device_not_listed"),
+            "{command}"
+        );
+    }
+}
+
+#[test]
 fn server_cannot_force_the_code() {
     let mut server = FakeServer::new();
     let a = new_id();
@@ -869,7 +1026,12 @@ impl Forger {
 
     /// The certificate `identity` signs for the forger's own device.
     fn own_certificate(&self, user: Uuid, identity: &SignatureKeyPair) -> Vec<u8> {
-        DeviceCertificate::new(user, self.device, key32(self.signer.public()), [5; 32], 1)
+        self.certificate_as(user, self.device, identity)
+    }
+
+    /// The certificate `identity` signs for the forger's signature key, as `device` of `user`.
+    fn certificate_as(&self, user: Uuid, device: Uuid, identity: &SignatureKeyPair) -> Vec<u8> {
+        DeviceCertificate::new(user, device, key32(self.signer.public()), [5; 32], 1)
             .sign(identity)
             .unwrap()
     }
@@ -946,6 +1108,7 @@ fn transfer_from_a_forged_identity_is_rejected() {
     let x = &forger.identity;
     let approver = forger.own_certificate(a, x);
     let both = [forger.device, n.id];
+    let elsewhere = new_id();
     let cases = [
         // A's real list, which X doesn't sign.
         (
@@ -1004,6 +1167,67 @@ fn transfer_from_a_forged_identity_is_rejected() {
                 approver.clone(),
             ),
             expect("rule_violation", "wrong_device"),
+        ),
+        // The sender's certificate, for a device of another user.
+        (
+            forger.transfer(
+                n.id,
+                &qr.key,
+                forger.certificate_for(&asked),
+                forger.list(a, &both, x),
+                forger.own_certificate(b, x),
+            ),
+            expect("rule_violation", "wrong_user"),
+        ),
+        // The sender's certificate, for another device than the one that sent the message.
+        (
+            forger.transfer(
+                n.id,
+                &qr.key,
+                forger.certificate_for(&asked),
+                forger.list(a, &[elsewhere, n.id], x),
+                forger.certificate_as(a, elsewhere, x),
+            ),
+            expect("rule_violation", "wrong_device"),
+        ),
+        // The new device's certificate, signed by yet another identity.
+        (
+            forger.transfer(
+                n.id,
+                &qr.key,
+                other.certificate_for(&asked),
+                forger.list(a, &both, x),
+                approver.clone(),
+            ),
+            expect("invalid_signature", "certificate"),
+        ),
+        // The new device's certificate, for a device of another user.
+        (
+            forger.transfer(
+                n.id,
+                &qr.key,
+                forger.certificate_for(&Commitment {
+                    user: b,
+                    ..asked.clone()
+                }),
+                forger.list(a, &both, x),
+                approver.clone(),
+            ),
+            expect("rule_violation", "wrong_user"),
+        ),
+        // A payload that isn't a transfer.
+        (
+            DirectMessage::seal(
+                &forger.provider,
+                &forger.signer,
+                forger.device,
+                n.id,
+                &key32(&qr.key),
+                "approval.transfer",
+                b"not a transfer",
+            )
+            .unwrap(),
+            expect("decrypt_failed", "transfer"),
         ),
     ];
     let before = identity_rows(&mut n);
