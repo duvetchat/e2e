@@ -689,6 +689,58 @@ fn a_proposal_passed_off_as_a_message_is_refused() {
 }
 
 #[test]
+fn out_of_the_group_a_message_waits_its_turn() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut b1] = new_devices(&mut server, [a, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    // A removes B, and B1 hears it. A adds B again (its commit and B1's welcome), then writes.
+    let remove = json!({"cmd": "remove_members", "conversation_id": conversation, "users": [b]});
+    server.commit(&mut a1, conversation, remove).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    let claimed = server.claim(&[b]);
+    let add = json!({
+        "cmd": "add_members",
+        "conversation_id": conversation,
+        "users": [{"user_id": b, "key_packages": claimed[b.to_string().as_str()]}],
+    });
+    server.commit(&mut a1, conversation, add).unwrap();
+    server.deliver(&mut a1);
+    let back = say(&mut server, &mut a1, conversation, "Volviste");
+    let entries = server.entries(conversation);
+
+    // The message reaches B1 first. Out of the group nothing opens it: it's ignored, nothing of it
+    // is kept, and B1's count stays short of the backlog B1 still needs.
+    let early = ok(&mut b1.core, apply(conversation, &entries[5..]));
+    assert_eq!(
+        results(std::slice::from_ref(&early)),
+        [json!([6, "message", "ignored", null])]
+    );
+    assert_eq!(early["applied_through"], 3);
+    assert_eq!(messages_of(&mut b1, conversation), Vec::<Value>::new());
+
+    // The backlog brings the welcome, and the message again, which B1 reads now.
+    let backlog = ok(&mut b1.core, apply(conversation, &entries[3..]));
+    assert_eq!(
+        results(std::slice::from_ref(&backlog)),
+        [
+            json!([4, "commit", "ignored", null]),
+            json!([5, "welcome", "applied", null]),
+            json!([6, "message", "applied", null]),
+        ]
+    );
+    assert_eq!(backlog["applied_through"], 6);
+    assert_eq!(
+        message(&mut b1, conversation, back).unwrap()["text"],
+        "Volviste"
+    );
+}
+
+#[test]
 fn search_finds_words_without_accents() {
     let (mut server, conversation, [a, b], [mut a1, mut a2, mut b1, mut b2]) = group_of_four();
     let start = server.clock.now_ms();
