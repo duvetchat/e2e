@@ -206,14 +206,14 @@ CREATE TABLE deviceless_users (
 
 -- The backup's days: a row for each conversation and UTC day (YYYY-MM-DD) this device holds anything
 -- of, or the server holds a segment of as far as it knows. `dirty` while what the device holds of the
--- day changed since the server last held the same; `listed` once backup_due or backup_segment handed
--- the day out after its last change, so that backup_uploaded takes what the client uploads as the
--- day; `uploaded` what the server holds: none it knows of, an incomplete copy (0) or a complete one (1).
+-- day changed since the server last held the same; `version` counts the day's changes, so that
+-- backup_uploaded takes as the day only the build of its current version; `uploaded` what the server
+-- holds: none it knows of, an incomplete copy (0) or a complete one (1).
 CREATE TABLE segments (
     conversation_id BLOB NOT NULL,
     day TEXT NOT NULL,
     dirty INTEGER NOT NULL DEFAULT 1,
-    listed INTEGER NOT NULL DEFAULT 0,
+    version INTEGER NOT NULL DEFAULT 0,
     uploaded INTEGER CHECK (uploaded IN (0, 1)),
     PRIMARY KEY (conversation_id, day)
 );
@@ -222,7 +222,7 @@ CREATE VIEW segment_changes (conversation_id, at) AS SELECT NULL, NULL WHERE 0;
 CREATE TRIGGER segment_changed INSTEAD OF INSERT ON segment_changes BEGIN
     INSERT OR IGNORE INTO segments (conversation_id, day)
         VALUES (new.conversation_id, strftime('%Y-%m-%d', new.at / 1000.0, 'unixepoch'));
-    UPDATE segments SET dirty = 1, listed = 0
+    UPDATE segments SET dirty = 1, version = version + 1
         WHERE conversation_id = new.conversation_id
         AND day = strftime('%Y-%m-%d', new.at / 1000.0, 'unixepoch');
 END;

@@ -337,14 +337,15 @@ fn segment(device: &mut TestDevice, conversation: Uuid, day: &str) -> Value {
 }
 
 /// The server holds the day, complete or not.
-fn uploaded(device: &mut TestDevice, conversation: Uuid, day: &str, complete: bool) {
+fn uploaded(device: &mut TestDevice, conversation: Uuid, day: &str, built: &Value) {
     let reply = ok(
         &mut device.core,
         json!({
             "cmd": "backup_uploaded",
             "conversation_id": conversation,
             "day": day,
-            "complete": complete,
+            "complete": built["complete"],
+            "version": built["version"],
         }),
     );
     assert_eq!(reply, json!({}));
@@ -354,12 +355,7 @@ fn uploaded(device: &mut TestDevice, conversation: Uuid, day: &str, complete: bo
 /// it: `backup_segment`'s reply.
 fn back_up(device: &mut TestDevice, conversation: Uuid, day: &str) -> Value {
     let built = segment(device, conversation, day);
-    uploaded(
-        device,
-        conversation,
-        day,
-        built["complete"].as_bool().unwrap(),
-    );
+    uploaded(device, conversation, day, &built);
     built
 }
 
@@ -606,7 +602,7 @@ fn segment_round_trip() {
     assert_eq!(due(&mut a2), []);
 
     // Once the server holds it, A1 has nothing due either.
-    uploaded(&mut dm.a1, conversation, &the_day, true);
+    uploaded(&mut dm.a1, conversation, &the_day, &built);
     assert_eq!(due(&mut dm.a1), []);
 }
 
@@ -788,8 +784,7 @@ fn delete_marks_its_days_again() {
     delete(&mut dm.server, &mut dm.a1, conversation, gone);
     dm.deliver();
     for (day, built) in days.iter().zip(&in_flight) {
-        let complete = built["complete"].as_bool().unwrap();
-        uploaded(&mut dm.b1, conversation, day, complete);
+        uploaded(&mut dm.b1, conversation, day, built);
     }
     for device in [&mut dm.a1, &mut dm.b1] {
         let listed: Vec<String> = due(device).into_iter().map(|(_, day, _)| day).collect();
@@ -936,11 +931,11 @@ fn incomplete_day_can_be_replaced() {
     assert_eq!(due(&mut dm.a1), [(conversation, the_day.clone(), false)]);
     assert_eq!(due(&mut a2), [(conversation, the_day.clone(), false)]);
 
-    // A1 uploads its copy, incomplete. A2 finds the server's copy no less complete than its own and
-    // keeps it. Neither has the day due any more.
+    // A1 uploads its copy, incomplete. A2 imports the server's copy first, which holds all A2 holds
+    // of the day: it has nothing to upload. Neither has the day due any more.
     let first = back_up(&mut dm.a1, conversation, &the_day);
     assert_eq!(first["complete"], false);
-    uploaded(&mut a2, conversation, &the_day, false);
+    assert_eq!(imported(&mut a2, &first["data"]), 0);
     assert_eq!(due(&mut dm.a1), []);
     assert_eq!(due(&mut a2), []);
 
@@ -1101,6 +1096,36 @@ fn reencrypt_moves_old_segments_to_the_new_key() {
     assert_eq!(shown_ids(&mut a2, conversation), [hello]);
     // A1, which keeps the old key, still opens the old segment.
     assert_eq!(imported(&mut dm.a1, &old["data"]), 0);
+}
+
+#[test]
+fn a_day_listed_again_during_an_upload_stays_due() {
+    let mut dm = dm();
+    let (conversation, day) = (dm.conversation, dm.day);
+    dm.at(day + HOUR);
+    let gone = say(&mut dm.server, &mut dm.a1, conversation, "se borrará");
+    say(&mut dm.server, &mut dm.a1, conversation, "se queda");
+    dm.deliver();
+    dm.at(day + DAY_MS + HOUR);
+    let the_day = utc_day(day);
+
+    // A1 lists the day and builds it; its upload is under way when A1 deletes a message of the day,
+    // and the client lists the days again meanwhile.
+    assert_eq!(due(&mut dm.a1).len(), 1);
+    let built = segment(&mut dm.a1, conversation, &the_day);
+    delete(&mut dm.server, &mut dm.a1, conversation, gone);
+    assert_eq!(due(&mut dm.a1).len(), 1);
+
+    // The upload of the build from before the deletion ends: the day stays due, to upload without
+    // the message.
+    uploaded(&mut dm.a1, conversation, &the_day, &built);
+    let listed: Vec<String> = due(&mut dm.a1).into_iter().map(|(_, day, _)| day).collect();
+    assert_eq!(listed, [the_day.clone()]);
+    let latest = back_up(&mut dm.a1, conversation, &the_day);
+    assert_eq!(due(&mut dm.a1), []);
+    let backup_key = backup_key_of(dm.a, &dm.identity);
+    let carried = Segment::read(&bytes(&latest["data"])).open(&backup_key);
+    assert!(carried.iter().all(|record| record.id != gone));
 }
 
 /// A day of A's under A's first backup key, then A's change of keys: the old day's segment, the

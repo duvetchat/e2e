@@ -19,7 +19,7 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use hkdf::Hkdf;
 use miniz_oxide::inflate::TINFLStatus;
 use openmls_traits::OpenMlsProvider;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use uuid::Uuid;
@@ -54,6 +54,8 @@ pub(crate) struct Uploaded {
     day: String,
     /// Whether the copy the server holds now is complete.
     complete: bool,
+    /// The day's version the uploaded build was of, as `backup_segment` answered it.
+    version: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +83,8 @@ pub(crate) struct Built {
     #[serde(with = "b64")]
     key_id: Vec<u8>,
     complete: bool,
+    /// The day's version this build holds, for `backup_uploaded` once it's uploaded.
+    version: i64,
 }
 
 #[derive(Serialize)]
@@ -99,8 +103,7 @@ pub(crate) struct Reencrypted {
 /// The days to upload, by conversation and oldest first: each one that ended (in UTC, by the core's
 /// clock) while it changed since the server last held what this device holds of it, or while this
 /// device holds it complete and the server's copy isn't. A day with nothing to carry that the server
-/// holds nothing of, as far as this device knows, isn't one. `backup_uploaded` then takes the day as
-/// the server's, unless it changes again first.
+/// holds nothing of, as far as this device knows, isn't one.
 pub(crate) fn backup_due(tx: &Tx<'_>) -> Result<DueDays, Error> {
     let today = Day::of(tx.now());
     let rows = {
@@ -134,7 +137,6 @@ pub(crate) fn backup_due(tx: &Tx<'_>) -> Result<DueDays, Error> {
         if uploaded.is_none() && carried(tx, conversation, day)?.is_empty() {
             continue;
         }
-        listed(tx, conversation, &text)?;
         segments.push(DueDay {
             conversation_id: conversation,
             day: text,
@@ -145,8 +147,8 @@ pub(crate) fn backup_due(tx: &Tx<'_>) -> Result<DueDays, Error> {
 }
 
 /// The segment of `conversation`'s `day`, sealed with the backup key: what this device carries of
-/// the day (its messages as they were sent, and their edits) and whether it holds the day whole.
-/// `backup_uploaded` then takes it as the server's, unless the day changes first.
+/// the day (its messages as they were sent, and their edits), whether it holds the day whole, and the
+/// day's version it holds, which `backup_uploaded` takes back once the segment is uploaded.
 pub(crate) fn backup_segment(tx: &Tx<'_>, request: SegmentDay) -> Result<Built, Error> {
     let day = parse_day(&request.day)?;
     let conversation = request.conversation_id;
@@ -176,27 +178,37 @@ pub(crate) fn backup_segment(tx: &Tx<'_>, request: SegmentDay) -> Result<Built, 
         },
         &deflated,
     )?;
-    listed(tx, conversation, &text)?;
+    let version: i64 = tx
+        .conn()
+        .query_row(
+            "SELECT version FROM segments WHERE conversation_id = ?1 AND day = ?2",
+            params![conversation.as_bytes().as_slice(), text],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
     Ok(Built {
         data,
         key_id: key_id.to_vec(),
         complete,
+        version,
     })
 }
 
-/// The server holds `conversation`'s `day` now, complete or not: the segment `backup_segment` built,
-/// which the client uploaded, or another device's the client found there and kept. The day isn't
-/// due any more, unless it changed since this device last listed or built it.
+/// The server holds `conversation`'s `day` now, as `backup_segment` built it at `version` and the
+/// client uploaded it, complete or not. The day isn't due any more, unless it changed since that
+/// build: an older build's upload leaves a newer change due.
 pub(crate) fn backup_uploaded(tx: &Tx<'_>, request: Uploaded) -> Result<Empty, Error> {
     let day = parse_day(&request.day)?.to_string();
     tx.conn().execute(
-        "INSERT INTO segments (conversation_id, day, dirty, listed, uploaded) \
-         VALUES (?1, ?2, 0, 0, ?3) ON CONFLICT (conversation_id, day) DO UPDATE SET \
-         uploaded = excluded.uploaded, dirty = dirty AND NOT listed, listed = 0",
+        "INSERT INTO segments (conversation_id, day, dirty, uploaded) VALUES (?1, ?2, 0, ?3) \
+         ON CONFLICT (conversation_id, day) DO UPDATE SET uploaded = excluded.uploaded, \
+         dirty = dirty AND version != ?4",
         params![
             request.conversation_id.as_bytes().as_slice(),
             day,
-            request.complete
+            request.complete,
+            request.version
         ],
     )?;
     Ok(Empty {})
@@ -223,9 +235,9 @@ pub(crate) fn backup_import(tx: &Tx<'_>, request: SegmentData) -> Result<Importe
     let same =
         records.len() == all.len() && same_records(carried(tx, conversation, opened.day)?, records);
     tx.conn().execute(
-        "INSERT INTO segments (conversation_id, day, dirty, listed, uploaded) \
-         VALUES (?1, ?2, ?3, 0, ?4) ON CONFLICT (conversation_id, day) DO UPDATE SET \
-         dirty = excluded.dirty, listed = 0, uploaded = excluded.uploaded",
+        "INSERT INTO segments (conversation_id, day, dirty, uploaded) VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT (conversation_id, day) DO UPDATE SET dirty = excluded.dirty, \
+         uploaded = excluded.uploaded",
         params![
             conversation.as_bytes().as_slice(),
             opened.day.to_string(),
@@ -338,16 +350,6 @@ fn complete(tx: &Tx<'_>, conversation: Uuid, day: Day) -> Result<bool, Error> {
 fn carried(tx: &Tx<'_>, conversation: Uuid, day: Day) -> Result<Vec<Record>, Error> {
     let (start, end) = day.bounds();
     messages::records_for(tx, conversation, start, end)
-}
-
-/// The day was handed out: once the server holds it, `backup_uploaded` takes it as this device
-/// holds it now, unless it changes first.
-fn listed(tx: &Tx<'_>, conversation: Uuid, day: &str) -> Result<(), Error> {
-    tx.conn().execute(
-        "UPDATE segments SET listed = 1 WHERE conversation_id = ?1 AND day = ?2",
-        params![conversation.as_bytes().as_slice(), day],
-    )?;
-    Ok(())
 }
 
 /// Whether two sets of records are the same, in whatever order.
