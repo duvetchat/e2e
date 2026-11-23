@@ -508,7 +508,7 @@ fn reset_welcome_goes_by_the_reset_not_the_record() {
 }
 
 #[test]
-fn re_added_member_goes_by_the_rules_not_the_record() {
+fn re_added_member_keeps_to_the_record() {
     let mut server = FakeServer::new();
     let (a, b, c) = (new_id(), new_id(), new_id());
     let [mut a1, mut b1, mut c1] = new_devices(&mut server, [a, b, c]);
@@ -526,8 +526,9 @@ fn re_added_member_goes_by_the_rules_not_the_record() {
     let add = adding(&mut server, conversation, b);
     server.commit(&mut a1, conversation, add).unwrap();
 
-    // B1's welcome to that later epoch, even with B1's record from before the cutover beside it,
-    // goes by the rules alone: only the founding welcome is held to the record.
+    // B1's welcome to that later epoch, with B1's record from before the cutover beside it, keeps
+    // to it: the founders still listed, A and C, are the record's, in its order, and A, its owner,
+    // still owns the group. B entered again later, by the owner's commit.
     let mut entries = server.entries(conversation)[3..].to_vec();
     assert_eq!(entries[1]["kind"], "welcome");
     entries[1]["expected"] = json!({"owner": a, "members": [a, b, c]});
@@ -542,6 +543,129 @@ fn re_added_member_goes_by_the_rules_not_the_record() {
     server.deliver_all(&mut [&mut a1, &mut c1]);
     let state = same_group(&mut [&mut a1, &mut b1, &mut c1], conversation);
     assert_eq!(members(&state), [a, c, b]);
+}
+
+/// A conversation from before the cutover whose group X founded: A's client showed it with A, its
+/// owner, and B, and the server lists X, an account of its own, too. X's first commit brings no
+/// device but its own. A1, X1, the conversation, and A's client's record of it.
+fn planted_founder(server: &mut FakeServer) -> (TestDevice, TestDevice, Uuid, Value) {
+    let (a, b, x) = (new_id(), new_id(), new_id());
+    let [a1, _b1, mut x1] = new_devices(server, [a, b, x]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b, x], true);
+    let mut create = server.create_group(conversation);
+    create["key_packages"] = json!({});
+    server.commit(&mut x1, conversation, create).unwrap();
+    (a1, x1, conversation, json!({"owner": a, "members": [a, b]}))
+}
+
+#[test]
+fn planted_founder_is_refused_in_a_later_welcome() {
+    let mut server = FakeServer::new();
+    let (mut a1, mut x1, conversation, record) = planted_founder(&mut server);
+
+    // X brings A1 in its next commit, which a server that skips its validator queues. A1, with its
+    // record beside the welcome, refuses it: X is a founder the record doesn't have.
+    let key_package = json!(server.last_resort(a1.id));
+    let (commit, welcome) = add_by_hand(&mut x1, conversation, None, &key_package);
+    server.force(conversation, "commit", commit);
+    let seq = server.force(conversation, "welcome", welcome);
+    let mut entry = server.entries(conversation).last().unwrap().clone();
+    entry["expected"] = record;
+    let refused = ok(&mut a1.core, apply(conversation, &[entry]));
+    assert_eq!(
+        results(&[refused]),
+        [json!([seq, "welcome", "rejected", "member_list_mismatch"])]
+    );
+    assert_eq!(a1.no_group(conversation)["what"], "group");
+}
+
+#[test]
+fn planted_founder_is_refused_on_an_external_join() {
+    let mut server = FakeServer::new();
+    let (mut a1, _, conversation, record) = planted_founder(&mut server);
+
+    // A1 joins by external commit, with its record as a welcome takes it: refused, as X is a
+    // founder the record doesn't have.
+    let mut join = joining(&server, conversation);
+    join["expected"] = record;
+    let refused = error(&mut a1.core, join);
+    assert_eq!(
+        (&refused["code"], &refused["rule"]),
+        (&json!("rule_violation"), &json!("member_list_mismatch"))
+    );
+    assert_eq!(a1.no_group(conversation)["what"], "group");
+}
+
+#[test]
+fn new_devices_keep_to_the_record() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut b1] = new_devices(&mut server, [a, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], true);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    // B gets two devices after the cutover, whose client has B's record of the conversation. B3
+    // joins by external commit with it, at a later epoch: the founders, A and B, are the record's.
+    let [mut b2, mut b3] = new_devices(&mut server, [b, b]);
+    let record = json!({"owner": a, "members": [a, b]});
+    server.introduce(&mut a1);
+    let mut join = joining(&server, conversation);
+    join["expected"] = record.clone();
+    server.commit(&mut b3, conversation, join).unwrap();
+    server.deliver(&mut a1);
+
+    // A1 brings B2 in its next commit, made by hand, as no command adds a member's device, and B2
+    // takes the welcome with the record beside it.
+    let key_package = json!(server.last_resort(b2.id));
+    let (commit, welcome) = add_by_hand(&mut a1, conversation, None, &key_package);
+    server.force(conversation, "commit", commit);
+    let seq = server.force(conversation, "welcome", welcome);
+    let mut entry = server.entries(conversation).last().unwrap().clone();
+    entry["expected"] = record;
+    let taken = ok(&mut b2.core, apply(conversation, &[entry]));
+    assert_eq!(
+        results(&[taken]),
+        [json!([seq, "welcome", "applied", null])]
+    );
+    assert_eq!(members(&b2.group(conversation)), [a, b]);
+}
+
+#[test]
+fn reset_welcome_keeps_a_new_device_to_the_record() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1, mut b1, mut c1] = new_devices(&mut server, [a, b, c]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], true);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    // A adds C after the cutover. Then B gets a device that never held the group, whose client has
+    // B's record from before the cutover.
+    let add = adding(&mut server, conversation, c);
+    server.commit(&mut a1, conversation, add).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1]);
+    let [mut b2] = new_devices(&mut server, [b]);
+    b2.remember(conversation, Some(a), &[a, b]);
+    server.introduce(&mut a1);
+
+    // A resets the group. B2's welcome to the next generation, with the record beside it, has C
+    // among that generation's founders, a user the record doesn't have: B2 refuses it.
+    let reset = json!({
+        "cmd": "reset_group",
+        "conversation_id": conversation,
+        "key_packages": server.claim(&[a, b, c]),
+    });
+    server.commit(&mut a1, conversation, reset).unwrap();
+    let refused = server.deliver(&mut b2);
+    assert_eq!(
+        results(&refused),
+        [json!([6, "welcome", "rejected", "member_list_mismatch"])]
+    );
+    assert_eq!(b2.no_group(conversation)["what"], "group");
 }
 
 #[test]
@@ -1004,12 +1128,12 @@ fn server_proposal_is_committed_by_next_writer() {
     );
 }
 
-/// `device` adds `user` from its own group state, without its core's rules, which keeps that
-/// state as it was: the commit and the welcome.
+/// `device` adds `key_package`'s device from its own group state, without its core's rules, which
+/// keeps that state as it was: the commit and the welcome. `user`, when given, enters the list.
 fn add_by_hand(
     device: &mut TestDevice,
     conversation: Uuid,
-    user: Uuid,
+    user: Option<Uuid>,
     key_package: &Value,
 ) -> (Vec<u8>, Vec<u8>) {
     let key_package = KeyPackageIn::tls_deserialize_exact_bytes(&bytes(key_package))
@@ -1020,21 +1144,23 @@ fn add_by_hand(
         let (mut group, _) = mls::load_group(tx, conversation)?;
         let own = tx.own_device()?;
         let context = group.public_group().group_context().clone();
-        let mut list = MemberList::from_group_context(&context).unwrap();
-        list.users.push(Entry {
-            user,
-            generation: 0,
-            epoch: context.epoch().as_u64() + 1,
-        });
-        let mut extensions = context.extensions().clone();
-        extensions.add_or_replace(list.to_extension()).unwrap();
         group.set_aad(CommitAad::new(Vec::new()).encode());
         let provider = tx.provider();
-        let bundle = group
-            .commit_builder()
-            .propose_adds([key_package])
-            .propose_group_context_extensions(extensions)
-            .unwrap()
+        let mut builder = group.commit_builder().propose_adds([key_package]);
+        if let Some(user) = user {
+            let mut list = MemberList::from_group_context(&context).unwrap();
+            list.users.push(Entry {
+                user,
+                generation: 0,
+                epoch: context.epoch().as_u64() + 1,
+            });
+            let mut extensions = context.extensions().clone();
+            extensions.add_or_replace(list.to_extension()).unwrap();
+            builder = builder
+                .propose_group_context_extensions(extensions)
+                .unwrap();
+        }
+        let bundle = builder
             .force_self_update(true)
             .load_psks(provider.storage())
             .unwrap()
@@ -1069,7 +1195,7 @@ fn invalid_commit_blocks_and_reset_recovers() {
 
     // So B2 makes it by hand, and a server that skips its validator queues it.
     let key_package = &add["users"][0]["key_packages"][0];
-    let (commit, welcome) = add_by_hand(&mut b2, conversation, c, key_package);
+    let (commit, welcome) = add_by_hand(&mut b2, conversation, Some(c), key_package);
     let commit_seq = server.force(conversation, "commit", commit);
     let welcome_seq = server.force(conversation, "welcome", welcome);
 

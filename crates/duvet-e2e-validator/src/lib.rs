@@ -571,6 +571,8 @@ fn rule_context(
         pending_server_removals: pending,
         enforce_pending: true,
         expected_initial: rules.expected_initial,
+        // A record is a client's, of what its person saw before the cutover.
+        record: None,
         external_sender: rules.external_sender,
     })
 }

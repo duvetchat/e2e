@@ -13,6 +13,7 @@ use openmls::prelude::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::apply::Expected;
 use super::members::Committed;
 use super::{
     ConversationId, Extra, GroupRow, Pending, REFRESH_AFTER_MS, can_commit,
@@ -51,6 +52,10 @@ pub(crate) struct JoinExternal {
     /// The group info of the group's latest epoch, as the API serves it.
     #[serde(with = "b64")]
     group_info: Vec<u8>,
+    /// For a conversation from before the cutover: the client's own record of it, as a welcome
+    /// entry's `expected`.
+    #[serde(default)]
+    expected: Option<Expected>,
 }
 
 #[derive(Serialize)]
@@ -233,7 +238,8 @@ pub(crate) fn refresh_due(tx: &Tx<'_>) -> Result<Due, Error> {
 /// API serves: a device on its user's list whose user is a member, coming back after it was
 /// removed or its state fell behind, or new to the group. Whatever this device had of the group
 /// goes, and the queue counts again from this commit. The group it enters is held to the rules
-/// first, as a welcome's is. Merged as it's made, it waits for `commit_result` all the same.
+/// first, and to the client's record of a conversation from before the cutover, as a welcome's is.
+/// Merged as it's made, it waits for `commit_result` all the same.
 pub(crate) fn join_external(tx: &Tx<'_>, request: JoinExternal) -> Result<Committed, Error> {
     let conversation = request.conversation_id;
     let own = tx.own_device()?;
@@ -335,7 +341,10 @@ pub(crate) fn join_external(tx: &Tx<'_>, request: JoinExternal) -> Result<Commit
     let context = group.public_group().group_context();
     let mut leaves = leaves(group.members()).map_err(violation)?;
     certify_leaves_by_pinned(tx, &mut leaves)?;
-    let ctx = rule_context(tx, leaves.values().map(|leaf| leaf.user))?;
+    let mut ctx = rule_context(tx, leaves.values().map(|leaf| leaf.user))?;
+    if let Some(record) = &request.expected {
+        record.hold(&mut ctx, request.generation, false, row.is_some());
+    }
     check_joined_state(&ctx, context, &leaves).map_err(violation)?;
 
     let commit = tls(bundle.commit())?;

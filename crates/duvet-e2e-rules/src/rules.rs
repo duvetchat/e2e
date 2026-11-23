@@ -89,6 +89,9 @@ pub struct RuleContext {
     pub enforce_pending: bool,
     /// The list epoch 0 must have, when any member may make it: a conversation from before the cutover.
     pub expected_initial: Option<MemberList>,
+    /// A device's record of a conversation from before the cutover, which a group it joins past the
+    /// founding must keep to ([`keeps_record`]).
+    pub record: Option<MemberList>,
     /// The API's signature key, the group's one external sender; not compared when unknown.
     pub external_sender: Option<Vec<u8>>,
 }
@@ -272,10 +275,10 @@ pub fn unlisted_candidates(change: &MembershipChange) -> impl Iterator<Item = Uu
 }
 
 /// Whether a group's state, as a device finds it, is one Duvet makes: Duvet's context, a
-/// well-formed member list (exactly `expected_initial`, when given), and every leaf certified for
-/// its own key, its device on its user's latest list, its user a member. Checked in this order.
-/// Where a state enters through no commit, this is what checks it: `check_change` from epoch 0 and
-/// the validator's `create`.
+/// well-formed member list (exactly `expected_initial`, and keeping to `record`, when given), and
+/// every leaf certified for its own key, its device on its user's latest list, its user a member.
+/// Checked in this order. Where a state enters through no commit, this is what checks it:
+/// `check_change` from epoch 0 and the validator's `create`.
 pub fn check_state(
     ctx: &RuleContext,
     context: &GroupContext,
@@ -328,6 +331,13 @@ fn state(
         {
             return Err(MemberListMismatch);
         }
+    }
+    if ctx
+        .record
+        .as_ref()
+        .is_some_and(|record| !keeps_record(&list, record))
+    {
+        return Err(MemberListMismatch);
     }
 
     for leaf in leaves.values() {
@@ -386,6 +396,27 @@ fn sender_key(sender: &ExternalSender) -> Result<Vec<u8>, RuleViolation> {
     let key =
         VLBytes::tls_deserialize(&mut encoded.as_slice()).map_err(|_| RuleViolation::Malformed)?;
     Ok(key.as_slice().to_vec())
+}
+
+/// Whether `list`, a group's well-formed member list, keeps to `record`, a device's record of the
+/// conversation from before the cutover, as a group it joins past the founding must: the same kind;
+/// the users still listed who entered at the generation's start, its founders, all in the record
+/// and in its order; and the record's owner, while a founder, still the owner, as only their
+/// leaving hands the group on. A user who entered later, a member added back among them, was added
+/// by the owner, under the rules.
+pub fn keeps_record(list: &MemberList, record: &MemberList) -> bool {
+    let founder = |user: Uuid| list.entry(user).is_some_and(|entry| entry.epoch == 0);
+    let mut recorded = record.users.iter().map(|entry| entry.user);
+    let founders_in_order = list
+        .users
+        .iter()
+        .filter(|entry| entry.epoch == 0)
+        .all(|entry| recorded.any(|user| user == entry.user));
+    let owner_kept = record
+        .owner
+        .filter(|&owner| founder(owner))
+        .is_none_or(|owner| list.owner == Some(owner));
+    list.kind == record.kind && founders_in_order && owner_kept
 }
 
 /// A member list as Duvet keeps it: at most 20 users, each once, entered in this generation and by

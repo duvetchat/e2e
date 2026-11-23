@@ -4,8 +4,8 @@
 //! Each kind of entry has its handler ([`EntryHandler`]); the order is this module's alone.
 
 use duvet_e2e_rules::{
-    Entry as ListEntry, Kind, LeaveStatement, MemberList, Place, RuleViolation, check_joined_state,
-    extract_change, group_id_parts, join_config, leaves, statement_user,
+    Entry as ListEntry, Kind, LeaveStatement, MemberList, Place, RuleContext, RuleViolation,
+    check_joined_state, extract_change, group_id_parts, join_config, leaves, statement_user,
 };
 use openmls::prelude::tls_codec::DeserializeBytes as _;
 use openmls::prelude::{
@@ -41,9 +41,9 @@ pub(crate) struct Entry {
     #[serde(with = "b64")]
     pub(crate) data: Vec<u8>,
     /// On the welcome of a conversation from before the cutover: its owner and members as this
-    /// device's client showed them then, from the client's own record (the API never gives it),
-    /// which the group must have. Only the founding welcome, the first commit's at generation 0, is
-    /// held to it; any later one, a member's added back or a new device's, goes by the rules.
+    /// device's client showed them then, from the client's own record (the API never gives it).
+    /// The founding welcome must have that list, and a later join keep its founders to it
+    /// ([`Expected::hold`]).
     #[serde(default)]
     pub(crate) expected: Option<Expected>,
     /// On the server's proposal to remove a leaf of a user who leaves: their signed statement, for
@@ -91,7 +91,8 @@ pub(crate) struct Expected {
 }
 
 impl Expected {
-    /// The list epoch 0 must have: a group's when there's an owner, a DM's when there isn't.
+    /// The record as a list at `generation`'s start: a group's when there's an owner, a DM's when
+    /// there isn't.
     fn list(&self, generation: u32) -> MemberList {
         let kind = if self.owner.is_some() {
             Kind::Group
@@ -99,6 +100,26 @@ impl Expected {
             Kind::Dm
         };
         entered_at_start(kind, self.owner, &self.members, generation)
+    }
+
+    /// Holds a group this device joins at `generation` to this record, in `ctx`. The founding
+    /// welcome, the first commit's at generation 0, must have the record's list. Any later join at
+    /// generation 0, and a join at a later generation by a device with no row for the conversation
+    /// (it never joined), must keep its founders to it (`keeps_record`). A device with a row joins
+    /// a later generation by the reset's expectation alone.
+    pub(crate) fn hold(
+        &self,
+        ctx: &mut RuleContext,
+        generation: u32,
+        founding: bool,
+        has_row: bool,
+    ) {
+        let list = self.list(generation);
+        if founding {
+            ctx.expected_initial = Some(list);
+        } else if generation == 0 || !has_row {
+            ctx.record = Some(list);
+        }
     }
 }
 
@@ -423,16 +444,13 @@ impl EntryHandler for Welcomes {
         certify_leaves_by_pinned(tx, &mut leaves)?;
         let context = staged.group_context();
         let epoch = context.epoch().as_u64();
-        // A client's record from before the cutover is the first group as it was made: only the
-        // founding welcome, the first commit's (generation 0, epoch 1), is held to it. Any later
-        // one goes by the rules, a reset's by its expectation.
-        let expected = entry
-            .expected
-            .as_ref()
-            .filter(|_| (generation, epoch) == (0, 1))
-            .map(|expected| expected.list(generation));
         let mut ctx = rule_context(tx, leaves.values().map(|leaf| leaf.user))?;
-        ctx.expected_initial = expected.or(reset);
+        ctx.expected_initial = reset;
+        if let Some(record) = &entry.expected {
+            // The founding welcome is the first commit's, at generation 0.
+            let founding = (generation, epoch) == (0, 1);
+            record.hold(&mut ctx, generation, founding, at.row.is_some());
+        }
         if let Err(violation) = check_joined_state(&ctx, context, &leaves) {
             welcome_asks_first(tx, &digest(&entry.data), &ctx, &leaves, violation)?;
             return Ok(rejected(violation.name()));

@@ -7,7 +7,7 @@ use duvet_e2e_rules::{
     CommitAad, DeviceCertificate, DeviceList, Entry, Kind, LeaveStatement, MEMBER_LIST_EXTENSION,
     MemberList, MembershipChange, Removed, RuleContext, RuleViolation, SUITE, check_change,
     check_joined_state, check_state, extract_change, group_config, group_id, join_config,
-    leaf_capabilities, leaves,
+    keeps_record, leaf_capabilities, leaves,
 };
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
@@ -1391,6 +1391,48 @@ fn legacy_creator_moving_itself_first_is_rejected() {
         check_change(&ctx, &own_change(&group, &[]).unwrap()),
         Err(RuleViolation::MemberListMismatch)
     );
+}
+
+#[test]
+fn joined_list_keeps_to_the_record() {
+    // A device's record of a conversation from before the cutover, O its owner, and the lists of
+    // groups it joins past the founding: the founders still listed (entered at epoch 0) must be the
+    // record's, in its order, and O, while one of them, the owner. Who entered later is the rules'.
+    let (o, a, b, x) = (new_id(), new_id(), new_id(), new_id());
+    let list = |kind, owner, users: &[(Uuid, u64)]| {
+        let users = users
+            .iter()
+            .map(|&(user, epoch)| Entry {
+                user,
+                generation: 0,
+                epoch,
+            })
+            .collect();
+        MemberList::new(kind, owner, users)
+    };
+    let record = list(Kind::Group, Some(o), &[(o, 0), (a, 0), (b, 0)]);
+    let keeps = |owner, users: &[(Uuid, u64)]| {
+        keeps_record(&list(Kind::Group, Some(owner), users), &record)
+    };
+    assert!(keeps(o, &[(o, 0), (a, 0), (b, 0)]), "the record");
+    assert!(keeps(o, &[(o, 0), (b, 0), (a, 4)]), "A added back");
+    assert!(keeps(o, &[(o, 0), (a, 0), (b, 0), (x, 2)]), "X added later");
+    assert!(keeps(a, &[(a, 0), (b, 0)]), "O gone, A its successor");
+    assert!(
+        keeps(a, &[(a, 0), (b, 0), (o, 5)]),
+        "O back, A still the owner"
+    );
+    assert!(!keeps(o, &[(o, 0), (a, 0), (b, 0), (x, 0)]), "X a founder");
+    assert!(
+        !keeps(o, &[(o, 0), (b, 0), (a, 0)]),
+        "the founders reordered"
+    );
+    assert!(
+        !keeps(a, &[(o, 0), (a, 0), (b, 0)]),
+        "A the owner, O a founder"
+    );
+    let dm = list(Kind::Dm, None, &[(o, 0), (a, 0)]);
+    assert!(!keeps_record(&dm, &record), "a DM");
 }
 
 #[test]
