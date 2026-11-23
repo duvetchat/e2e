@@ -45,11 +45,12 @@ pub(crate) const ROTATION_TRANSFER: &str = "rotation.transfer";
 const TRANSFER_FIXED: usize = 256;
 
 /// A rotation's transfer to a device that stays: `{v: 1, identity, backup_key,
-/// previous_backup_keys, certificate, device_list, sender}`. `identity` is the new identity's
-/// 32-byte secret, `backup_key` the new backup key, `previous_backup_keys` those before it (32
-/// bytes each, oldest first), `certificate` the receiving device's from the new identity,
-/// `device_list` the new list, and `sender` the sending device's certificate from the identity
-/// before, which the receiving device still holds.
+/// previous_backup_keys, certificate, device_list, previous_list, sender}`. `identity` is the new
+/// identity's 32-byte secret, `backup_key` the new backup key, `previous_backup_keys` those before
+/// it (32 bytes each, oldest first), `certificate` the receiving device's from the new identity,
+/// `device_list` the new list. `previous_list` and `sender` are of the identity before, which the
+/// receiving device still holds: the user's list as the sending device had it, and the sending
+/// device's certificate.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Transfer {
@@ -64,6 +65,8 @@ struct Transfer {
     certificate: Vec<u8>,
     #[serde(with = "serde_bytes")]
     device_list: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    previous_list: Vec<u8>,
     #[serde(with = "serde_bytes")]
     sender: Vec<u8>,
 }
@@ -180,10 +183,17 @@ pub(crate) fn rotate_keys(
         .clone()
         .ok_or_else(|| Error::Internal("the device has the identity but no certificate".into()))?;
     let kept = kept_keys(tx, own.user)?;
+    let previous_list = meta_get(tx, DEVICE_LIST)?
+        .ok_or_else(|| Error::Internal("the identity has no device list".into()))?;
     keep_earlier_identity(tx, own.user, &held)?;
     let (created, backup_key) = new_identity(tx, &own, staying)?;
     keep_previous(tx, own.user, &backup_key, &kept)?;
-    let transfers = hand_over(tx, &own, &keys, &sender, &backup_key, &kept)?;
+    let before = Before {
+        sender: &sender,
+        list: &previous_list,
+        backup_keys: &kept,
+    };
+    let transfers = hand_over(tx, &own, &keys, &backup_key, &before)?;
     // The new identity's certificates of the user's devices, this one's and those that stay.
     let certified = tx
         .own_device()?
@@ -254,17 +264,25 @@ fn staying_keys(
         .collect()
 }
 
+/// What a transfer carries of the identity before: the sending device's certificate, the user's
+/// list as the sending device had it, and the backup keys before the new one.
+struct Before<'a> {
+    sender: &'a [u8],
+    list: &'a [u8],
+    backup_keys: &'a [u8],
+}
+
 /// For each device of `keys`: a certificate of its keys from the new identity, which this device
-/// holds now, and its transfer, sealed to its HPKE key and signed by this device, with this
-/// device's certificate from the identity before, `sender`.
+/// holds now, and its transfer, sealed to its HPKE key and signed by this device, with what it
+/// carries of the identity before.
 fn hand_over(
     tx: &Tx<'_>,
     own: &OwnDevice,
     keys: &[Staying],
-    sender: &[u8],
     backup_key: &[u8],
-    previous: &[u8],
+    before: &Before<'_>,
 ) -> Result<Vec<Handed>, Error> {
+    let (sender, previous) = (before.sender, before.backup_keys);
     let identity = tx
         .own_identity()?
         .ok_or_else(|| Error::Internal("the new identity isn't stored".into()))?;
@@ -292,10 +310,15 @@ fn hand_over(
                 previous_backup_keys: Zeroizing::new(previous.to_vec()),
                 certificate: certificate.clone(),
                 device_list: list.clone(),
+                previous_list: before.list.to_vec(),
                 sender: sender.to_vec(),
             };
-            let capacity =
-                TRANSFER_FIXED + certificate.len() + list.len() + sender.len() + previous.len();
+            let capacity = TRANSFER_FIXED
+                + certificate.len()
+                + list.len()
+                + before.list.len()
+                + sender.len()
+                + previous.len();
             let mut payload = Zeroizing::new(Vec::with_capacity(capacity));
             ciborium::into_writer(&transfer, &mut *payload)
                 .map_err(|_| Error::Internal("a CBOR value couldn't be written".into()))?;
@@ -363,6 +386,20 @@ pub(crate) fn receive_rotation(
         return Err(Error::Exists {
             what: "identity".into(),
         });
+    }
+    // The user's list before the change, as the sending device had it: newer than this device's,
+    // it's taken as `observe_user` takes one (a device set up while this one was away). The
+    // identity this device holds signed it; a refusal further on undoes it with the rest.
+    let carried =
+        DeviceList::verify(&claimed.previous_list, &held).map_err(|_| signature("device_list"))?;
+    if carried.user != own.user {
+        return Err(rule("wrong_user"));
+    }
+    let newer = tx
+        .device_list_of(own.user)?
+        .is_none_or(|current| carried.version > current.version);
+    if newer {
+        meta_put(tx, DEVICE_LIST, &claimed.previous_list)?;
     }
     let sender =
         DeviceCertificate::verify(&claimed.sender, &held).map_err(|_| signature("certificate"))?;

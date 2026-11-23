@@ -900,8 +900,8 @@ fn devices_that_stay_take_the_new_identity() {
     same_group(&mut [&mut a1, &mut a3, &mut b1, &mut c1], group);
 }
 
-/// A rotation's transfer as the core writes it, for a test to make one of its own:
-/// `{v: 1, identity, backup_key, previous_backup_keys, certificate, device_list, sender}`.
+/// A rotation's transfer as the core writes it, for a test to make one of its own: `{v: 1,
+/// identity, backup_key, previous_backup_keys, certificate, device_list, previous_list, sender}`.
 #[derive(Serialize)]
 struct TransferPayload {
     v: u32,
@@ -915,6 +915,8 @@ struct TransferPayload {
     certificate: Vec<u8>,
     #[serde(with = "serde_bytes")]
     device_list: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    previous_list: Vec<u8>,
     #[serde(with = "serde_bytes")]
     sender: Vec<u8>,
 }
@@ -1030,6 +1032,7 @@ fn a_device_takes_only_a_transfer_that_holds_up() {
         device_list: DeviceList::new(a, new_key, 1, vec![a1.id])
             .sign(&new_identity)
             .unwrap(),
+        previous_list: bytes(&served["device_list"]),
         sender: served_certificate(&served, a1.id),
     };
     let unlisted = sealed_by(&mut a1, a3.id, &a3_hpke, &payload);
@@ -1109,8 +1112,15 @@ fn a_lost_device_leaves_the_groups_without_the_server() {
     let rotated = ok(&mut a1.core, rotate(&[a2.id]));
     server.take_identity(a, &rotated);
 
-    // A1 sends nothing while A2's leaf is in the group: it commits A2's removal first, which the
-    // server's validator takes, as A's latest list doesn't have A2.
+    // A1 sends nothing while A2's leaf is in the group. Its core first asks to observe its own user,
+    // as a device of A's may have come since it last saw the list; the list doesn't have A2, so A1
+    // commits A2's removal first, which the server's validator takes.
+    let asked = ready(&mut a1, group).unwrap_err();
+    assert_eq!(
+        (&asked["code"], &asked["users"]),
+        (&json!("needs_identities"), &json!([a.to_string()]))
+    );
+    assert_eq!(ok(&mut a1.core, server.observed(a))["state"], "same");
     let wait = ready(&mut a1, group).unwrap_err();
     assert_eq!(wait["code"], "pending_proposals");
     server
@@ -1149,12 +1159,16 @@ fn a_device_signed_off_the_list_leaves_without_the_server() {
     start(&mut server, &mut a1, group);
     server.deliver_all(&mut [&mut a1, &mut a2, &mut b1]);
 
-    // A1 takes A2 off A's list, which the server takes; it proposes no removal. A1 commits it.
+    // A1 takes A2 off A's list, which the server takes; it proposes no removal. A1 asks to observe
+    // its own user first, then commits it.
     let list = ok(
         &mut a1.core,
         json!({"cmd": "sign_device_list", "remove": [a2.id]}),
     );
     server.take_list(a, &list["device_list"]);
+    let asked = ready(&mut a1, group).unwrap_err();
+    assert_eq!(asked["code"], "needs_identities");
+    assert_eq!(ok(&mut a1.core, server.observed(a))["state"], "same");
     let wait = ready(&mut a1, group).unwrap_err();
     assert_eq!(wait["code"], "pending_proposals");
     server
@@ -1307,4 +1321,58 @@ fn a_staying_device_waits_for_its_transfer() {
     let applied = ok(&mut a3.core, apply(group, &entries));
     assert_eq!(outcomes(&applied), [json!("applied")]);
     same_group(&mut [&mut a1, &mut a3], group);
+}
+
+#[test]
+fn a_tablet_with_an_old_list_takes_the_transfer() {
+    let mut server = FakeServer::new();
+    let a = new_id();
+    let a1 = server.device(a);
+    let mut a2 = server.device(a);
+    meet(&mut server, &mut [&mut a2]);
+
+    // While A2, a tablet, is off, A sets up A3 under the identity it has: A2's list doesn't have A3.
+    let mut a3 = server.device(a);
+    server.introduce(&mut a3);
+
+    // A1 is lost, and A3 changes the keys without it. A3 isn't on the list A2 holds, but the
+    // transfer brings A's list from before the change, newer than A2's, which has it: A2 takes it.
+    let rotated = ok(&mut a3.core, rotating(&server, a, &[a1.id]));
+    let new_key = key(&rotated["identity_key"]);
+    server.take_identity(a, &rotated);
+    let transfer = server.inbox(a2.id).remove(0);
+    let taken = ok(&mut a2.core, receiving(&transfer, &new_key));
+    assert_eq!(key(&taken["identity_key"]), new_key);
+    assert_eq!(identity_key(&mut a2.core), new_key);
+}
+
+#[test]
+fn a_stale_own_list_asks_before_taking_a_device_out() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let mut a1 = server.device(a);
+    let mut a2 = server.device(a);
+    let mut b1 = server.device(b);
+    meet(&mut server, &mut [&mut a1, &mut a2, &mut b1]);
+
+    // A3 is set up while A2 is away, and B, who sees A's newer list, starts a group with A: its
+    // welcome brings A3's leaf to A2.
+    let mut a3 = server.device(a);
+    server.publish(&mut a3);
+    ok(&mut b1.core, server.observed(a));
+    let group = new_id();
+    server.conversation(group, Kind::Group, Some(b), &[b, a], false);
+    start(&mut server, &mut b1, group);
+    server.deliver(&mut a2);
+    assert!(devices(&a2.group(group)).contains(&a3.id));
+
+    // A3 isn't on the list A2 holds. Before taking it out, A2's core asks to observe its own user;
+    // the list it gets has A3, and A2 may send.
+    let asked = ready(&mut a2, group).unwrap_err();
+    assert_eq!(
+        (&asked["code"], &asked["users"]),
+        (&json!("needs_identities"), &json!([a.to_string()]))
+    );
+    assert_eq!(ok(&mut a2.core, server.observed(a))["state"], "same");
+    assert_eq!(ready(&mut a2, group), Ok(()));
 }

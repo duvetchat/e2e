@@ -271,10 +271,27 @@ pub fn load_group(tx: &Tx<'_>, conversation: Uuid) -> Result<(MlsGroup, GroupRow
 pub fn ready_to_send(tx: &Tx<'_>, conversation: Uuid) -> Result<(), Error> {
     let (group, row) = load_group(tx, conversation)?;
     can_commit(&group, &row)?;
-    if group.has_pending_proposals() || !unlisted_own_leaves(tx, &group)?.is_empty() {
+    if group.has_pending_proposals() {
+        return Err(Error::PendingProposals);
+    }
+    if !unlisted_own_leaves(tx, &group)?.is_empty() {
+        ask_about_own_list(tx)?;
         return Err(Error::PendingProposals);
     }
     Ok(())
+}
+
+/// The ask's key before this device takes out a device of its own user: one for every group, as
+/// what it checks, the own list, is the same everywhere.
+const OWN_LIST_ASK: &[u8] = b"own devices off the list";
+
+/// Before this device takes out a leaf of its own user whose device is off the user's list as it
+/// holds it: `needs_identities` for the own user, once per state of that list, as a device of the
+/// user may have been set up since this device last saw it. `Ok` once the client observed its own
+/// user at what this device knows of the list now.
+fn ask_about_own_list(tx: &Tx<'_>) -> Result<(), Error> {
+    let user = tx.own_user()?.ok_or_else(|| not_found("device"))?;
+    ask_first(tx, OWN_LIST_ASK, BTreeSet::from([user]))
 }
 
 /// The leaves in `group` of this device's own user whose devices are off the user's latest list
@@ -701,10 +718,13 @@ pub(crate) fn draft(
             _ => None,
         })
         .collect();
-    for unlisted in unlisted_own_leaves(tx, group)? {
-        if !going.contains(&unlisted.u32()) && !removes.contains(&unlisted) {
-            removes.push(unlisted);
-        }
+    let unlisted: Vec<LeafNodeIndex> = unlisted_own_leaves(tx, group)?
+        .into_iter()
+        .filter(|leaf| !going.contains(&leaf.u32()) && !removes.contains(leaf))
+        .collect();
+    if !unlisted.is_empty() {
+        ask_about_own_list(tx)?;
+        removes.extend(unlisted);
     }
     going.extend(removes.iter().map(|leaf| leaf.u32()));
 
