@@ -891,6 +891,46 @@ fn reset_welcome_keeps_a_new_device_to_the_record() {
 }
 
 #[test]
+fn removed_device_keeps_to_the_record_at_a_later_generation() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1, mut b1, mut c1] = new_devices(&mut server, [a, b, c]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], true);
+    b1.remember(conversation, Some(a), &[a, b]);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    // A adds C after the cutover, then removes B: B1 keeps its row, without the group.
+    let add = adding(&mut server, conversation, c);
+    server.commit(&mut a1, conversation, add).unwrap();
+    let remove = json!({"cmd": "remove_members", "conversation_id": conversation, "users": [b]});
+    server.commit(&mut a1, conversation, remove).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1]);
+    assert_eq!(b1.no_group(conversation)["what"], "membership");
+
+    // A resets the group and adds B back at the next generation. B1's welcome, its record beside
+    // it, lists C, a user the record doesn't have: B1 refuses it, from its row as without one.
+    let reset = json!({
+        "cmd": "reset_group",
+        "conversation_id": conversation,
+        "key_packages": server.claim(&[c]),
+    });
+    server.commit(&mut a1, conversation, reset).unwrap();
+    let add = adding(&mut server, conversation, b);
+    server.commit(&mut a1, conversation, add).unwrap();
+    assert_eq!(
+        results(&server.deliver(&mut b1)),
+        [
+            json!([6, "commit", "ignored", null]),
+            json!([7, "welcome", "ignored", null]),
+            json!([8, "commit", "ignored", null]),
+            json!([9, "welcome", "rejected", "member_list_mismatch"]),
+        ]
+    );
+}
+
+#[test]
 fn catch_up_after_many_epochs() {
     let mut server = FakeServer::new();
     let (a, b) = (new_id(), new_id());
