@@ -1263,3 +1263,48 @@ fn a_device_set_up_before_the_change_keeps_its_groups() {
     assert!(outcomes(&refused).contains(&json!("rejected")), "{refused}");
     assert_eq!(c1.group(group)["blocked"], true);
 }
+
+#[test]
+fn a_staying_device_waits_for_its_transfer() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let mut a1 = server.device(a);
+    let a2 = server.device(a);
+    let mut a3 = server.device(a);
+    let mut b1 = server.device(b);
+    meet(&mut server, &mut [&mut a1, &mut a3, &mut b1]);
+    let group = new_id();
+    server.conversation(group, Kind::Group, Some(b), &[b, a], false);
+    start(&mut server, &mut b1, group);
+    server.deliver_all(&mut [&mut a1, &mut a3, &mut b1]);
+
+    // A1 changes the keys without A2, and renews its leaf under the new identity.
+    let rotated = ok(&mut a1.core, rotating(&server, a, &[a2.id]));
+    let new_key = key(&rotated["identity_key"]);
+    server.take_identity(a, &rotated);
+    server
+        .commit(&mut a1, group, command("refresh", group))
+        .unwrap();
+
+    // A3 takes the queue before its transfer. Its core asks to observe its own user, whom the
+    // server serves under the identity A3 doesn't hold yet; applied again, it asks again, and blocks
+    // nothing.
+    let entries = server.entries(group);
+    for _ in 0..2 {
+        let asked = error(&mut a3.core, apply(group, &entries));
+        assert_eq!(
+            (&asked["code"], &asked["users"]),
+            (&json!("needs_identities"), &json!([a.to_string()]))
+        );
+        let seen = ok(&mut a3.core, server.observed(a));
+        assert_eq!(seen["reason"], "not_own_identity");
+    }
+    assert_eq!(a3.group(group)["blocked"], false);
+
+    // Once it takes its transfer, the queue applies.
+    let transfer = server.inbox(a3.id).remove(0);
+    ok(&mut a3.core, receiving(&transfer, &new_key));
+    let applied = ok(&mut a3.core, apply(group, &entries));
+    assert_eq!(outcomes(&applied), [json!("applied")]);
+    same_group(&mut [&mut a1, &mut a3], group);
+}

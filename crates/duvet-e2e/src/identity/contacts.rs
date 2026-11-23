@@ -82,13 +82,17 @@ pub(crate) fn observe_user(
     let version = i64::try_from(list.version)
         .map_err(|_| invalid("device_list", "the device list's version is out of range"))?;
 
-    // The client observed the user anew: what `apply` asked about them was looked at.
-    tx.conn().execute(
-        "UPDATE observe_asks SET observed = 1 WHERE user_id = ?1",
-        [user.as_bytes().as_slice()],
-    )?;
-
+    // The client observed the user anew: what `apply` asked about them was looked at. But not for
+    // this device's own user under an identity it doesn't hold (a rotation whose transfer it hasn't
+    // taken yet): those asks stay open, and the queue waits for the transfer instead of blocking.
     let own = tx.own_user()? == Some(user);
+    if !own || tx.own_identity_key()? == Some(identity_key) {
+        tx.conn().execute(
+            "UPDATE observe_asks SET observed = 1 WHERE user_id = ?1",
+            [user.as_bytes().as_slice()],
+        )?;
+    }
+
     let pinned = if own {
         let key = tx
             .own_identity_key()?
