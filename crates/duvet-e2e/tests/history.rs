@@ -305,18 +305,18 @@ fn history_share_week() {
     assert_eq!(received["conversation_id"], json!(conversation));
     assert_eq!(received["user_id"], json!(a));
     let imported = ok(&mut b1.core, import(&shared));
-    assert_eq!(imported["imported"], 2);
+    assert_eq!(imported["imported"], 3);
 
-    // B1 has the week's messages as A1 had them, each marked as shared by A, and nothing from
-    // before the week. C's edit isn't applied: an edit counts only from its author's own package.
+    // B1 has the week as A1 had it, C's edit included on A's copy of C's message, each message
+    // marked as shared by A, and nothing from before the week.
     let shown = messages_of(&mut b1, conversation);
     assert_eq!(ids(&shown), [yesterday, five]);
     assert!(!ids(&shown).contains(&old));
     assert_eq!(shown[0]["user_id"], json!(a));
     assert_eq!(shown[0]["text"], "ayer");
     assert_eq!(shown[1]["user_id"], json!(c));
-    assert_eq!(shown[1]["text"], "hace cinco días");
-    assert_eq!(shown[1]["edited_at"], Value::Null);
+    assert_eq!(shown[1]["text"], "hace cinco días, editado");
+    assert!(shown[1]["edited_at"].is_i64());
     for message in &shown {
         assert_eq!(message["shared_by"], json!(a));
         assert_eq!(message["status"], "ok");
@@ -1918,6 +1918,131 @@ fn another_members_package_moves_no_message_to_another_author() {
     assert_eq!(shown[0]["text"], "lo que A escribió");
     assert_eq!(shown[0]["shared_by"], json!(a));
     assert_eq!(imported, 0);
+}
+
+/// `user`'s first device, added to `conversation` by `owner`'s device, which every device of
+/// `others` then observes and applies.
+fn added(
+    server: &mut FakeServer,
+    owner: &mut TestDevice,
+    others: &mut [&mut TestDevice],
+    conversation: Uuid,
+    user: Uuid,
+) -> TestDevice {
+    let mut device = server.device(user);
+    server.publish(&mut device);
+    server.introduce(&mut device);
+    server.introduce(owner);
+    for other in others.iter_mut() {
+        server.introduce(other);
+    }
+    let add = adding(server, conversation, user);
+    server.commit(owner, conversation, add).unwrap();
+    server.deliver(owner);
+    server.deliver(&mut device);
+    for other in others.iter_mut() {
+        server.deliver(other);
+    }
+    device
+}
+
+/// `from`'s share of all of `conversation` with `to`'s user, taken by `to`.
+fn share_all(
+    server: &mut FakeServer,
+    from: &mut TestDevice,
+    to: &mut TestDevice,
+    conversation: Uuid,
+) {
+    let shared = ok(
+        &mut from.core,
+        json!({
+            "cmd": "history_share",
+            "conversation_id": conversation,
+            "to_user": to.user,
+            "range": "all",
+            "devices": certificates(server, to.user),
+        }),
+    );
+    let sender = certificate(server, from.user, from.id);
+    take_package(server, to, &sender, &shared);
+}
+
+#[test]
+fn a_shared_edit_counts_on_its_sharers_copy_until_the_authors_own_comes() {
+    let mut server = FakeServer::new();
+    let (a, b, c, d) = (new_id(), new_id(), new_id(), new_id());
+    let (conversation, [mut a1, mut b1]) = group_of(&mut server, [a, b]);
+
+    // B writes and edits it.
+    let message = say(&mut server, &mut b1, conversation, "lo que B escribió");
+    let edited = ok(
+        &mut b1.core,
+        json!({
+            "cmd": "edit",
+            "conversation_id": conversation,
+            "message_id": message,
+            "text": "lo que B corrigió",
+        }),
+    );
+    server.post_change(
+        &b1,
+        conversation,
+        "edit",
+        message,
+        bytes(&edited["ciphertext"]),
+    );
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    // C comes in after it. A's share brings B's message and B's edit: C1 shows the edit, as A
+    // shared it, and marked so.
+    let mut c1 = added(&mut server, &mut a1, &mut [&mut b1], conversation, c);
+    share_all(&mut server, &mut a1, &mut c1, conversation);
+    let shown = messages_of(&mut c1, conversation);
+    assert_eq!(shown[0]["text"], "lo que B corrigió");
+    assert!(shown[0]["edited_at"].is_i64(), "{}", shown[0]);
+    assert_eq!(shown[0]["shared_by"], json!(a));
+
+    // A then shares C an edit B never made: it counts on A's copy, on A's word.
+    let invented = Record {
+        kind: RecordKind::Edit,
+        id: message,
+        seq: 1_000_000,
+        user: b,
+        device: b1.id,
+        sent: server.clock.now_ms() as u64 + 1000,
+        envelope: Envelope::Edit {
+            message_id: message,
+            text: "lo que A le hace decir".into(),
+        }
+        .encode()
+        .unwrap(),
+        shared_by: None,
+        reply_to: None,
+    };
+    let deflated = miniz_oxide::deflate::compress_to_vec(&cbor(&vec![invented]), 6);
+    let command = package_of(&mut server, &mut a1, &mut c1, conversation, &deflated);
+    ok(&mut c1.core, command);
+    let shown = messages_of(&mut c1, conversation);
+    assert_eq!(shown[0]["text"], "lo que A le hace decir");
+
+    // B's own share replaces A's copy: C1 shows B's text and B's own edits only, marked B's.
+    share_all(&mut server, &mut b1, &mut c1, conversation);
+    let shown = messages_of(&mut c1, conversation);
+    assert_eq!(shown[0]["text"], "lo que B corrigió");
+    assert_eq!(shown[0]["shared_by"], json!(b));
+
+    // What C1 shares on is what it shows: D, after it, gets B's edit, not the one A made up.
+    let mut d1 = added(
+        &mut server,
+        &mut a1,
+        &mut [&mut b1, &mut c1],
+        conversation,
+        d,
+    );
+    share_all(&mut server, &mut c1, &mut d1, conversation);
+    let shown = messages_of(&mut d1, conversation);
+    assert_eq!(shown[0]["text"], "lo que B corrigió");
+    assert_eq!(shown[0]["shared_by"], json!(c));
 }
 
 fn cbor(value: &impl serde::Serialize) -> Vec<u8> {

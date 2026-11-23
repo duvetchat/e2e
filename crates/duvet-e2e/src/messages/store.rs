@@ -451,8 +451,11 @@ pub(crate) fn echo_edit(
     message.as_deref().map(stored_uuid).transpose()
 }
 
-/// Sets a message's text to its author's latest edit (by when the API took it), or to the text it
-/// was sent with when it has none. An edit to no text leaves none.
+/// Sets a message's text to its author's latest edit that counts (by when the API took it), or to
+/// the text it was sent with when it has none. An edit to no text leaves none. An edit counts when
+/// this device has it itself, when it came in its author's own package, or when the member who
+/// shared this copy of the message shared it too: once the author's own copy replaces theirs, their
+/// edits no longer count.
 pub(crate) fn refresh_text(tx: &Tx<'_>, id: i64) -> Result<(), Error> {
     let row = by_id(tx, id)?;
     let (Some(message_id), Some(envelope), false) = (row.message_id, &row.envelope, row.deleted)
@@ -463,11 +466,13 @@ pub(crate) fn refresh_text(tx: &Tx<'_>, id: i64) -> Result<(), Error> {
         .conn()
         .query_row(
             "SELECT text, sent_at FROM edits WHERE conversation_id = ?1 AND message_id = ?2 \
-             AND user_id = ?3 ORDER BY sent_at DESC, id DESC LIMIT 1",
+             AND user_id = ?3 AND (shared_by IS NULL OR shared_by = ?3 OR shared_by IS ?4) \
+             ORDER BY sent_at DESC, id DESC LIMIT 1",
             params![
                 row.conversation.as_bytes().as_slice(),
                 message_id.as_bytes().as_slice(),
                 row.user.as_bytes().as_slice(),
+                row.shared_by.as_ref().map(|by| by.as_bytes().as_slice()),
             ],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -652,7 +657,8 @@ pub(crate) enum Scope {
 /// Hands `each` the records of `scope` sent from `since` on (all of them, with none), one at a
 /// time, oldest or newest first, in a package's order (by time, then number: every entry of a
 /// conversation's queue has its own), until it answers false: what a package carries, read
-/// without holding all of it. The same records `records_for` and `noted_records` give.
+/// without holding all of it. The records `records_for` and `noted_records` give, but of the edits
+/// only those that count on this device (`refresh_text`): a package carries what it shows.
 ///
 /// The indexes `messages_by_time` and `edits_by_time` give that order, so SQLite sorts nothing:
 /// it reads no more rows than `each` takes, never the whole range at once.
@@ -688,6 +694,7 @@ pub(crate) fn each_record(
          e.shared_by, NULL FROM edits e JOIN messages m ON m.message_id = e.message_id \
          AND m.conversation_id = e.conversation_id AND m.user_id = e.user_id \
          WHERE {edits} AND e.seq IS NOT NULL AND m.deleted = 0 AND m.status = 'ok' \
+         AND (e.shared_by IS NULL OR e.shared_by = m.user_id OR e.shared_by IS m.shared_by) \
          AND e.sent_at >= ?3 \
          ORDER BY 6 {order}, 3 {order}"
     ))?;
@@ -833,9 +840,10 @@ pub fn import(
 /// Brings in one `record` of `conversation` from a package `sharer` shared, marked as shared by
 /// them: as [`import`] does, but a message that waits takes only a record whose user is its sender
 /// as the API named them, a message record from its own author's package (`sharer` is its user)
-/// replaces a copy another member shared, and an edit counts only from its author's own package.
-/// One another member shares could put any text in its author's name, on a message this device
-/// may have read itself, so it's dropped. Whether it changed something.
+/// replaces a copy another member shared of that author's message, and another member's edit counts
+/// only on a copy that same member shared, whose text is already on their word and marked so. On a
+/// message this device read itself, or another sharer's copy, it's dropped: it could put any text
+/// in its author's name. Whether it changed something.
 pub fn import_shared(
     tx: &Tx<'_>,
     conversation: Uuid,
@@ -844,7 +852,14 @@ pub fn import_shared(
 ) -> Result<bool, Error> {
     match record.kind {
         RecordKind::Message => import_message(tx, conversation, record, Some(sharer), Some(sharer)),
-        RecordKind::Edit if record.user != sharer => Ok(false),
+        RecordKind::Edit if record.user != sharer => {
+            let on_their_copy =
+                by_message_id(tx, record.id)?.is_some_and(|row| row.shared_by == Some(sharer));
+            if !on_their_copy {
+                return Ok(false);
+            }
+            import_edit(tx, conversation, record, Some(sharer))
+        }
         RecordKind::Edit => import_edit(tx, conversation, record, Some(sharer)),
     }
 }
@@ -943,17 +958,19 @@ fn import_edit(
         return Ok(false);
     }
     // An edit is known by its message, its number and its author: another user's row under the
-    // same number neither stands in for the author's edit nor keeps it out.
+    // same number neither stands in for the author's edit nor keeps it out. Nor does a copy another
+    // member shared: only this device's own, or one the same package's sharer brought.
     let known: Option<i64> = tx
         .conn()
         .query_row(
             "SELECT id FROM edits WHERE conversation_id = ?1 AND message_id = ?2 AND seq = ?3 \
-             AND user_id = ?4",
+             AND user_id = ?4 AND (shared_by IS NULL OR shared_by IS ?5)",
             params![
                 conversation.as_bytes().as_slice(),
                 message_id.as_bytes().as_slice(),
                 seq,
-                record.user.as_bytes().as_slice()
+                record.user.as_bytes().as_slice(),
+                shared_by.as_ref().map(|by| by.as_bytes().as_slice())
             ],
             |row| row.get(0),
         )

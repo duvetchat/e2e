@@ -18,8 +18,8 @@
 //! it, verifies the package with that same device's key, inflates its records in steps, 256 MiB at
 //! most and one record at most a message's size, and imports them as shared by its user
 //! ([`crate::messages::import_shared`]): a message that waits takes only its sender's record, a
-//! copy another member shared gives way to its author's own, an edit counts only from its author's
-//! own package, and nothing else a device has is overwritten.
+//! copy another member shared gives way to its author's own, another member's edit counts only on
+//! a copy they shared, and nothing else a device has is overwritten.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
