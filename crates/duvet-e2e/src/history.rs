@@ -4,7 +4,9 @@
 //! - `history_share` packs what this device has of the last day, week, month or all of a
 //!   conversation, for a member who joined it later (decision 26).
 //! - `catch_up` packs what this device noted for a member who had no device while it sent
-//!   (decision 14), then empties the note.
+//!   (decision 14). The note stays until the client says the package is up
+//!   (`catch_up_delivered`), and then only what the package carried goes: a reply lost on the way
+//!   costs a package made again, and what didn't fit waits for the next.
 //!
 //! A package is the records' CBOR, deflated, under a header that says what it is ([`Header`]),
 //! signed by the device that made it under `duvet history share v1`: `{v: 1, header, records}`. It
@@ -33,7 +35,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::identity::{from_cbor, invalid, not_found, random, stored_key, stored_uuid, to_cbor};
-use crate::messages::{Record, forget_noted, import, noted_records, records_for};
+use crate::messages::{Empty, Record, RecordKind, import, noted_records, records_for};
 use crate::mls::GroupRow;
 use crate::parts::{PACKAGE_PART, TAG, fits, open_part, seal_part};
 use crate::protocol::b64;
@@ -50,6 +52,9 @@ pub(crate) const SHARE_KEY: &str = "history.key";
 pub(crate) const CATCH_UP_KEY: &str = "catch_up.key";
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// How long the server keeps a package: past it, a catch-up can't be delivered any more.
+const PACKAGE_KEPT_MS: i64 = 30 * DAY_MS;
 
 /// zlib's default level.
 const COMPRESSION: u8 = 6;
@@ -212,6 +217,14 @@ pub(crate) struct CatchUp {
     devices: Vec<Vec<u8>>,
 }
 
+/// `catch_up_delivered`: the client uploaded a catch-up this device made, and posted its keys.
+#[derive(Debug, Deserialize)]
+pub(crate) struct CatchUpDelivered {
+    conversation_id: Uuid,
+    user_id: Uuid,
+    share_id: Uuid,
+}
+
 /// `history_import`: a package whose key `receive_direct` took, as the server hands its parts over.
 #[derive(Debug, Deserialize)]
 pub(crate) struct HistoryImport {
@@ -269,20 +282,39 @@ pub fn share(
         device: own.device,
         to,
     };
-    pack(tx, &own, &header, &records, start, limit, &recipients)
+    let (shared, _) = pack(tx, &own, &header, &records, start, limit, &recipients)?;
+    Ok(shared)
 }
 
-/// A catch-up for a member of the conversation: what this device noted for them under the identity
-/// it pins for them now, in one package sealed to their devices. Then the note is emptied, and
-/// they're due no more. Nothing noted that a catch-up can carry is `not_found` (`catch_up`).
 pub(crate) fn catch_up(tx: &Tx<'_>, request: CatchUp) -> Result<Shared, Error> {
-    let (conversation, user) = (request.conversation_id, request.user_id);
+    catch_up_within(
+        tx,
+        request.conversation_id,
+        request.user_id,
+        &request.devices,
+        MAX_PACKAGE,
+    )
+}
+
+/// `catch_up` with the sealed package held to `limit` bytes (the command's is `MAX_PACKAGE`): what
+/// this device noted for `user` in `conversation` under the identity it pins for them now, the
+/// newest that fit, in one package sealed to their devices. The note stays: the messages the
+/// package carried are kept by its ID, and their notes go only once the client says it delivered
+/// it (`catch_up_delivered`). Until then the user stays due, and a catch-up whose reply was lost is
+/// made again. Nothing noted that a catch-up can carry is `not_found` (`catch_up`).
+pub fn catch_up_within(
+    tx: &Tx<'_>,
+    conversation: Uuid,
+    user: Uuid,
+    devices: &[Vec<u8>],
+    limit: usize,
+) -> Result<Shared, Error> {
     let own = sharing_with(tx, conversation, user, "user_id")?;
     let records = noted_records(tx, conversation, user)?;
     if records.is_empty() {
         return Err(not_found("catch_up"));
     }
-    let recipients = recipients(tx, user, &request.devices)?;
+    let recipients = recipients(tx, user, devices)?;
     let header = Header {
         kind: ShareKind::CatchUp,
         conversation,
@@ -290,11 +322,58 @@ pub(crate) fn catch_up(tx: &Tx<'_>, request: CatchUp) -> Result<Shared, Error> {
         device: own.device,
         to: user,
     };
-    // ponytail: the newest 64 MiB go and the note empties all the same, as a catch-up goes once;
-    // the rest would take one package after another until the note is empty.
-    let shared = pack(tx, &own, &header, &records, 0, MAX_PACKAGE, &recipients)?;
-    forget_noted(tx, conversation, user)?;
+    let (shared, carried) = pack(tx, &own, &header, &records, 0, limit, &recipients)?;
+    // A catch-up the server no longer keeps can't be delivered: its record goes, and its messages'
+    // notes stay for another.
+    tx.conn().execute(
+        "DELETE FROM catch_ups WHERE created_at < ?1",
+        [tx.now().saturating_sub(PACKAGE_KEPT_MS)],
+    )?;
+    let share = shared.sealed.share_id;
+    for record in carried
+        .iter()
+        .filter(|record| record.kind == RecordKind::Message)
+    {
+        tx.conn().execute(
+            "INSERT OR IGNORE INTO catch_ups (share_id, conversation_id, user_id, message, \
+             created_at) SELECT ?1, ?2, ?3, id, ?5 FROM messages \
+             WHERE conversation_id = ?2 AND message_id = ?4",
+            params![
+                share.as_bytes().as_slice(),
+                conversation.as_bytes().as_slice(),
+                user.as_bytes().as_slice(),
+                record.id.as_bytes().as_slice(),
+                tx.now(),
+            ],
+        )?;
+    }
     Ok(shared)
+}
+
+/// The client uploaded the catch-up `share_id` that this device made for `user_id` in
+/// `conversation_id`, and posted its keys: the notes of the messages it carried go, those of any
+/// other message stay for the next catch-up. One this device didn't make for them, or one already
+/// delivered, is `not_found` (`share`).
+pub(crate) fn catch_up_delivered(tx: &Tx<'_>, request: CatchUpDelivered) -> Result<Empty, Error> {
+    let (conversation, user, share) = (
+        request.conversation_id.as_bytes().as_slice(),
+        request.user_id.as_bytes().as_slice(),
+        request.share_id.as_bytes().as_slice(),
+    );
+    tx.conn().execute(
+        "DELETE FROM deviceless WHERE conversation_id = ?1 AND user_id = ?2 AND message IN \
+         (SELECT message FROM catch_ups WHERE share_id = ?3 AND conversation_id = ?1 \
+         AND user_id = ?2)",
+        params![conversation, user, share],
+    )?;
+    let delivered = tx.conn().execute(
+        "DELETE FROM catch_ups WHERE share_id = ?3 AND conversation_id = ?1 AND user_id = ?2",
+        params![conversation, user, share],
+    )?;
+    if delivered == 0 {
+        return Err(not_found("share"));
+    }
+    Ok(Empty {})
 }
 
 /// This device, sending a package of `conversation` to `to` (`field`): another user than its
@@ -316,37 +395,40 @@ fn sharing_with(
     Ok(own)
 }
 
-/// The package of the newest `records` that fit, sealed: see [`newest_that_fit`].
-fn pack(
+/// The package of the newest `records` that fit, sealed (see [`newest_that_fit`]), with the
+/// records it carries.
+fn pack<'r>(
     tx: &Tx<'_>,
     own: &OwnDevice,
     header: &Header,
-    records: &[Record],
+    records: &'r [Record],
     start: i64,
     limit: usize,
     recipients: &[(Uuid, [u8; 32])],
-) -> Result<Shared, Error> {
-    let (signed, start, truncated) = newest_that_fit(records, start, limit, |kept| {
+) -> Result<(Shared, &'r [Record]), Error> {
+    let (signed, start, first) = newest_that_fit(records, start, limit, |kept| {
         package(&own.signer, header, &deflate(kept)?)
     })?;
     let sealed = seal_for(tx, header.kind, header.conversation, &signed, recipients)?;
-    Ok(Shared {
+    let shared = Shared {
         sealed,
         start,
-        truncated,
-    })
+        truncated: first > 0,
+    };
+    Ok((shared, &records[first..]))
 }
 
 /// The package `build` makes of the newest of `records` (in the order they were sent) that fit:
 /// their CBOR within `MAX_RECORDS`, and the package, once sealed, within `limit`. With where its
 /// window starts (`start` when they all fit, else just after the newest record left out, so the
-/// package holds every record from then on) and whether any were left out.
+/// package holds every record from then on) and the first record it holds: any before were left
+/// out.
 fn newest_that_fit(
     records: &[Record],
     start: i64,
     limit: usize,
     build: impl Fn(&[Record]) -> Result<Vec<u8>, Error>,
-) -> Result<(Vec<u8>, i64, bool), Error> {
+) -> Result<(Vec<u8>, i64, usize), Error> {
     let sizes = records
         .iter()
         .map(|record| to_cbor(record).map(|bytes| bytes.len()))
@@ -367,7 +449,7 @@ fn newest_that_fit(
                     .saturating_add(1),
                 None => start,
             };
-            return Ok((package, start, first > 0));
+            return Ok((package, start, first));
         }
         if first == records.len() {
             return Err(Error::TooLarge {
@@ -744,8 +826,9 @@ fn open_parts(key: &[u8; 32], share: Uuid, parts: Vec<Vec<u8>>) -> Result<Vec<u8
 }
 
 /// The records `deflated` holds, read as they inflate, in steps: once more than `MAX_RECORDS`
-/// bytes inflated, `too_large`, and nothing more is inflated. A stream that isn't DEFLATE, or what
-/// it inflates to that isn't one list of records and nothing after, is `decrypt_failed` (`history`).
+/// bytes inflated, `too_large`, and nothing more is inflated. A stream that isn't DEFLATE, or
+/// what it inflates to that isn't one list of records and nothing after, is `decrypt_failed`
+/// (`history`).
 fn inflate_records(deflated: &[u8]) -> Result<Vec<Record>, Error> {
     let mut inflater = Inflater {
         state: InflateState::new_boxed(DataFormat::Raw),

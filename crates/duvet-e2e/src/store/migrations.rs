@@ -218,6 +218,17 @@ CREATE TABLE history_keys (
     received_at INTEGER NOT NULL
 );
 
+-- The messages each catch-up this device made carried, by package, until its client says it
+-- delivered it (catch_up_delivered): then their notes in deviceless go, and only theirs.
+CREATE TABLE catch_ups (
+    share_id BLOB NOT NULL,
+    conversation_id BLOB NOT NULL,
+    user_id BLOB NOT NULL,
+    message INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (share_id, message)
+);
+
 -- The backup's days: a row for each conversation and UTC day (YYYY-MM-DD) this device holds anything
 -- of, or the server holds a segment of as far as it knows. `dirty` while what the device holds of the
 -- day changed since the server last held the same; `version` counts the day's changes, so that

@@ -9,6 +9,7 @@ mod support;
 
 use duvet_e2e::history::{self, Header, MAX_PACKAGE, MAX_RECORDS, Range, ShareKind};
 use duvet_e2e::messages::Record;
+use duvet_e2e::parts::{open_part, seal_part};
 use duvet_e2e::{Clock, DirectMessage};
 use duvet_e2e_rules::{DeviceCertificate, Kind};
 use openmls::prelude::SignatureScheme;
@@ -624,15 +625,13 @@ fn decompression_bomb_is_too_large() {
     assert_eq!(messages_of(&mut b1, conversation), Vec::<Value>::new());
 }
 
-#[test]
-fn catch_up_delivers_what_was_missed() {
-    let mut server = FakeServer::new();
+/// A group A makes with B, who has no device yet, as A1's client knows: its conversation, the
+/// two users, and A1.
+fn deviceless_b(server: &mut FakeServer) -> (Uuid, [Uuid; 2], TestDevice) {
     let (a, b) = (new_id(), new_id());
-    let [mut a1] = new_devices(&mut server, [a]);
+    let [mut a1] = new_devices(server, [a]);
     let conversation = new_id();
     server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
-
-    // A makes the group with B, who has no device yet, as A1's client knows.
     let create = json!({
         "cmd": "create_group",
         "conversation_id": conversation,
@@ -649,6 +648,69 @@ fn catch_up_delivers_what_was_missed() {
         &mut a1.core,
         json!({"cmd": "without_devices", "conversation_id": conversation, "users": [b]}),
     );
+    (conversation, [a, b], a1)
+}
+
+/// `user`'s first device, which enters the group of `conversation` by external commit.
+fn first_device_joins(server: &mut FakeServer, user: Uuid, conversation: Uuid) -> TestDevice {
+    let mut device = server.device(user);
+    server.introduce(&mut device);
+    let joining = json!({
+        "cmd": "join_external",
+        "conversation_id": conversation,
+        "generation": 0,
+        "group_info": server.group_info(conversation),
+    });
+    server.commit(&mut device, conversation, joining).unwrap();
+    device
+}
+
+fn catch_up_command(server: &FakeServer, conversation: Uuid, user: Uuid) -> Value {
+    json!({
+        "cmd": "catch_up",
+        "conversation_id": conversation,
+        "user_id": user,
+        "devices": certificates(server, user),
+    })
+}
+
+fn delivered(conversation: Uuid, user: Uuid, share_id: &Value) -> Value {
+    json!({
+        "cmd": "catch_up_delivered",
+        "conversation_id": conversation,
+        "user_id": user,
+        "share_id": share_id,
+    })
+}
+
+/// Who `device` names as due a catch-up in `conversation`.
+fn due(device: &mut TestDevice, conversation: Uuid) -> Value {
+    ok(&mut device.core, apply(conversation, &[]))["catch_up_due"].clone()
+}
+
+/// `device` takes the key of `shared` from its inbox, from the device whose certificate is `from`,
+/// then the package: how many records it imported.
+fn take_package(
+    server: &mut FakeServer,
+    device: &mut TestDevice,
+    from: &str,
+    shared: &Value,
+) -> u64 {
+    post_keys(server, shared);
+    let taken = take_inbox(server, device, from);
+    assert!(
+        taken.iter().all(|reply| reply.get("ok").is_some()),
+        "{taken:?}"
+    );
+    ok(&mut device.core, import(shared))["imported"]
+        .as_u64()
+        .unwrap()
+}
+
+#[test]
+fn catch_up_delivers_what_was_missed() {
+    let mut server = FakeServer::new();
+    let (conversation, [a, b], mut a1) = deviceless_b(&mut server);
 
     // A1 writes twice while B has no device: both are noted for B.
     let first = encrypted(&mut a1, conversation, "para cuando llegues");
@@ -656,15 +718,7 @@ fn catch_up_delivers_what_was_missed() {
 
     // B's first device enters by external commit, and A1's messages reach the API after it,
     // encrypted at the epoch before: B1 can't read them, and shows them as waiting.
-    let mut b1 = server.device(b);
-    server.introduce(&mut b1);
-    let joining = json!({
-        "cmd": "join_external",
-        "conversation_id": conversation,
-        "generation": 0,
-        "group_info": server.group_info(conversation),
-    });
-    server.commit(&mut b1, conversation, joining).unwrap();
+    let mut b1 = first_device_joins(&mut server, b, conversation);
     let first = post(&mut server, &mut a1, conversation, first);
     let second = post(&mut server, &mut a1, conversation, second);
     server.deliver(&mut b1);
@@ -680,22 +734,19 @@ fn catch_up_delivers_what_was_missed() {
     let taken = server.deliver(&mut a1);
     assert_eq!(taken[0]["catch_up_due"], json!([b]));
 
-    // A1 makes it, sealed to B1, and the register empties: B is due nothing more.
-    let catch_up = json!({
-        "cmd": "catch_up",
-        "conversation_id": conversation,
-        "user_id": b,
-        "devices": certificates(&server, b),
-    });
-    let caught = ok(&mut a1.core, catch_up.clone());
+    // A1 makes it, sealed to B1. B stays due until the client says the package is delivered;
+    // then nothing is left to catch up.
+    let caught = ok(&mut a1.core, catch_up_command(&server, conversation, b));
     assert_eq!(caught["truncated"], false);
     assert_eq!(caught["keys"].as_array().unwrap().len(), 1);
     assert_eq!(caught["keys"][0]["device_id"], json!(b1.id));
-    assert_eq!(
-        ok(&mut a1.core, apply(conversation, &[]))["catch_up_due"],
-        json!([])
+    assert_eq!(due(&mut a1, conversation), json!([b]));
+    ok(
+        &mut a1.core,
+        delivered(conversation, b, &caught["share_id"]),
     );
-    let nothing = error(&mut a1.core, catch_up);
+    assert_eq!(due(&mut a1, conversation), json!([]));
+    let nothing = error(&mut a1.core, catch_up_command(&server, conversation, b));
     assert_eq!(refusal(&nothing), json!(["not_found", "catch_up"]));
 
     // B1 takes the key, then the package: what waited is there, marked as shared by A.
@@ -716,6 +767,218 @@ fn catch_up_delivers_what_was_missed() {
         assert_eq!(message["user_id"], json!(a));
         assert_eq!(message["shared_by"], json!(a));
     }
+}
+
+#[test]
+fn a_lost_catch_up_is_made_again() {
+    let mut server = FakeServer::new();
+    let (conversation, [a, b], mut a1) = deviceless_b(&mut server);
+    let first = say(&mut server, &mut a1, conversation, "uno");
+    let second = say(&mut server, &mut a1, conversation, "dos");
+    let mut b1 = first_device_joins(&mut server, b, conversation);
+    server.introduce(&mut a1);
+    server.deliver(&mut a1);
+    assert_eq!(due(&mut a1, conversation), json!([b]));
+
+    // A1 makes B's catch-up, and its reply is lost before anything is uploaded: nothing is
+    // forgotten, and B is still due one.
+    ok(&mut a1.core, catch_up_command(&server, conversation, b));
+    assert_eq!(due(&mut a1, conversation), json!([b]));
+
+    // The next one carries everything again.
+    let caught = ok(&mut a1.core, catch_up_command(&server, conversation, b));
+    let from = certificate(&server, a, a1.id);
+    assert_eq!(take_package(&mut server, &mut b1, &from, &caught), 2);
+    assert_eq!(ids(&messages_of(&mut b1, conversation)), [second, first]);
+}
+
+#[test]
+fn delivered_forgets_only_what_its_package_carried() {
+    let mut server = FakeServer::new();
+    let (conversation, [a, b], mut a1) = deviceless_b(&mut server);
+    let first = say(&mut server, &mut a1, conversation, "uno");
+    // Another message waits for the API's answer when the catch-up is made: no catch-up can
+    // carry it yet.
+    let late = encrypted(&mut a1, conversation, "todavía sin respuesta");
+    let mut b1 = first_device_joins(&mut server, b, conversation);
+    server.introduce(&mut a1);
+    server.deliver(&mut a1);
+    let caught = ok(&mut a1.core, catch_up_command(&server, conversation, b));
+
+    // The late message gets its answer, then the first package is delivered: its message's note
+    // goes, the late one's stays, and B is still due.
+    let late = post(&mut server, &mut a1, conversation, late);
+    ok(
+        &mut a1.core,
+        delivered(conversation, b, &caught["share_id"]),
+    );
+    assert_eq!(due(&mut a1, conversation), json!([b]));
+
+    // The same package again, or one this device didn't make, is not found.
+    let again = error(
+        &mut a1.core,
+        delivered(conversation, b, &caught["share_id"]),
+    );
+    assert_eq!(refusal(&again), json!(["not_found", "share"]));
+    let unknown = error(&mut a1.core, delivered(conversation, b, &json!(new_id())));
+    assert_eq!(refusal(&unknown), json!(["not_found", "share"]));
+
+    // The next catch-up carries the late message alone; once it's delivered, B is due nothing.
+    let next = ok(&mut a1.core, catch_up_command(&server, conversation, b));
+    let from = certificate(&server, a, a1.id);
+    assert_eq!(take_package(&mut server, &mut b1, &from, &caught), 1);
+    assert_eq!(take_package(&mut server, &mut b1, &from, &next), 1);
+    ok(&mut a1.core, delivered(conversation, b, &next["share_id"]));
+    assert_eq!(due(&mut a1, conversation), json!([]));
+    assert_eq!(ids(&messages_of(&mut b1, conversation)), [late, first]);
+}
+
+#[test]
+fn a_truncated_catch_up_leaves_the_oldest_for_the_next() {
+    let mut server = FakeServer::new();
+    let (conversation, [a, b], mut a1) = deviceless_b(&mut server);
+
+    // A1 writes twelve long messages, a second apart, while B has no device.
+    let mut written = Vec::new();
+    for seed in 0..12 {
+        written.push(say(&mut server, &mut a1, conversation, &noise(seed, 1500)));
+        server.clock.advance(1000);
+    }
+    let mut b1 = first_device_joins(&mut server, b, conversation);
+    server.introduce(&mut a1);
+    server.deliver(&mut a1);
+    let devices = certificate_bytes(&server, b);
+    let from = certificate(&server, a, a1.id);
+
+    // Under a smaller cap, the same function's catch-up carries the newest that fit.
+    let cut = a1
+        .core
+        .transaction(|tx| history::catch_up_within(tx, conversation, b, &devices, 6 * 1024))
+        .unwrap();
+    assert!(cut.truncated);
+    let cut = serde_json::to_value(&cut).unwrap();
+    let newest = take_package(&mut server, &mut b1, &from, &cut);
+    assert!(0 < newest && newest < 12, "{newest} of 12");
+    ok(&mut a1.core, delivered(conversation, b, &cut["share_id"]));
+
+    // The oldest stay noted: B is still due, and the next catch-up carries them.
+    assert_eq!(due(&mut a1, conversation), json!([b]));
+    let rest = a1
+        .core
+        .transaction(|tx| history::catch_up_within(tx, conversation, b, &devices, MAX_PACKAGE))
+        .unwrap();
+    assert!(!rest.truncated);
+    let rest = serde_json::to_value(&rest).unwrap();
+    assert_eq!(
+        take_package(&mut server, &mut b1, &from, &rest),
+        12 - newest
+    );
+    ok(&mut a1.core, delivered(conversation, b, &rest["share_id"]));
+    assert_eq!(due(&mut a1, conversation), json!([]));
+
+    // B1 has all twelve, in order.
+    let mut shown = ids(&messages_of(&mut b1, conversation));
+    shown.reverse();
+    assert_eq!(shown, written);
+}
+
+#[test]
+fn package_parts_keep_their_sizes() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let (conversation, [mut a1, mut b1]) = group_of(&mut server, [a, b]);
+    say(&mut server, &mut a1, conversation, "en partes");
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    let shared = ok(
+        &mut a1.core,
+        json!({
+            "cmd": "history_share",
+            "conversation_id": conversation,
+            "to_user": b,
+            "range": "all",
+            "devices": certificates(&server, b),
+        }),
+    );
+    post_keys(&mut server, &shared);
+    let from = certificate(&server, a, a1.id);
+    let taken = take_inbox(&mut server, &mut b1, &from);
+    assert!(taken[0].get("ok").is_some(), "{}", taken[0]);
+
+    // The package cut again in parts of other sizes, each sealed in its place under the package's
+    // own key (as B1 keeps it), so each would open: B1 refuses them by their sizes.
+    let share: Uuid = shared["share_id"].as_str().unwrap().parse().unwrap();
+    let key: [u8; 32] = b1
+        .rolled_back(|tx| {
+            Ok(tx.conn().query_row(
+                "SELECT key FROM history_keys WHERE share_id = ?1",
+                [share.as_bytes().as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?)
+        })
+        .try_into()
+        .unwrap();
+    let parts: Vec<Vec<u8>> = shared["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(bytes)
+        .collect();
+    let last = parts.len() - 1;
+    let package: Vec<u8> = parts
+        .iter()
+        .enumerate()
+        .flat_map(|(index, part)| {
+            open_part(&key, share, index as u64, index == last, part).unwrap()
+        })
+        .collect();
+    let (head, tail) = package.split_at(package.len() / 2);
+    let recut = [
+        b64(&seal_part(&key, share, 0, false, head)),
+        b64(&seal_part(&key, share, 1, true, tail)),
+    ];
+    let refused = error(
+        &mut b1.core,
+        json!({"cmd": "history_import", "share_id": share, "parts": recut}),
+    );
+    assert_eq!(refusal(&refused), json!(["decrypt_failed", "history"]));
+
+    // As it was cut, it opens.
+    ok(&mut b1.core, import(&shared));
+}
+
+#[test]
+fn parts_over_64_mib_are_too_large() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let (conversation, [mut a1, mut b1]) = group_of(&mut server, [a, b]);
+    let shared = ok(
+        &mut a1.core,
+        json!({
+            "cmd": "history_share",
+            "conversation_id": conversation,
+            "to_user": b,
+            "range": "all",
+            "devices": certificates(&server, b),
+        }),
+    );
+    post_keys(&mut server, &shared);
+    let from = certificate(&server, a, a1.id);
+    let taken = take_inbox(&mut server, &mut b1, &from);
+    assert!(taken[0].get("ok").is_some(), "{}", taken[0]);
+
+    // The server hands B1 more than 64 MiB of parts under that package: refused by their size
+    // before any opens. 64 MiB itself passes that check, and fails as a part in no place does.
+    let parts_of = |len: usize| {
+        json!({
+            "cmd": "history_import",
+            "share_id": shared["share_id"],
+            "parts": [b64(&vec![0u8; len])],
+        })
+    };
+    let refused = error(&mut b1.core, parts_of(MAX_PACKAGE + 1));
+    assert_eq!(refusal(&refused), json!(["too_large", MAX_PACKAGE]));
+    let refused = error(&mut b1.core, parts_of(MAX_PACKAGE));
+    assert_eq!(refusal(&refused), json!(["decrypt_failed", "history"]));
 }
 
 fn cbor(value: &impl serde::Serialize) -> Vec<u8> {

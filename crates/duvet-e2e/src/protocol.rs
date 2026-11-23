@@ -102,6 +102,7 @@ pub(crate) enum Command {
     HistoryShare(crate::history::HistoryShare),
     HistoryImport(crate::history::HistoryImport),
     CatchUp(crate::history::CatchUp),
+    CatchUpDelivered(crate::history::CatchUpDelivered),
 }
 
 pub(crate) fn parse(command: &str) -> Result<Command, Error> {
@@ -187,6 +188,9 @@ pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error
         Command::HistoryShare(request) => reply(crate::history::history_share(tx, request)?),
         Command::HistoryImport(request) => reply(crate::history::history_import(tx, request)?),
         Command::CatchUp(request) => reply(crate::history::catch_up(tx, request)?),
+        Command::CatchUpDelivered(request) => {
+            reply(crate::history::catch_up_delivered(tx, request)?)
+        }
     }
 }
 
