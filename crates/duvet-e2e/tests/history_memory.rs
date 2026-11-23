@@ -1,6 +1,7 @@
-//! The memory a package's import and a share take, as a global allocator counts what this test
-//! binary holds: a binary of its own, its tests one at a time, so nothing else allocates while one
-//! measures. SQLite's own allocations go through its allocator, not this one.
+//! The memory a package's import, a share and a catch-up take, as a global allocator counts what
+//! this test binary holds: a binary of its own, its tests one at a time, so nothing else allocates
+//! while one measures. SQLite's own allocations go through its allocator, not this one; SQLite
+//! counts them itself, and the tests read that count too.
 
 mod support;
 
@@ -66,12 +67,21 @@ static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 const MIB: usize = 1024 * 1024;
 
-/// What `f` returns, and the most held at once while it ran beyond what was held as it began.
-fn peak_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
+/// What `f` returns, and the most held at once while it ran beyond what was held as it began: by
+/// this binary's allocator, then by SQLite's, which keeps its own count (its pages, its sorts).
+fn peak_during<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
     let base = HELD.load(Relaxed);
     PEAK.store(base, Relaxed);
+    // SAFETY: SQLite reads and resets its memory counters under its own mutex, from any thread.
+    let sqlite_base = unsafe { rusqlite::ffi::sqlite3_memory_used() };
+    // SAFETY: as above; the reset makes the high-water mark what SQLite holds now.
+    unsafe { rusqlite::ffi::sqlite3_memory_highwater(1) };
     let out = f();
-    (out, PEAK.load(Relaxed).saturating_sub(base))
+    // SAFETY: as above.
+    let sqlite_peak = unsafe { rusqlite::ffi::sqlite3_memory_highwater(0) };
+    let held = PEAK.load(Relaxed).saturating_sub(base);
+    let sqlite_held = usize::try_from(sqlite_peak - sqlite_base).unwrap_or(0);
+    (out, held, sqlite_held)
 }
 
 /// A group of A and B, a device each, both in it: its conversation and the devices.
@@ -181,7 +191,7 @@ fn an_import_holds_one_record_at_a_time() {
     .to_string();
 
     // The import reads them one at a time: it never holds them all.
-    let (reply, peak) = peak_during(|| b1.core.handle(&command));
+    let (reply, peak, _) = peak_during(|| b1.core.handle(&command));
     let reply: Value = serde_json::from_str(&reply).unwrap();
     assert_eq!(reply["ok"]["imported"], 6144, "{reply}");
     assert!(peak < 8 * MIB, "the import held {} MiB at once", peak / MIB);
@@ -213,9 +223,54 @@ fn a_share_holds_one_record_at_a_time() {
     })
     .to_string();
 
-    // Sharing all of it reads the records one at a time, and deflates them as they're written.
-    let (reply, peak) = peak_during(|| a1.core.handle(&command));
+    // Sharing all of it reads the records one at a time, in an order SQLite doesn't sort, and
+    // deflates them as they're written.
+    let (reply, peak, sqlite) = peak_during(|| a1.core.handle(&command));
     let reply: Value = serde_json::from_str(&reply).unwrap();
     assert_eq!(reply["ok"]["truncated"], false, "{reply}");
     assert!(peak < 8 * MIB, "the share held {} MiB at once", peak / MIB);
+    assert!(sqlite < 8 * MIB, "SQLite held {} MiB at once", sqlite / MIB);
+}
+
+#[test]
+fn a_catch_up_holds_one_record_at_a_time() {
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let (conversation, mut a1, _b1) = group(&mut server, a, b);
+
+    // A1 has 24 MiB of messages of its own, all noted for B.
+    let records = messages_of_a(a, &a1, 6144);
+    a1.core
+        .transaction(|tx| {
+            duvet_e2e::messages::import(tx, conversation, &records, None)?;
+            tx.conn().execute(
+                "INSERT INTO deviceless (conversation_id, user_id, message) \
+                 SELECT conversation_id, ?1, id FROM messages WHERE conversation_id = ?2",
+                rusqlite::params![b.as_bytes().as_slice(), conversation.as_bytes().as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    drop(records);
+    let command = json!({
+        "cmd": "catch_up",
+        "conversation_id": conversation,
+        "user_id": b,
+        "devices": certificates(&server, b).iter().map(|signed| b64(signed)).collect::<Vec<_>>(),
+    })
+    .to_string();
+
+    // The catch-up reads them as a share does.
+    let (reply, peak, sqlite) = peak_during(|| a1.core.handle(&command));
+    let reply: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(reply["ok"]["truncated"], false, "{reply}");
+    assert!(
+        peak < 8 * MIB,
+        "the catch-up held {} MiB at once",
+        peak / MIB
+    );
+    assert!(sqlite < 8 * MIB, "SQLite held {} MiB at once", sqlite / MIB);
 }

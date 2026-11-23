@@ -233,6 +233,11 @@ CREATE TABLE catch_ups (
     PRIMARY KEY (share_id, message)
 );
 
+-- A conversation's messages and edits by time, then number: the order a history package carries
+-- them in, which a share or a catch-up reads without a sort.
+CREATE INDEX messages_by_time ON messages (conversation_id, sent_at, seq);
+CREATE INDEX edits_by_time ON edits (conversation_id, sent_at, seq);
+
 -- The backup's days: a row for each conversation and UTC day (YYYY-MM-DD) this device holds anything
 -- of, or the server holds a segment of as far as it knows. `dirty` while what the device holds of the
 -- day changed since the server last held the same; `version` counts the day's changes, so that

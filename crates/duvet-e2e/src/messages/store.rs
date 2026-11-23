@@ -650,9 +650,12 @@ pub(crate) enum Scope {
 }
 
 /// Hands `each` the records of `scope` sent from `since` on (all of them, with none), one at a
-/// time, oldest or newest first, in a package's order (by time, number, then message before edit),
-/// until it answers false: what a package carries, read without holding all of it. The same
-/// records `records_for` and `noted_records` give.
+/// time, oldest or newest first, in a package's order (by time, then number: every entry of a
+/// conversation's queue has its own), until it answers false: what a package carries, read
+/// without holding all of it. The same records `records_for` and `noted_records` give.
+///
+/// The indexes `messages_by_time` and `edits_by_time` give that order, so SQLite sorts nothing:
+/// it reads no more rows than `each` takes, never the whole range at once.
 pub(crate) fn each_record(
     tx: &Tx<'_>,
     scope: &Scope,
@@ -670,7 +673,7 @@ pub(crate) fn each_record(
         Scope::Noted { conversation, user } => (
             *conversation,
             *user,
-            format!("m.id IN ({})", deviceless::NOTED),
+            format!("m.conversation_id = ?1 AND m.id IN ({})", deviceless::NOTED),
             format!("e.conversation_id = ?1 AND m.id IN ({})", deviceless::NOTED),
         ),
     };
@@ -679,19 +682,19 @@ pub(crate) fn each_record(
         "SELECT 0, m.message_id, m.seq, m.user_id, m.device_id, m.sent_at, m.envelope, NULL, \
          m.shared_by, m.reply_to FROM messages m WHERE {messages} AND m.status = 'ok' \
          AND m.deleted = 0 AND m.message_id IS NOT NULL AND m.seq IS NOT NULL \
-         AND m.envelope IS NOT NULL AND (?3 IS NULL OR m.sent_at >= ?3) \
+         AND m.envelope IS NOT NULL AND m.sent_at >= ?3 \
          UNION ALL \
          SELECT 1, e.message_id, e.seq, e.user_id, e.device_id, e.sent_at, NULL, e.text, \
          e.shared_by, NULL FROM edits e JOIN messages m ON m.message_id = e.message_id \
          AND m.conversation_id = e.conversation_id AND m.user_id = e.user_id \
          WHERE {edits} AND e.seq IS NOT NULL AND m.deleted = 0 AND m.status = 'ok' \
-         AND (?3 IS NULL OR e.sent_at >= ?3) \
-         ORDER BY 6 {order}, 3 {order}, 1 {order}"
+         AND e.sent_at >= ?3 \
+         ORDER BY 6 {order}, 3 {order}"
     ))?;
     let mut rows = statement.query(params![
         conversation.as_bytes().as_slice(),
         user.as_bytes().as_slice(),
-        since
+        since.unwrap_or(i64::MIN)
     ])?;
     while let Some(row) = rows.next()? {
         let edit: bool = row.get(0)?;
