@@ -24,8 +24,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use duvet_e2e::{Clock, Core, FakeClock, OpenConfig};
-use duvet_e2e_rules::{Kind, group_id};
-use openmls::prelude::{MlsGroup, OpenMlsProvider};
+use duvet_e2e_rules::{DeviceCertificate, Kind, group_id};
+use openmls::prelude::{BasicCredential, MlsGroup, OpenMlsProvider, Proposal, Sender};
 use openmls::treesync::LeafNodeSource;
 use serde_json::{Value, json};
 use support::*;
@@ -64,6 +64,38 @@ fn messages(core: &mut Core, conversation: Uuid) -> Vec<Value> {
         json!({"cmd": "messages", "conversation_id": conversation, "limit": 100}),
     );
     page["messages"].as_array().unwrap().clone()
+}
+
+/// The proposals `core` holds in `conversation`'s group: whether each is the server's (the group's
+/// external sender), and the user and device of the leaf it removes, if it's a removal.
+fn pending(core: &mut Core, conversation: Uuid) -> Vec<(bool, Option<(Uuid, Uuid)>)> {
+    let group = ok(
+        core,
+        json!({"cmd": "group", "conversation_id": conversation}),
+    );
+    let id = group_id(conversation, group["generation"].as_u64().unwrap() as u32);
+    core.transaction(|tx| {
+        let group = MlsGroup::load(tx.provider().storage(), &id)
+            .unwrap()
+            .unwrap();
+        let removed = |proposal: &Proposal| {
+            let Proposal::Remove(remove) = proposal else {
+                return None;
+            };
+            let leaf = group.public_group().leaf(remove.removed()).unwrap();
+            let credential = BasicCredential::try_from(leaf.credential().clone()).unwrap();
+            let certificate = DeviceCertificate::read_unverified(credential.identity()).unwrap();
+            Some((certificate.user, certificate.device))
+        };
+        Ok(group
+            .pending_proposals()
+            .map(|queued| {
+                let external = matches!(queued.sender(), Sender::External(_));
+                (external, removed(queued.proposal()))
+            })
+            .collect())
+    })
+    .unwrap()
 }
 
 fn texts(core: &mut Core, conversation: Uuid) -> Vec<Value> {
@@ -340,8 +372,15 @@ fn opens(name: &str, fixture: &Value) {
             "{name}: {missed}"
         );
 
-        // B1 commits the removal it kept.
+        // B1 still holds the removal it kept, the server's, of B's other device, and commits it.
+        // Checked as such: without it, B1's commit would still take that leaf out, as one of
+        // B's own off B's list, once B1 had looked its own user up again (`needs_identities`).
         if fixture["proposal"]["conversation"] == json!(id) {
+            let kept = pending(&mut b1, id);
+            assert!(
+                matches!(kept[..], [(true, Some((user, device)))] if user == b && device != b1_id),
+                "{name}: B1 holds {kept:?}, not the server's removal of B's other device"
+            );
             queue.commit(
                 &mut b1,
                 json!({"cmd": "commit_pending", "conversation_id": id}),
