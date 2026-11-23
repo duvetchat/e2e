@@ -292,7 +292,7 @@ fn undecryptable(
 /// This device's own message or edit, back from the queue: known by its ciphertext, which MLS
 /// wouldn't open for it. A message takes the ID, the number and the time the API gave it, unless
 /// that ID can't be its own (`store::bind`): then its rows stay as they are, and the copy is still
-/// its own.
+/// its own. A message left without an ID keeps its ciphertext in the outbox, for a retry to send.
 fn own_echo(tx: &Tx<'_>, conversation: Uuid, entry: &Entry) -> Result<Option<Applied>, Error> {
     let nonce: Option<String> = tx
         .conn()
@@ -303,19 +303,25 @@ fn own_echo(tx: &Tx<'_>, conversation: Uuid, entry: &Entry) -> Result<Option<App
         )
         .optional()?;
     if let Some(nonce) = nonce {
-        if let Some(row) = store::by_nonce(tx, &nonce)? {
-            store::bind(
-                tx,
-                &row,
-                entry.message_id,
-                entry.seq,
-                entry.sent_at,
-                &entry.mentions,
-                entry.reply_to,
-            )?;
+        let spent = match store::by_nonce(tx, &nonce)? {
+            Some(row) => {
+                let bound = store::bind(
+                    tx,
+                    &row,
+                    entry.message_id,
+                    entry.seq,
+                    entry.sent_at,
+                    &entry.mentions,
+                    entry.reply_to,
+                )?;
+                bound || row.message_id.is_some()
+            }
+            None => true,
+        };
+        if spent {
+            tx.conn()
+                .execute("DELETE FROM outbox WHERE nonce = ?1", [&nonce])?;
         }
-        tx.conn()
-            .execute("DELETE FROM outbox WHERE nonce = ?1", [&nonce])?;
         return Ok(Some(Applied::Own));
     }
     let echo = Sha256::digest(&entry.data);

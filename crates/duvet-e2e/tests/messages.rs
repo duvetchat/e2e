@@ -570,6 +570,41 @@ fn the_id_of_another_message_is_refused() {
 }
 
 #[test]
+fn a_refused_echo_leaves_the_message_to_send_again() {
+    let (mut server, conversation, _, [mut a1, mut b1]) = dm();
+    let theirs = say(&mut server, &mut a1, conversation, "el mensaje de A");
+    server.deliver(&mut b1);
+
+    // The server labels the copy of B1's message with the ID of A's: B1 refuses that ID, and its
+    // message stays to be sent, with its ciphertext.
+    let envelope = json!({"text": "otra vez"});
+    let first = ok(
+        &mut b1.core,
+        encrypt(conversation, "again", envelope.clone()),
+    );
+    let ciphertext = bytes(&first["ciphertext"]);
+    let (id, seq) = server.post_message(&b1, conversation, "again", ciphertext, &[]);
+    label(&mut server, conversation, seq, theirs);
+    let taken = server.deliver(&mut b1);
+    assert_eq!(results(&taken), [json!([seq, "message", "own", null])]);
+
+    // Its retry is the same ciphertext, and the API's answer to it binds the message.
+    let again = ok(&mut b1.core, encrypt(conversation, "again", envelope));
+    assert_eq!(again, first);
+    let ciphertext = bytes(&again["ciphertext"]);
+    assert_eq!(
+        server.post_message(&b1, conversation, "again", ciphertext, &[]),
+        (id, seq)
+    );
+    ok(&mut b1.core, sent_command(conversation, "again", id, seq));
+    let shown = message(&mut b1, conversation, id).unwrap();
+    assert_eq!(
+        (&shown["status"], &shown["text"]),
+        (&json!("ok"), &json!("otra vez"))
+    );
+}
+
+#[test]
 fn a_copy_an_import_brought_gives_way() {
     // The API's answer before the queue's copy, then the other way around.
     for echo_first in [false, true] {
