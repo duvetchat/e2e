@@ -158,6 +158,12 @@ fn keep_message(
             filled(row.id)?;
             row.id
         }
+        // The copy an import brought first: this device has decrypted it now, so it's no longer one the
+        // API's word on deletions may take.
+        Some(row) if row.imported && row.user == from.user => {
+            store::decrypted(tx, row.id)?;
+            return Ok(Applied::Ignored);
+        }
         Some(_) => return Ok(Applied::Ignored),
     };
     store::set_mentions(tx, id, &entry.mentions)?;

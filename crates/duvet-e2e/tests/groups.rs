@@ -1992,3 +1992,38 @@ fn corrupted_proposal_queue_is_an_error() {
     let refused = b1.no_group(conversation);
     assert_eq!(refused["code"], "storage", "{refused}");
 }
+
+#[test]
+fn a_device_that_joined_by_welcome_asks_before_taking_a_leaf_out() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1, mut b1, mut c1] = new_devices(&mut server, [a, b, c]);
+    // B gets B2 once C1 has seen B's list: A1 and B1 see B's newer list, C1 doesn't.
+    let mut b2 = server.device(b);
+    server.publish(&mut b2);
+    for device in [&mut a1, &mut b1, &mut b2] {
+        server.introduce(device);
+    }
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
+
+    // A adds C. C1 enters by the welcome, which holds B2's leaf to B's identity alone: C1 still
+    // holds B's list without B2.
+    let add = adding(&mut server, conversation, c);
+    server.commit(&mut a1, conversation, add).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2, &mut c1]);
+    assert!(device_set(&c1.group(conversation)).contains(&b2.id));
+
+    // Before it sends, C1 asks about B, and is served B's newer list: B2 is on it, and C1 sends
+    // without taking B2 out.
+    let asked = ready(&mut c1, conversation).unwrap_err();
+    assert_eq!(
+        (&asked["code"], &asked["users"]),
+        (&json!("needs_identities"), &json!([b.to_string()]))
+    );
+    assert_eq!(ok(&mut c1.core, server.observed(b))["state"], "same");
+    assert_eq!(ready(&mut c1, conversation), Ok(()));
+    assert!(device_set(&c1.group(conversation)).contains(&b2.id));
+}

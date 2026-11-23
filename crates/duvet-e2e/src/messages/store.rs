@@ -284,6 +284,14 @@ pub(crate) struct Filled<'a> {
     pub(crate) imported: bool,
 }
 
+/// The row `id`, a copy an import brought, holds a message this device has now decrypted itself: only
+/// its author's deletion takes it from here on (`Row::imported`). Its text and edits stay as they are.
+pub(crate) fn decrypted(tx: &Tx<'_>, id: i64) -> Result<(), Error> {
+    tx.conn()
+        .execute("UPDATE messages SET imported = 0 WHERE id = ?1", [id])?;
+    Ok(())
+}
+
 pub(crate) fn fill(tx: &Tx<'_>, id: i64, filled: Filled<'_>) -> Result<(), Error> {
     tx.conn().execute(
         "UPDATE messages SET seq = ?2, user_id = ?3, device_id = ?4, sent_at = ?5, envelope = ?6, \

@@ -22,5 +22,6 @@ wasm-bindgen-futures.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dev-dependencies]
+miniz_oxide.workspace = true
 rusqlite.workspace = true
 wasm-bindgen-test.workspace = true

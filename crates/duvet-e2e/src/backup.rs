@@ -178,7 +178,8 @@ pub(crate) fn backup_segment(tx: &Tx<'_>, request: SegmentDay) -> Result<Built, 
         .unwrap_or(0);
     let complete = complete(tx, conversation, day)?;
     let mut records = carried(tx, conversation, day)?;
-    records.retain(|record| !request.deleted.contains(&record.id));
+    let deleted: HashSet<&Uuid> = request.deleted.iter().collect();
+    records.retain(|record| !deleted.contains(&record.id));
     let deflated = deflate(&records, MAX_SEGMENT)?;
     let key_id = recovery::key_id(&backup_key);
     let data = seal(

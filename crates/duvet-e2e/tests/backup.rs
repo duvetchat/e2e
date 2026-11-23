@@ -1989,3 +1989,30 @@ fn a_message_the_device_decrypted_goes_only_by_its_authors_deletion() {
     dm.server.deliver(&mut a2);
     assert_eq!(shown_ids(&mut a2, conversation), [stays]);
 }
+
+#[test]
+fn a_message_imported_first_is_the_devices_own_once_its_queue_brings_it() {
+    let (mut dm, mut a2) = dm_with_a2();
+    let (conversation, day) = (dm.conversation, dm.day);
+    // On `day` A1 writes, and A2 takes it from its queue; then B1 writes, and A2 stops there.
+    dm.at(day + HOUR);
+    let first = say(&mut dm.server, &mut dm.a1, conversation, "primero");
+    dm.server
+        .deliver_all(&mut [&mut dm.a1, &mut dm.b1, &mut a2]);
+    let later = say(&mut dm.server, &mut dm.b1, conversation, "después");
+    dm.deliver();
+
+    // The next day A2 imports A1's copy of the day, which brings B's message first, then takes its
+    // queue, which brings the same message: A2 has decrypted it.
+    dm.at(day + DAY_MS + HOUR);
+    let copy = back_up(&mut dm.a1, conversation, &utc_day(day));
+    imported(&mut a2, &copy["data"]);
+    dm.server.deliver(&mut a2);
+
+    // The API names it as deleted, though B never deleted it: A2 keeps it.
+    ok(
+        &mut a2.core,
+        json!({"cmd": "backup_import", "data": copy["data"], "deleted": [later]}),
+    );
+    assert_eq!(shown_ids(&mut a2, conversation), [later, first]);
+}

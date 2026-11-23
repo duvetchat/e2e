@@ -299,9 +299,11 @@ fn ask_about_lists(tx: &Tx<'_>, unlisted: &[(LeafNodeIndex, Uuid)]) -> Result<()
 
 /// The leaves in `group` whose devices are off their users' latest lists as this device holds them
 /// (removed from them, or left out of a rotation or a reset), this device's own aside, each with
-/// its user. Every leaf entered checked against a list this device knew, and the lists it keeps
-/// only move forward: a device off the latest one is a device its user took off. A user whose list
-/// this device doesn't hold has none here.
+/// its user. A user whose list this device doesn't hold has none here. A leaf is off a list
+/// this device holds because its user took its device off, or because this device holds a list older
+/// than the leaf: a welcome holds leaves to their user's identity alone, so a device that joined by
+/// one may never have seen the list that brought a leaf. So `pending_proposals` asks first
+/// (`ask_about_lists`): once the client observes the user, a leaf on their newer list stays.
 fn unlisted_leaves(tx: &Tx<'_>, group: &MlsGroup) -> Result<Vec<(LeafNodeIndex, Uuid)>, Error> {
     let own = group.own_leaf_index().u32();
     let mut lists = BTreeMap::new();

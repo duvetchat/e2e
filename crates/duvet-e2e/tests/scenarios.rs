@@ -465,6 +465,14 @@ fn holds(blob: &[u8], text: &str) -> bool {
         .any(|window| window == text.as_bytes())
 }
 
+/// Whether `blob` holds `text`, or inflates to bytes that do: a segment's or a package's records
+/// deflated and sent unsealed would hold it there.
+fn seen(blob: &[u8], text: &str) -> bool {
+    holds(blob, text)
+        || miniz_oxide::inflate::decompress_to_vec_with_limit(blob, 1 << 26)
+            .is_ok_and(|inflated| holds(&inflated, text))
+}
+
 /// A witness string goes everywhere a DM's words go: a message, a file's name and content, an edit,
 /// an answer, the day's backup segment, a history package and the keys sent with it. Afterwards no
 /// queue, inbox, key package, list, certificate, group state, nonce, file, segment or package the
@@ -653,7 +661,7 @@ fn witness_string_never_reaches_the_server() {
     assert!(stored.len() > 50, "{} blobs", stored.len());
     let found: Vec<&str> = stored
         .iter()
-        .filter(|(_, blob)| holds(blob, WITNESS))
+        .filter(|(_, blob)| seen(blob, WITNESS))
         .map(|(place, _)| place.as_str())
         .collect();
     assert_eq!(found, Vec::<&str>::new());
@@ -665,4 +673,7 @@ fn witness_string_never_reaches_the_server() {
     .encode()
     .unwrap();
     assert!(holds(&envelope, WITNESS));
+    // And through deflate: the envelope deflated, as a segment's records are, is found.
+    let deflated = miniz_oxide::deflate::compress_to_vec(&envelope.repeat(10), 6);
+    assert!(seen(&deflated, WITNESS));
 }

@@ -74,6 +74,14 @@ fn holds(blob: &[u8], text: &str) -> bool {
         .any(|window| window == text.as_bytes())
 }
 
+/// Whether `blob` holds `text`, or inflates to bytes that do: a blob deflated and sent unsealed
+/// would hold it there.
+fn seen(blob: &[u8], text: &str) -> bool {
+    holds(blob, text)
+        || miniz_oxide::inflate::decompress_to_vec_with_limit(blob, 1 << 26)
+            .is_ok_and(|inflated| holds(&inflated, text))
+}
+
 /// A device: a core in a database of its own.
 struct Device {
     core: Core,
@@ -256,8 +264,11 @@ impl Server {
         }
         self.group_infos
             .insert(conversation.to_owned(), reply["group_info"].clone());
+        // The committer takes its own commit back from the queue, after what came before it: a cursor
+        // it has stays, and a new one starts at the commit.
         self.cursors
-            .insert((conversation.to_owned(), device.id.clone()), seq);
+            .entry((conversation.to_owned(), device.id.clone()))
+            .or_insert(seq - 1);
         let result = ok(
             &mut device.core,
             json!({"cmd": "commit_result", "conversation_id": conversation, "accepted": true, "seq": seq}),
@@ -448,6 +459,9 @@ fn two_users_converse_and_a_member_comes_and_goes() {
     server.say(&mut b2, &conversation, "bienvenido, C");
     server.deliver(&mut c1);
     assert_eq!(c1.shown(&conversation)[0].1, "bienvenido, C");
+    // A1, the owner, takes its own commit back from the queue, and reads on.
+    server.deliver(&mut a1);
+    assert_eq!(a1.shown(&conversation)[0].1, "bienvenido, C");
 
     // A removes C: C1 leaves the group, and reads nothing written after.
     let removed = ok(
@@ -464,6 +478,8 @@ fn two_users_converse_and_a_member_comes_and_goes() {
     server.say(&mut a2, &conversation, "ya sin C");
     server.deliver_all(&mut [&mut b1, &mut c1]);
     assert_eq!(b1.shown(&conversation)[0].1, "ya sin C");
+    server.deliver(&mut a1);
+    assert_eq!(a1.shown(&conversation)[0].1, "ya sin C");
     assert!(
         c1.shown(&conversation)
             .iter()
@@ -521,8 +537,11 @@ fn witness_string_never_reaches_the_server() {
     assert!(held.len() > 400, "{} blobs", held.len());
     let found: Vec<&str> = held
         .iter()
-        .filter(|(_, blob)| holds(blob, WITNESS))
+        .filter(|(_, blob)| seen(blob, WITNESS))
         .map(|(place, _)| place.as_str())
         .collect();
     assert_eq!(found, Vec::<&str>::new());
+    // The search sees through deflate: a deflated copy of the witnessed text is found.
+    let deflated = miniz_oxide::deflate::compress_to_vec(witnessed.repeat(10).as_bytes(), 6);
+    assert!(seen(&deflated, WITNESS));
 }
