@@ -427,10 +427,17 @@ fn share_rejects_a_bad_signature_or_a_stranger() {
     server.take_list(a, &signed["device_list"]);
     assert_ne!(ok(&mut b1.core, server.observed(a))["state"], "rejected");
     let shared = ok(&mut a2.core, share_all.clone());
-    post_keys(&mut server, &shared);
-    let refused = take_inbox(&mut server, &mut b1, &a2_certificate);
+    let key = bytes(&shared["keys"][0]["message"]);
+    // B1 first asks to observe A anew, as its list of A may be old; at the same list, it refuses.
+    let asked = error(&mut b1.core, receive_direct(&key, &a2_certificate));
     assert_eq!(
-        refusal(&refused[0]["error"]),
+        (&asked["code"], &asked["users"]),
+        (&json!("needs_identities"), &json!([a]))
+    );
+    ok(&mut b1.core, server.observed(a));
+    let refused = error(&mut b1.core, receive_direct(&key, &a2_certificate));
+    assert_eq!(
+        refusal(&refused),
         json!(["rule_violation", "device_not_listed"])
     );
 
@@ -458,10 +465,15 @@ fn share_rejects_a_bad_signature_or_a_stranger() {
         b"a key",
     )
     .unwrap();
-    let refused = error(
-        &mut b1.core,
-        receive_direct(&key, &b64(&forged_certificate)),
+    // As an identity B1 hasn't observed yet may have signed it, B1 asks first, then refuses.
+    let forged = b64(&forged_certificate);
+    let asked = error(&mut b1.core, receive_direct(&key, &forged));
+    assert_eq!(
+        (&asked["code"], &asked["users"]),
+        (&json!("needs_identities"), &json!([a]))
     );
+    ok(&mut b1.core, server.observed(a));
+    let refused = error(&mut b1.core, receive_direct(&key, &forged));
     assert_eq!(
         refusal(&refused),
         json!(["invalid_signature", "certificate"])
@@ -979,6 +991,59 @@ fn parts_over_64_mib_are_too_large() {
     assert_eq!(refusal(&refused), json!(["too_large", MAX_PACKAGE]));
     let refused = error(&mut b1.core, parts_of(MAX_PACKAGE));
     assert_eq!(refusal(&refused), json!(["decrypt_failed", "history"]));
+}
+
+#[test]
+fn a_device_back_after_a_long_absence_asks_before_refusing_a_key() {
+    let mut server = FakeServer::new();
+    let (conversation, [a, b], _a1) = deviceless_b(&mut server);
+    // B's device last observed A while A's list held one device.
+    let mut b1 = server.device(b);
+    server.introduce(&mut b1);
+
+    // A sets up a second device, which joins the group and writes for B, who has no device there.
+    let mut a2 = server.device(a);
+    server.publish(&mut a2);
+    server.introduce(&mut a2);
+    let joining = json!({
+        "cmd": "join_external",
+        "conversation_id": conversation,
+        "generation": 0,
+        "group_info": server.group_info(conversation),
+    });
+    server.commit(&mut a2, conversation, joining).unwrap();
+    ok(
+        &mut a2.core,
+        json!({"cmd": "without_devices", "conversation_id": conversation, "users": [b]}),
+    );
+    let missed = say(&mut server, &mut a2, conversation, "mientras no estabas");
+
+    // B1 comes back and joins, which checks no list: what it knows of A stays as it was.
+    let joining = json!({
+        "cmd": "join_external",
+        "conversation_id": conversation,
+        "generation": 0,
+        "group_info": server.group_info(conversation),
+    });
+    server.commit(&mut b1, conversation, joining).unwrap();
+    assert_eq!(server.deliver(&mut a2)[0]["catch_up_due"], json!([b]));
+    let caught = ok(&mut a2.core, catch_up_command(&server, conversation, b));
+    let key = bytes(&caught["keys"][0]["message"]);
+    let from = certificate(&server, a, a2.id);
+
+    // B1's list of A doesn't name A2: it asks to observe A, and asks again until it has.
+    for _ in 0..2 {
+        let asked = error(&mut b1.core, receive_direct(&key, &from));
+        assert_eq!(
+            (&asked["code"], &asked["users"]),
+            (&json!("needs_identities"), &json!([a]))
+        );
+    }
+    ok(&mut b1.core, server.observed(a));
+    let taken = ok(&mut b1.core, receive_direct(&key, &from));
+    assert_eq!(taken["type"], "catch_up.key");
+    assert_eq!(ok(&mut b1.core, import(&caught))["imported"], 1);
+    assert_eq!(ids(&messages_of(&mut b1, conversation)), [missed]);
 }
 
 fn cbor(value: &impl serde::Serialize) -> Vec<u8> {

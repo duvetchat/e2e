@@ -19,7 +19,7 @@
 //! most, and imports them as shared by its user: nothing a device has is overwritten, and a message
 //! that waits takes the record's content.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
 
 use base64::Engine;
@@ -31,12 +31,13 @@ use openmls_traits::OpenMlsProvider;
 use openmls_traits::signatures::Signer;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize, Serializer};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::identity::{from_cbor, invalid, not_found, random, stored_key, stored_uuid, to_cbor};
 use crate::messages::{Empty, Record, RecordKind, import, noted_records, records_for};
-use crate::mls::GroupRow;
+use crate::mls::{GroupRow, ask_first};
 use crate::parts::{PACKAGE_PART, TAG, fits, open_part, seal_part};
 use crate::protocol::b64;
 use crate::{DirectMessage, Error, OwnDevice, Tx};
@@ -527,11 +528,18 @@ fn recipients(tx: &Tx<'_>, to: Uuid, devices: &[Vec<u8>]) -> Result<Vec<(Uuid, [
         if claimed.user != to {
             return Err(rule("wrong_user"));
         }
-        let certificate = DeviceCertificate::verify(signed, &identity).map_err(|_| signature())?;
+        // What this device knows of `to` may be what refuses the certificate: it observes them
+        // anew first, once for each state of that knowledge.
+        let entry = Sha256::digest(signed);
+        let Ok(certificate) = DeviceCertificate::verify(signed, &identity) else {
+            ask_first(tx, &entry, BTreeSet::from([to]))?;
+            return Err(signature());
+        };
         if !list
             .as_ref()
             .is_some_and(|list| list.contains(certificate.device))
         {
+            ask_first(tx, &entry, BTreeSet::from([to]))?;
             return Err(rule("device_not_listed"));
         }
         let hpke = stored_key(&certificate.hpke_key)?;
@@ -636,7 +644,14 @@ pub(crate) fn receive_key(
         .ok_or_else(|| Error::NeedsIdentities {
             users: vec![claimed.user.to_string()],
         })?;
-    let sender = DeviceCertificate::verify(signed, &identity).map_err(|_| signature())?;
+    // What this device knows of the sender's user may be what refuses the sender (an identity or a
+    // list it hasn't observed yet, as after a long absence): it observes them anew first, once for
+    // each state of that knowledge, and only then refuses.
+    let entry = Sha256::digest(message);
+    let Ok(sender) = DeviceCertificate::verify(signed, &identity) else {
+        ask_first(tx, &entry, BTreeSet::from([claimed.user]))?;
+        return Err(signature());
+    };
     if sender.device != from {
         return Err(rule("wrong_device"));
     }
@@ -644,6 +659,7 @@ pub(crate) fn receive_key(
         .device_list_of(sender.user)?
         .is_some_and(|list| list.contains(sender.device));
     if !listed {
+        ask_first(tx, &entry, BTreeSet::from([sender.user]))?;
         return Err(rule("device_not_listed"));
     }
     let signature_key = stored_key(&sender.signature_key)?;

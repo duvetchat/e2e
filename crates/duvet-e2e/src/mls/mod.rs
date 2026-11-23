@@ -561,7 +561,7 @@ fn unconfirmed_leavers(tx: &Tx<'_>, change: &MembershipChange) -> Result<BTreeSe
 /// refused commit's or welcome's SHA-256) asked about them at what this device knows of them now.
 /// Once it observed each of them since, the same knowledge refusing the same entry again is the
 /// refusal (`Ok`). What it asks is noted, whatever becomes of the command.
-fn ask_first(tx: &Tx<'_>, entry: &[u8], users: BTreeSet<Uuid>) -> Result<(), Error> {
+pub(crate) fn ask_first(tx: &Tx<'_>, entry: &[u8], users: BTreeSet<Uuid>) -> Result<(), Error> {
     let mut ask = Vec::new();
     for user in users {
         let (Some(identity), Some(list)) = (tx.identity_of(user)?, tx.device_list_of(user)?) else {
