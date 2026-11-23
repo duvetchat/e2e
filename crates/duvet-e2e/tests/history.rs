@@ -8,9 +8,9 @@
 mod support;
 
 use duvet_e2e::history::{self, Header, MAX_PACKAGE, MAX_RECORDS, Range, ShareKind};
-use duvet_e2e::messages::Record;
+use duvet_e2e::messages::{Record, RecordKind};
 use duvet_e2e::parts::{open_part, seal_part};
-use duvet_e2e::{Clock, DirectMessage};
+use duvet_e2e::{Clock, DirectMessage, Envelope};
 use duvet_e2e_rules::{DeviceCertificate, Kind};
 use openmls::prelude::SignatureScheme;
 use openmls_basic_credential::SignatureKeyPair;
@@ -1249,6 +1249,403 @@ fn a_device_back_after_a_long_absence_asks_before_refusing_a_key() {
     assert_eq!(taken["type"], "catch_up.key");
     assert_eq!(ok(&mut b1.core, import(&caught))["imported"], 1);
     assert_eq!(ids(&messages_of(&mut b1, conversation)), [missed]);
+}
+
+/// A package key's payload, as its sender writes it.
+fn key_payload(share: Uuid, conversation: Uuid, key: [u8; 32]) -> Vec<u8> {
+    use ciborium::Value;
+    cbor(&Value::Map(vec![
+        (Value::Text("v".into()), Value::Integer(1.into())),
+        (
+            Value::Text("share".into()),
+            Value::Bytes(share.as_bytes().to_vec()),
+        ),
+        (
+            Value::Text("conversation".into()),
+            Value::Bytes(conversation.as_bytes().to_vec()),
+        ),
+        (Value::Text("key".into()), Value::Bytes(key.to_vec())),
+    ]))
+}
+
+/// `payload` as a package's key from `device` to the device `to`, whose HPKE key is `to_hpke`.
+fn key_message(device: &mut TestDevice, to: Uuid, to_hpke: &[u8; 32], payload: &[u8]) -> Vec<u8> {
+    device
+        .core
+        .transaction(|tx| {
+            let own = tx.own_device()?;
+            let provider = OpenMlsRustCrypto::default();
+            DirectMessage::seal(
+                &provider,
+                &own.signer,
+                own.device,
+                to,
+                to_hpke,
+                "history.key",
+                payload,
+            )
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_key_is_refused_without_its_sender_or_against_its_package() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut a2, mut b1] = new_devices(&mut server, [a, a, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut a2, &mut b1]);
+    let shared = ok(
+        &mut a1.core,
+        json!({
+            "cmd": "history_share",
+            "conversation_id": conversation,
+            "to_user": b,
+            "range": "all",
+            "devices": certificates(&server, b),
+        }),
+    );
+    let key = bytes(&shared["keys"][0]["message"]);
+    let a1_certificate = certificate(&server, a, a1.id);
+
+    // Without its sender's certificate; then with A2's, a device on A's list, but not the one the
+    // key says sent it.
+    let refused = error(
+        &mut b1.core,
+        json!({"cmd": "receive_direct", "message": b64(&key)}),
+    );
+    assert_eq!(
+        refusal(&refused),
+        json!(["bad_command", "from_certificate"])
+    );
+    let a2_certificate = certificate(&server, a, a2.id);
+    let refused = error(&mut b1.core, receive_direct(&key, &a2_certificate));
+    assert_eq!(refusal(&refused), json!(["rule_violation", "wrong_device"]));
+
+    // From A1, B1 takes it, and takes it again. Another key A1 signs for the same package, or a
+    // payload with a byte after it, it refuses.
+    ok(&mut b1.core, receive_direct(&key, &a1_certificate));
+    ok(&mut b1.core, receive_direct(&key, &a1_certificate));
+    let share: Uuid = shared["share_id"].as_str().unwrap().parse().unwrap();
+    let to_b1 = hpke_key(&server, b, b1.id);
+    let payload = key_payload(share, conversation, [7; 32]);
+    let other = key_message(&mut a1, b1.id, &to_b1, &payload);
+    let refused = error(&mut b1.core, receive_direct(&other, &a1_certificate));
+    assert_eq!(
+        (&refused["code"], &refused["message"]),
+        (&json!("exists"), &json!("share exists already"))
+    );
+    let mut payload = key_payload(new_id(), conversation, [7; 32]);
+    payload.push(0);
+    let trailed = key_message(&mut a1, b1.id, &to_b1, &payload);
+    let refused = error(&mut b1.core, receive_direct(&trailed, &a1_certificate));
+    assert_eq!(refusal(&refused), json!(["decrypt_failed", "history"]));
+    // The key it took still opens the package.
+    ok(&mut b1.core, import(&shared));
+
+    // A key from S, whose identity B1 hasn't observed: it asks to, then takes it.
+    let s = new_id();
+    let mut s1 = server.device(s);
+    server.introduce(&mut s1);
+    let devices = certificate_bytes(&server, b);
+    let sealed = s1
+        .core
+        .transaction(|tx| {
+            history::seal(
+                tx,
+                ShareKind::Share,
+                conversation,
+                b,
+                b"a package",
+                &devices,
+            )
+        })
+        .unwrap();
+    let from_s = certificate(&server, s, s1.id);
+    let asked = error(
+        &mut b1.core,
+        receive_direct(&sealed.keys[0].message, &from_s),
+    );
+    assert_eq!(
+        (&asked["code"], &asked["users"]),
+        (&json!("needs_identities"), &json!([s]))
+    );
+    ok(&mut b1.core, server.observed(s));
+    ok(
+        &mut b1.core,
+        receive_direct(&sealed.keys[0].message, &from_s),
+    );
+}
+
+#[test]
+fn a_package_goes_only_to_devices_its_sender_can_check() {
+    let mut server = FakeServer::new();
+    let (conversation, [_, b], mut a1) = deviceless_b(&mut server);
+
+    // A1 writes while B has no device. B then sets up two, which A1 hasn't observed, and the API
+    // says B has devices now.
+    say(&mut server, &mut a1, conversation, "para cuando llegues");
+    let mut b1 = server.device(b);
+    let b2 = server.device(b);
+    ok(
+        &mut a1.core,
+        json!({"cmd": "without_devices", "conversation_id": conversation, "users": []}),
+    );
+    let b1_certificate = certificate(&server, b, b1.id);
+    let b2_certificate = certificate(&server, b, b2.id);
+    // A share and a catch-up for B, sealed to `devices`.
+    let packages = |devices: &[&str]| {
+        [
+            json!({
+                "cmd": "history_share",
+                "conversation_id": conversation,
+                "to_user": b,
+                "range": "all",
+                "devices": devices,
+            }),
+            json!({
+                "cmd": "catch_up",
+                "conversation_id": conversation,
+                "user_id": b,
+                "devices": devices,
+            }),
+        ]
+    };
+
+    // Neither goes to a device of an identity A1 hasn't observed: it asks to observe B.
+    for command in packages(&[b1_certificate.as_str()]) {
+        let asked = error(&mut a1.core, command);
+        assert_eq!(
+            (&asked["code"], &asked["users"]),
+            (&json!("needs_identities"), &json!([b]))
+        );
+    }
+
+    // B2 leaves B's list, and A1 observes B.
+    ok(&mut b1.core, server.observed(b));
+    let signed = ok(
+        &mut b1.core,
+        json!({"cmd": "sign_device_list", "remove": [b2.id]}),
+    );
+    server.take_list(b, &signed["device_list"]);
+    ok(&mut a1.core, server.observed(b));
+
+    // To no device, or to B1 under two certificates B's identity signed, which give it two keys.
+    let identity = b1.rolled_back(|tx| {
+        let meta = |key: &str| {
+            tx.conn()
+                .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })
+        };
+        Ok(SignatureKeyPair::from_raw(
+            SignatureScheme::ED25519,
+            meta("identity_secret")?,
+            meta("identity_key")?,
+        ))
+    });
+    let signed = bytes(&json!(b1_certificate));
+    let signature_key: [u8; 32] = DeviceCertificate::read_unverified(&signed)
+        .unwrap()
+        .signature_key
+        .try_into()
+        .unwrap();
+    let now = server.clock.now_ms() as u64;
+    let rekeyed = DeviceCertificate::new(b, b1.id, signature_key, [5; 32], now)
+        .sign(&identity)
+        .unwrap();
+    let rekeyed = b64(&rekeyed);
+    for (devices, message) in [
+        (vec![], "a package goes to at least one device"),
+        (
+            vec![b1_certificate.as_str(), rekeyed.as_str()],
+            "a device's certificates give it different keys",
+        ),
+    ] {
+        for command in packages(&devices) {
+            let refused = error(&mut a1.core, command);
+            assert_eq!(
+                (&refused["code"], &refused["field"], &refused["message"]),
+                (&json!("bad_command"), &json!("devices"), &json!(message))
+            );
+        }
+    }
+
+    // To a device whose certificate another identity signed, or to B2, no longer on B's list: as
+    // what A1 knows of B may be old, it asks to observe B anew first; at the same knowledge, it
+    // refuses.
+    let forger = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+    let forged = DeviceCertificate::new(
+        b,
+        new_id(),
+        forger.public().try_into().unwrap(),
+        [9; 32],
+        now,
+    )
+    .sign(&forger)
+    .unwrap();
+    for (device, refused) in [
+        (b64(&forged), json!(["invalid_signature", "certificate"])),
+        (
+            b2_certificate,
+            json!(["rule_violation", "device_not_listed"]),
+        ),
+    ] {
+        for command in packages(&[device.as_str()]) {
+            assert_eq!(error(&mut a1.core, command)["code"], "needs_identities");
+        }
+        ok(&mut a1.core, server.observed(b));
+        for command in packages(&[device.as_str()]) {
+            assert_eq!(refusal(&error(&mut a1.core, command)), refused);
+        }
+    }
+
+    // To B1 alone, both are sealed.
+    for command in packages(&[b1_certificate.as_str()]) {
+        let sealed = ok(&mut a1.core, command);
+        assert_eq!(sealed["keys"][0]["device_id"], json!(b1.id));
+    }
+}
+
+/// A1's package of `records` (what deflate gives, or not) for B, sealed to B's devices, whose key
+/// B1 takes: the import of it.
+fn package_of(
+    server: &mut FakeServer,
+    a1: &mut TestDevice,
+    b1: &mut TestDevice,
+    conversation: Uuid,
+    records: &[u8],
+) -> Value {
+    let b = b1.user;
+    let devices = certificate_bytes(server, b);
+    let sealed = a1
+        .core
+        .transaction(|tx| {
+            let own = tx.own_device()?;
+            let header = Header {
+                kind: ShareKind::Share,
+                conversation,
+                user: own.user,
+                device: own.device,
+                to: b,
+            };
+            let package = history::package(&own.signer, &header, records)?;
+            history::seal(tx, ShareKind::Share, conversation, b, &package, &devices)
+        })
+        .unwrap();
+    let shared = serde_json::to_value(&sealed).unwrap();
+    post_keys(server, &shared);
+    let from = certificate(server, a1.user, a1.id);
+    let taken = take_inbox(server, b1, &from);
+    assert!(taken[0].get("ok").is_some(), "{}", taken[0]);
+    import(&shared)
+}
+
+#[test]
+fn an_import_takes_one_list_of_records_and_nothing_after() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let (conversation, [mut a1, mut b1]) = group_of(&mut server, [a, b]);
+    let record = Record {
+        kind: RecordKind::Message,
+        id: new_id(),
+        seq: 1,
+        user: a,
+        device: a1.id,
+        sent: server.clock.now_ms() as u64,
+        envelope: Envelope::Message {
+            text: Some("de A".into()),
+            attachments: Vec::new(),
+        }
+        .encode()
+        .unwrap(),
+        shared_by: None,
+        reply_to: None,
+    };
+    let records = cbor(&vec![record.clone()]);
+    let deflate = |bytes: &[u8]| miniz_oxide::deflate::compress_to_vec(bytes, 6);
+
+    // A package of a conversation B1 has no group of.
+    let elsewhere = package_of(&mut server, &mut a1, &mut b1, new_id(), &deflate(&records));
+    let refused = error(&mut b1.core, elsewhere);
+    assert_eq!(refusal(&refused), json!(["not_found", "group"]));
+
+    // The records with a byte after them, or their DEFLATE stream with bytes after it: B1 refuses
+    // either whole.
+    let mut trailed = records.clone();
+    trailed.push(0);
+    let mut after = deflate(&records);
+    after.extend([0, 1]);
+    for stream in [deflate(&trailed), after] {
+        let command = package_of(&mut server, &mut a1, &mut b1, conversation, &stream);
+        let refused = error(&mut b1.core, command);
+        assert_eq!(refusal(&refused), json!(["decrypt_failed", "history"]));
+    }
+    assert_eq!(messages_of(&mut b1, conversation), Vec::<Value>::new());
+
+    // The records alone, it imports.
+    let command = package_of(
+        &mut server,
+        &mut a1,
+        &mut b1,
+        conversation,
+        &deflate(&records),
+    );
+    assert_eq!(ok(&mut b1.core, command)["imported"], 1);
+    assert_eq!(ids(&messages_of(&mut b1, conversation)), [record.id]);
+}
+
+#[test]
+fn a_delivery_is_of_one_member_in_one_conversation() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1] = new_devices(&mut server, [a]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b, c], false);
+    let create = json!({
+        "cmd": "create_group",
+        "conversation_id": conversation,
+        "kind": "group",
+        "owner": a,
+        "members": [a, b, c],
+        "key_packages": server.claim(&[a]),
+        "external_sender": server.external_sender(),
+        "legacy": false,
+    });
+    server.commit(&mut a1, conversation, create).unwrap();
+    server.deliver(&mut a1);
+    let without = |users: &[Uuid]| json!({"cmd": "without_devices", "conversation_id": conversation, "users": users});
+
+    // A1 writes while B and C have no device: the message is noted for each. Then both set up a
+    // device, which A1 observes, and the API says they have them now.
+    ok(&mut a1.core, without(&[b, c]));
+    say(&mut server, &mut a1, conversation, "para los dos");
+    server.device(b);
+    server.device(c);
+    server.introduce(&mut a1);
+    ok(&mut a1.core, without(&[]));
+    let for_b = ok(&mut a1.core, catch_up_command(&server, conversation, b));
+    let for_c = ok(&mut a1.core, catch_up_command(&server, conversation, c));
+
+    // B's catch-up, confirmed for C, or in another conversation, is unknown, and forgets nothing.
+    for (conversation, user) in [(conversation, c), (new_id(), b)] {
+        let refused = error(
+            &mut a1.core,
+            delivered(conversation, user, &for_b["share_id"]),
+        );
+        assert_eq!(refusal(&refused), json!(["not_found", "share"]));
+    }
+    let mut both = [b, c];
+    both.sort();
+    assert_eq!(due(&mut a1, conversation), json!(both));
+
+    // Confirmed for B, it forgets B's note alone: C stays due, until C's own is confirmed.
+    ok(&mut a1.core, delivered(conversation, b, &for_b["share_id"]));
+    assert_eq!(due(&mut a1, conversation), json!([c]));
+    ok(&mut a1.core, delivered(conversation, c, &for_c["share_id"]));
+    assert_eq!(due(&mut a1, conversation), json!([]));
 }
 
 fn cbor(value: &impl serde::Serialize) -> Vec<u8> {
