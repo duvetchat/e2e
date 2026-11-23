@@ -1491,6 +1491,25 @@ fn a_late_answer_keeps_what_was_noted() {
         json!({"cmd": "without_devices", "conversation_id": conversation, "users": []}),
     );
 
+    // Before A1 takes its queue, its client asks what's due, and makes a catch-up for B anyway.
+    // While the message waits for the API's answer, B isn't due on it, and a catch-up can't carry
+    // it: its note stays.
+    let noted = |device: &mut TestDevice| -> Vec<Uuid> {
+        device
+            .core
+            .transaction(|tx| messages::noted_records(tx, conversation, b))
+            .unwrap()
+            .iter()
+            .map(|record| record.id)
+            .collect()
+    };
+    let before = ok(&mut a1.core, apply(conversation, &[]));
+    assert_eq!(before["catch_up_due"], json!([]));
+    assert_eq!(noted(&mut a1), Vec::<Uuid>::new());
+    a1.core
+        .transaction(|tx| messages::forget_noted(tx, conversation, b))
+        .unwrap();
+
     // B's device can't read the message, which came before it: B is due a catch-up that has it.
     let taken = server.deliver(&mut a1);
     assert_eq!(
@@ -1501,14 +1520,7 @@ fn a_late_answer_keeps_what_was_noted() {
         ]
     );
     assert_eq!(taken[0]["catch_up_due"], json!([b]));
-    let noted: Vec<Uuid> = a1
-        .core
-        .transaction(|tx| messages::noted_records(tx, conversation, b))
-        .unwrap()
-        .iter()
-        .map(|record| record.id)
-        .collect();
-    assert_eq!(noted, [early]);
+    assert_eq!(noted(&mut a1), [early]);
 }
 
 #[test]

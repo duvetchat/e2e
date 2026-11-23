@@ -24,6 +24,11 @@ const NOTED: &str = "SELECT d.message FROM deviceless d LEFT JOIN contacts c ON 
      WHERE d.conversation_id = ?1 AND d.user_id = ?2 \
      AND (d.identity_key IS NULL OR d.identity_key = c.identity_key)";
 
+/// The messages a catch-up can carry, as `message_record` makes their records: shown, not deleted,
+/// with the API's ID and number. One still waiting for the API's answer isn't one yet.
+const CARRIED: &str = "SELECT id FROM messages WHERE status = 'ok' AND deleted = 0 \
+     AND message_id IS NOT NULL AND seq IS NOT NULL AND envelope IS NOT NULL";
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct WithoutDevices {
     conversation_id: Uuid,
@@ -93,7 +98,8 @@ pub(crate) fn entered(tx: &Tx<'_>, conversation: Uuid, leaves: &[NewLeaf]) -> Re
 }
 
 /// The members of the conversation (`row`, as this device holds it) due a catch-up: a device of
-/// theirs is here now, and this device noted something for them under the identity they have.
+/// theirs is here now, and this device noted for them, under the identity they have, a message a
+/// catch-up can carry. One still waiting for the API's answer makes them due once it has it.
 pub(crate) fn catch_up_due(
     tx: &Tx<'_>,
     conversation: Uuid,
@@ -102,14 +108,15 @@ pub(crate) fn catch_up_due(
     let Some(row) = row else {
         return Ok(Vec::new());
     };
-    let mut statement = tx.conn().prepare(
+    let mut statement = tx.conn().prepare(&format!(
         "SELECT DISTINCT d.user_id FROM deviceless d LEFT JOIN contacts c ON c.user_id = d.user_id \
          WHERE d.conversation_id = ?1 \
          AND (d.identity_key IS NULL OR d.identity_key = c.identity_key) \
+         AND d.message IN ({CARRIED}) \
          AND NOT EXISTS (SELECT 1 FROM deviceless_users u \
              WHERE u.conversation_id = d.conversation_id AND u.user_id = d.user_id) \
-         ORDER BY d.user_id",
-    )?;
+         ORDER BY d.user_id"
+    ))?;
     let users = statement
         .query_map([conversation.as_bytes().as_slice()], |row| {
             row.get::<_, Vec<u8>>(0)
@@ -150,11 +157,15 @@ pub fn noted_records(tx: &Tx<'_>, conversation: Uuid, user: Uuid) -> Result<Vec<
     Ok(records)
 }
 
-/// Empties what this device noted for `user` in `conversation`, once their catch-up is made: they're
-/// no longer due one.
+/// Empties what this device noted for `user` in `conversation` that a catch-up can carry, once
+/// their catch-up is made: they're no longer due one. A message still waiting for the API's
+/// answer, which no catch-up had, keeps its note for the next.
 pub fn forget_noted(tx: &Tx<'_>, conversation: Uuid, user: Uuid) -> Result<(), Error> {
     tx.conn().execute(
-        "DELETE FROM deviceless WHERE conversation_id = ?1 AND user_id = ?2",
+        &format!(
+            "DELETE FROM deviceless WHERE conversation_id = ?1 AND user_id = ?2 \
+             AND message IN ({CARRIED})"
+        ),
         params![
             conversation.as_bytes().as_slice(),
             user.as_bytes().as_slice()
