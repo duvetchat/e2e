@@ -276,6 +276,12 @@ fn history_share_week() {
     let shared = ok(&mut a1.core, share(b, certificates(&server, b)));
     assert_eq!(shared["truncated"], false);
     assert_eq!(shared["start"], json!(now - 7 * DAY_MS));
+    // Its ID is a v7 UUID, as the API's are, with the core's time in its first 48 bits.
+    let share_id: Uuid = shared["share_id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(share_id.get_version_num(), 7);
+    let mut millis = [0u8; 8];
+    millis[2..].copy_from_slice(&share_id.as_bytes()[..6]);
+    assert_eq!(i64::from_be_bytes(millis), now);
     let size: usize = shared["parts"]
         .as_array()
         .unwrap()

@@ -564,9 +564,11 @@ fn seal_for(
 ) -> Result<Sealed, Error> {
     let own = tx.own_device()?;
     let provider = tx.provider();
-    let mut id = [0u8; 16];
-    id.copy_from_slice(&random(provider.rand(), 16)?);
-    let share_id = uuid::Builder::from_random_bytes(id).into_uuid();
+    // A v7 ID, as the API's, which it orders by: the server knows when a package came anyway.
+    let mut counter = [0u8; 10];
+    counter.copy_from_slice(&random(provider.rand(), 10)?);
+    let millis = u64::try_from(tx.now()).unwrap_or(0);
+    let share_id = uuid::Builder::from_unix_timestamp_millis(millis, &counter).into_uuid();
     let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(&random(provider.rand(), 32)?);
 
