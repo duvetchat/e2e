@@ -224,6 +224,40 @@ fn results(replies: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+/// `device` takes `conversation`'s whole queue in one `apply`, as a client does: whenever its core
+/// asks to observe users first, it observes them as the server has them, then applies again. What
+/// each `observe_user` answered, and the last `apply`'s reply.
+fn take_queue(
+    server: &FakeServer,
+    device: &mut TestDevice,
+    conversation: Uuid,
+) -> (Vec<Value>, Value) {
+    let mut observed = Vec::new();
+    loop {
+        let reply = run(
+            &mut device.core,
+            &apply(conversation, &server.entries(conversation)),
+        );
+        let Some(asked) = reply.get("error") else {
+            return (observed, reply["ok"].clone());
+        };
+        assert_eq!(asked["code"], "needs_identities", "{reply}");
+        assert!(observed.len() < 3, "asked again and again: {observed:?}");
+        for user in asked["users"].as_array().unwrap() {
+            let user: Uuid = user.as_str().unwrap().parse().unwrap();
+            observed.push(ok(&mut device.core, server.observed(user))["state"].clone());
+        }
+    }
+}
+
+/// What each entry of an `apply` reply did, in order.
+fn outcomes(reply: &Value) -> Vec<Value> {
+    results(std::slice::from_ref(reply))
+        .iter()
+        .map(|result| result[2].clone())
+        .collect()
+}
+
 /// `device`, holding `user`'s identity from before, takes `conversation`'s queue: its core asks to
 /// observe `user` anew first, and takes the queue once it has. What `observe_user` answered.
 fn deliver_observing(
@@ -680,4 +714,121 @@ fn reset_identity_keeps_the_groups_and_renews_them() {
         devices(&state).into_iter().collect::<BTreeSet<_>>(),
         BTreeSet::from([a1.id, b1.id, c1.id])
     );
+}
+
+/// Each of `devices` publishes its key packages, then observes every user.
+fn meet(server: &mut FakeServer, devices: &mut [&mut TestDevice]) {
+    for device in devices.iter_mut() {
+        server.publish(device);
+    }
+    for device in devices.iter_mut() {
+        server.introduce(device);
+    }
+}
+
+#[test]
+fn a_commit_from_before_the_change_applies_after_it() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let mut a1 = server.device(a);
+    let mut b1 = server.device(b);
+    meet(&mut server, &mut [&mut a1, &mut b1]);
+    let group = new_id();
+    server.conversation(group, Kind::Group, Some(a), &[a, b], false);
+    start(&mut server, &mut a1, group);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    // While B1 is away, A1 renews its leaf under the identity it has, changes its keys, and renews
+    // its leaf again under the new identity. The server takes both commits.
+    server
+        .commit(&mut a1, group, command("refresh", group))
+        .unwrap();
+    let rotated = ok(&mut a1.core, rotate(&[]));
+    server.take_identity(a, &rotated);
+    server
+        .commit(&mut a1, group, command("refresh", group))
+        .unwrap();
+
+    // B1 takes the whole queue at once. It asks to observe A once, for the leaf the new identity
+    // certifies, then applies both: the commit from before brings A1's leaf as it was, which
+    // asserts nothing new.
+    let (observed, reply) = take_queue(&server, &mut b1, group);
+    assert_eq!(observed, [json!("changed")]);
+    assert_eq!(outcomes(&reply), [json!("applied"), json!("applied")]);
+    same_group(&mut [&mut a1, &mut b1], group);
+    assert_eq!(b1.group(group)["blocked"], false);
+}
+
+#[test]
+fn commits_from_before_the_change_apply_in_any_conversation() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let mut a1 = server.device(a);
+    let mut b1 = server.device(b);
+    meet(&mut server, &mut [&mut a1, &mut b1]);
+    let (x, y) = (new_id(), new_id());
+    for conversation in [x, y] {
+        server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+        start(&mut server, &mut a1, conversation);
+    }
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    // While B1 is away, A1 renews its leaf in Y, changes its keys, and renews its leaf in X.
+    server.commit(&mut a1, y, command("refresh", y)).unwrap();
+    let rotated = ok(&mut a1.core, rotate(&[]));
+    server.take_identity(a, &rotated);
+    server.commit(&mut a1, x, command("refresh", x)).unwrap();
+
+    // B1 takes X first, where it observes A anew.
+    let (observed, reply) = take_queue(&server, &mut b1, x);
+    assert_eq!(observed, [json!("changed")]);
+    assert_eq!(outcomes(&reply), [json!("applied")]);
+
+    // Then Y, whose commit from before applies under the identity B1 pins now, with nothing to ask.
+    let (observed, reply) = take_queue(&server, &mut b1, y);
+    assert_eq!(observed, Vec::<Value>::new());
+    assert_eq!(outcomes(&reply), [json!("applied")]);
+    for conversation in [x, y] {
+        same_group(&mut [&mut a1, &mut b1], conversation);
+        assert_eq!(b1.group(conversation)["blocked"], false);
+    }
+}
+
+#[test]
+fn the_rotating_device_applies_what_the_lost_one_committed_before() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let mut a1 = server.device(a);
+    let mut a2 = server.device(a);
+    let mut b1 = server.device(b);
+    meet(&mut server, &mut [&mut a1, &mut a2, &mut b1]);
+    let group = new_id();
+    server.conversation(group, Kind::Group, Some(a), &[a, b], false);
+    start(&mut server, &mut a1, group);
+    server.deliver_all(&mut [&mut a1, &mut a2, &mut b1]);
+
+    // A2 renews its leaf, which the server takes, before A1 changes the keys without A2 and the
+    // server proposes A2's removal.
+    server
+        .commit(&mut a2, group, command("refresh", group))
+        .unwrap();
+    let rotated = ok(&mut a1.core, rotate(&[a2.id]));
+    server.take_identity(a, &rotated);
+    server.remove_device(group, a2.id);
+
+    // A1 takes the queue: A2's commit brings A2's leaf as it was, which no identity certifies
+    // again, so it applies with nothing to ask, and so does the proposal.
+    let (observed, reply) = take_queue(&server, &mut a1, group);
+    assert_eq!(observed, Vec::<Value>::new());
+    assert_eq!(outcomes(&reply), [json!("applied"), json!("applied")]);
+    assert_eq!(a1.group(group)["blocked"], false);
+
+    // A1 renews its leaf, which takes A2 out, and B1 takes it all.
+    server
+        .commit(&mut a1, group, command("refresh", group))
+        .unwrap();
+    let (observed, _) = take_queue(&server, &mut b1, group);
+    assert_eq!(observed, [json!("changed")]);
+    let state = same_group(&mut [&mut a1, &mut b1], group);
+    assert!(!devices(&state).contains(&a2.id), "A2 is out");
 }

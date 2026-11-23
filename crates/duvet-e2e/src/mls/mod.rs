@@ -563,6 +563,20 @@ fn ask_first(tx: &Tx<'_>, entry: &[u8], users: BTreeSet<Uuid>) -> Result<(), Err
     Err(Error::NeedsIdentities { users })
 }
 
+/// Drops from another device's commit the leaves it renews with the credential and signature key
+/// they had. Such a leaf asserts nothing new: it was certified as it entered, and only its own key
+/// signs it. So it isn't certified again under its user's identity as this device pins it now,
+/// which may have changed since the server took the commit (a rotation, a reset): that commit broke
+/// no rule then, and refusing it would block the group. The validator, which checks each commit as
+/// it comes, still certifies every leaf a commit brings.
+pub(crate) fn skip_unchanged_leaves(change: &mut MembershipChange) {
+    change.updated.retain(|(index, leaf)| {
+        change.leaves.get(index).is_none_or(|before| {
+            before.certificate != leaf.credential || before.signature_key != leaf.signature_key
+        })
+    });
+}
+
 /// What the rules go by for a commit beyond its users' identities and lists.
 #[derive(Default)]
 pub(crate) struct Extra {
