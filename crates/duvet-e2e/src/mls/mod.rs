@@ -464,8 +464,9 @@ pub(crate) fn commit_asks_first(
 }
 
 /// Before a welcome refused for `violation` counts as refused: the users of its leaves this device
-/// can't certify by their pinned identity (`leaf_not_signed`, a welcome holds leaves to nothing
-/// more) are to be observed anew first, as for a commit.
+/// can't certify by their pinned identity (`leaf_not_signed`: a welcome holds a leaf to that
+/// identity alone, or to the certificate it signed for the same device) are to be observed anew
+/// first, as for a commit.
 pub(crate) fn welcome_asks_first(
     tx: &Tx<'_>,
     entry: &[u8],
@@ -632,27 +633,52 @@ pub(crate) fn skip_unchanged_leaves(change: &mut MembershipChange) {
 pub(crate) fn certify_by_pinned(tx: &Tx<'_>, change: &mut MembershipChange) -> Result<(), Error> {
     let updated = change.updated.iter_mut().map(|(_, leaf)| leaf);
     for leaf in change.added.iter_mut().chain(updated) {
-        let Ok(claimed) = DeviceCertificate::read_unverified(&leaf.credential) else {
-            continue;
-        };
-        let Some(pinned) = tx.identity_of(claimed.user)? else {
-            continue;
-        };
-        if DeviceCertificate::verify(&leaf.credential, &pinned).is_ok() {
-            continue;
-        }
-        let made_before = tx
-            .earlier_identities_of(claimed.user)?
-            .iter()
-            .any(|key| DeviceCertificate::verify(&leaf.credential, key).is_ok());
-        if !made_before {
-            continue;
-        }
-        if let Some(current) = tx.certificate_of(claimed.user, claimed.device)? {
+        if let Some(current) = pinned_in_place_of(tx, &leaf.credential, true)? {
             leaf.credential = current;
         }
     }
     Ok(())
+}
+
+/// As [`certify_by_pinned`], for each leaf of a group this device enters, by a welcome or its own
+/// external commit. A new member may never have seen the identity a leaf's user had before, so a
+/// leaf's certificate needn't be one this device knows: the identity pinned now vouching for the
+/// same device, with the leaf's own key, is what lets it in.
+pub(crate) fn certify_leaves_by_pinned(tx: &Tx<'_>, leaves: &mut Leaves) -> Result<(), Error> {
+    for leaf in leaves.values_mut() {
+        if let Some(current) = pinned_in_place_of(tx, &leaf.certificate, false)? {
+            leaf.certificate = current;
+        }
+    }
+    Ok(())
+}
+
+/// The certificate the identity pinned for `credential`'s user signed for the same device, when
+/// this device keeps one and that identity didn't sign `credential`: when `earlier`, only if an
+/// identity this device knows the user had before did.
+fn pinned_in_place_of(
+    tx: &Tx<'_>,
+    credential: &[u8],
+    earlier: bool,
+) -> Result<Option<Vec<u8>>, Error> {
+    let Ok(claimed) = DeviceCertificate::read_unverified(credential) else {
+        return Ok(None);
+    };
+    let Some(pinned) = tx.identity_of(claimed.user)? else {
+        return Ok(None);
+    };
+    if DeviceCertificate::verify(credential, &pinned).is_ok() {
+        return Ok(None);
+    }
+    if earlier
+        && !tx
+            .earlier_identities_of(claimed.user)?
+            .iter()
+            .any(|key| DeviceCertificate::verify(credential, key).is_ok())
+    {
+        return Ok(None);
+    }
+    tx.certificate_of(claimed.user, claimed.device)
 }
 
 /// What the rules go by for a commit beyond its users' identities and lists.

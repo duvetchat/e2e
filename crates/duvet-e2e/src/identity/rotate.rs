@@ -10,10 +10,10 @@
 //! a certificate of its own keys from the new identity, the new list and the backup keys.
 //!
 //! After a rotation, the device's leaf in each of its groups still carries the certificate of the
-//! identity before. The members took it as it entered and don't check it again, but a welcome or
-//! an external join holds it to the new identity: every group of the device is due for `refresh`
-//! at once, whose commit brings the leaf with the new certificate. So is every group of a device
-//! that takes a transfer.
+//! identity before. The members took it as it entered and don't check it again, and a device that
+//! joins takes it while the identity it pins certifies the same device with the same key. Every
+//! group of the device is due for `refresh` at once all the same, whose commit brings the leaf
+//! with the new certificate. So is every group of a device that takes a transfer.
 
 use std::collections::BTreeMap;
 use std::iter;

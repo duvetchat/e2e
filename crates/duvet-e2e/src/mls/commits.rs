@@ -15,9 +15,9 @@ use uuid::Uuid;
 
 use super::members::Committed;
 use super::{
-    ConversationId, Extra, GroupRow, Pending, REFRESH_AFTER_MS, can_commit, delete_group, digest,
-    draft, load_group, openmls_error, own_merged, rule_context, stage, storage_error, stored_state,
-    tls, unlisted_own_leaves, violation,
+    ConversationId, Extra, GroupRow, Pending, REFRESH_AFTER_MS, can_commit,
+    certify_leaves_by_pinned, delete_group, digest, draft, load_group, openmls_error, own_merged,
+    rule_context, stage, storage_error, stored_state, tls, unlisted_own_leaves, violation,
 };
 use crate::identity::{invalid, not_found, stored_uuid};
 use crate::protocol::b64;
@@ -330,9 +330,11 @@ pub(crate) fn join_external(tx: &Tx<'_>, request: JoinExternal) -> Result<Commit
         .map_err(openmls_error)?;
 
     // The group this device enters, as a welcome's: every leaf certified by its user's pinned
-    // identity, its user a member, this device's own among them.
+    // identity (or by the certificate it signed for the same device), its user a member, this
+    // device's own among them.
     let context = group.public_group().group_context();
-    let leaves = leaves(group.members()).map_err(violation)?;
+    let mut leaves = leaves(group.members()).map_err(violation)?;
+    certify_leaves_by_pinned(tx, &mut leaves)?;
     let ctx = rule_context(tx, leaves.values().map(|leaf| leaf.user))?;
     check_joined_state(&ctx, context, &leaves).map_err(violation)?;
 

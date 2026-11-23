@@ -18,9 +18,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    Extra, GroupRow, certify_by_pinned, check, commit_asks_first, delete_group, digest,
-    openmls_error, own_merged, rule_context, skip_unchanged_leaves, storage_error, stored_group,
-    stored_state, welcome_asks_first,
+    Extra, GroupRow, certify_by_pinned, certify_leaves_by_pinned, check, commit_asks_first,
+    delete_group, digest, openmls_error, own_merged, rule_context, skip_unchanged_leaves,
+    storage_error, stored_group, stored_state, welcome_asks_first,
 };
 use crate::identity::{invalid, not_found};
 use crate::protocol::b64;
@@ -416,10 +416,11 @@ impl EntryHandler for Welcomes {
             Err(WelcomeError::StorageError(error)) => return Err(storage_error(error)),
             Err(_) => return Ok(rejected("invalid_welcome")),
         };
-        let leaves = match leaves(staged.members()) {
+        let mut leaves = match leaves(staged.members()) {
             Ok(leaves) => leaves,
             Err(violation) => return Ok(rejected(violation.name())),
         };
+        certify_leaves_by_pinned(tx, &mut leaves)?;
         let context = staged.group_context();
         let epoch = context.epoch().as_u64();
         // A client's record from before the cutover holds the conversation's first group alone;

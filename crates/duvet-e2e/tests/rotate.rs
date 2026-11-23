@@ -1,7 +1,7 @@
 //! Changing the user's identity, through `Core::handle` as a client drives it: starting over
 //! without the recovery key (`reset_identity`), and changing the keys once a device is lost
 //! (`rotate_keys`). The user's contacts see the change, and the device's groups take its leaves,
-//! certified anew, before anyone new can join them.
+//! certified anew.
 
 mod support;
 
@@ -503,7 +503,7 @@ fn contacts_see_the_change() {
 }
 
 #[test]
-fn new_members_join_once_the_leaves_are_certified_anew() {
+fn new_members_join_before_and_after_the_leaves_are_certified_anew() {
     let mut server = FakeServer::new();
     let (a, b, c, d) = (new_id(), new_id(), new_id(), new_id());
     let mut a1 = server.device(a);
@@ -536,8 +536,8 @@ fn new_members_join_once_the_leaves_are_certified_anew() {
     // identity before.
     assert_eq!(due(&mut a1), BTreeSet::from([group, dm]));
 
-    // Meanwhile, whoever pinned the new identity can't take A1's leaf. B adds C, whose device
-    // asks to observe A anew, then refuses the welcome.
+    // Meanwhile, whoever pinned the new identity takes A1's leaf, as the new identity certifies the
+    // same device and key: B adds C (its commit takes A2 out), and C's welcome takes the group.
     let mut c1 = server.device(c);
     server.publish(&mut c1);
     server.introduce(&mut c1);
@@ -545,19 +545,12 @@ fn new_members_join_once_the_leaves_are_certified_anew() {
     server.deliver(&mut b1);
     let add = adding(&mut server, group, c);
     server.commit(&mut b1, group, add).unwrap();
-    let entries = server.entries(group);
-    let asked = error(&mut c1.core, apply(group, &entries));
+    let joined = results(&server.deliver(&mut c1));
     assert_eq!(
-        (&asked["code"], &asked["users"]),
-        (&json!("needs_identities"), &json!([a.to_string()]))
+        (&joined[0][1], &joined[0][2]),
+        (&json!("welcome"), &json!("applied")),
+        "{joined:?}"
     );
-    assert_eq!(ok(&mut c1.core, server.observed(a))["state"], "same");
-    let refused = results(&[ok(&mut c1.core, apply(group, &entries))]);
-    assert_eq!(
-        refused.last().unwrap(),
-        &json!([entries.len(), "welcome", "rejected", "leaf_not_signed"])
-    );
-    assert_eq!(c1.no_group(group)["what"], "group");
 
     // A1 renews its leaf in each group: the commits carry the new certificate, which the server's
     // validator holds to the new identity, and takes. Nothing is due any more.
@@ -595,10 +588,8 @@ fn new_members_join_once_the_leaves_are_certified_anew() {
         "{joined:?}"
     );
 
-    // And C, whom the welcome in between left out, comes in by external commit.
+    // And C, in since the window, follows.
     ok(&mut c1.core, server.observed(d));
-    let join = joining(&server, group);
-    server.commit(&mut c1, group, join).unwrap();
     server.deliver_all(&mut [&mut a1, &mut b1, &mut c1, &mut d1]);
     let state = same_group(&mut [&mut a1, &mut b1, &mut c1, &mut d1], group);
     assert_eq!(
@@ -1424,4 +1415,76 @@ fn a_stale_own_list_asks_before_taking_a_device_out() {
     );
     assert_eq!(ok(&mut a2.core, server.observed(a))["state"], "same");
     assert_eq!(ready(&mut a2, group), Ok(()));
+}
+
+#[test]
+fn new_members_join_past_a_leaf_from_before_the_change() {
+    let mut server = FakeServer::new();
+    let (a, b, c, d) = (new_id(), new_id(), new_id(), new_id());
+    let mut a1 = server.device(a);
+    let a2 = server.device(a);
+    let mut a3 = server.device(a);
+    let mut b1 = server.device(b);
+    meet(&mut server, &mut [&mut a1, &mut a3, &mut b1]);
+    let group = new_id();
+    server.conversation(group, Kind::Group, Some(b), &[b, a], false);
+    start(&mut server, &mut b1, group);
+    server.deliver_all(&mut [&mut a1, &mut a3, &mut b1]);
+
+    // A1 changes the keys without A2 and renews its leaf. A3, a tablet that stays, is off: its leaf
+    // keeps the certificate from before.
+    let rotated = ok(&mut a1.core, rotating(&server, a, &[a2.id]));
+    server.take_identity(a, &rotated);
+    server
+        .commit(&mut a1, group, command("refresh", group))
+        .unwrap();
+    let (observed, _) = take_queue(&server, &mut b1, group);
+    assert_eq!(observed, [json!("changed")]);
+
+    // B adds C, who saw A only under the new identity, with its certificates: C's welcome takes the
+    // group, A3's leaf with it.
+    let mut c1 = server.device(c);
+    server.publish(&mut c1);
+    server.introduce(&mut c1);
+    ok(&mut b1.core, server.observed(c));
+    let add = adding(&mut server, group, c);
+    server.commit(&mut b1, group, add).unwrap();
+    let joined = results(&server.deliver(&mut c1));
+    assert_eq!(
+        (&joined[0][1], &joined[0][2]),
+        (&json!("welcome"), &json!("applied")),
+        "{joined:?}"
+    );
+
+    // So does B2, a new device of B's, joining by external commit.
+    let mut b2 = server.device(b);
+    server.introduce(&mut b2);
+    let join = joining(&server, group);
+    server.commit(&mut b2, group, join).unwrap();
+
+    // D is served, for A3, a certificate the new identity signed for other keys: D's welcome is
+    // refused, after D asks about A once.
+    let (_, new_secret) = opened(a, &rotated);
+    let other_keys = DeviceCertificate::new(a, a3.id, [1; 32], [2; 32], 1)
+        .sign(&signer(&new_secret))
+        .unwrap();
+    let mut d1 = server.device(d);
+    server.publish(&mut d1);
+    server.introduce(&mut d1);
+    let served = serving(server.observed(a), a3.id, &other_keys);
+    assert_eq!(ok(&mut d1.core, served.clone())["state"], "same");
+    take_queue(&server, &mut b1, group);
+    ok(&mut b1.core, server.observed(d));
+    let add = adding(&mut server, group, d);
+    server.commit(&mut b1, group, add).unwrap();
+    let entries = server.entries(group);
+    let asked = error(&mut d1.core, apply(group, &entries));
+    assert_eq!(asked["code"], "needs_identities");
+    assert_eq!(ok(&mut d1.core, served)["state"], "same");
+    let refused = results(&[ok(&mut d1.core, apply(group, &entries))]);
+    assert_eq!(
+        refused.last().unwrap(),
+        &json!([entries.len(), "welcome", "rejected", "leaf_not_signed"])
+    );
+    assert_eq!(d1.no_group(group)["what"], "group");
 }
