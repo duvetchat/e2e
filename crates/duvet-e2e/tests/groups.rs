@@ -508,6 +508,43 @@ fn reset_welcome_goes_by_the_reset_not_the_record() {
 }
 
 #[test]
+fn re_added_member_goes_by_the_rules_not_the_record() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1, mut b1, mut c1] = new_devices(&mut server, [a, b, c]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b, c], true);
+    b1.remember(conversation, Some(a), &[a, b, c]);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1]);
+
+    // A removes B, then adds B back, still in the first group: the list is now A, C, B.
+    let remove = json!({"cmd": "remove_members", "conversation_id": conversation, "users": [b]});
+    server.commit(&mut a1, conversation, remove).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1]);
+    assert_eq!(b1.no_group(conversation)["what"], "membership");
+    let add = adding(&mut server, conversation, b);
+    server.commit(&mut a1, conversation, add).unwrap();
+
+    // B1's welcome to that later epoch, even with B1's record from before the cutover beside it,
+    // goes by the rules alone: only the founding welcome is held to the record.
+    let mut entries = server.entries(conversation)[3..].to_vec();
+    assert_eq!(entries[1]["kind"], "welcome");
+    entries[1]["expected"] = json!({"owner": a, "members": [a, b, c]});
+    let back = ok(&mut b1.core, apply(conversation, &entries));
+    assert_eq!(
+        results(std::slice::from_ref(&back)),
+        [
+            json!([4, "commit", "ignored", null]),
+            json!([5, "welcome", "applied", null]),
+        ]
+    );
+    server.deliver_all(&mut [&mut a1, &mut c1]);
+    let state = same_group(&mut [&mut a1, &mut b1, &mut c1], conversation);
+    assert_eq!(members(&state), [a, c, b]);
+}
+
+#[test]
 fn catch_up_after_many_epochs() {
     let mut server = FakeServer::new();
     let (a, b) = (new_id(), new_id());
