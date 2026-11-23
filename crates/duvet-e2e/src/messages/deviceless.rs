@@ -2,9 +2,10 @@
 //! the group carries meanwhile. This device notes for them what it sends in that time, under the
 //! identity it had pinned for them then (none, if it had none). Once a device of theirs enters the
 //! group (another device's commit brings its leaf), or the client no longer counts them as without
-//! one, they're due a catch-up with what was noted, which `apply` names (`catch_up_due`) until the
-//! catch-up empties the note. A catch-up goes only to the identity the note was made for, or to any
-//! when none was pinned then: a new identity of theirs gets none of what was sent before it.
+//! one, they're due a catch-up with what was noted, which `apply` names (`catch_up_due`) until a
+//! delivered catch-up (`catch_up_delivered`) carried every note. A catch-up goes only to the
+//! identity the note was made for, or to any when none was pinned then: a new identity of theirs
+//! gets none of what was sent before it.
 
 use std::collections::BTreeSet;
 
@@ -171,9 +172,11 @@ pub fn noted_records(tx: &Tx<'_>, conversation: Uuid, user: Uuid) -> Result<Vec<
     Ok(records)
 }
 
-/// Empties what this device noted for `user` in `conversation` that a catch-up can carry, once
-/// their catch-up is made: they're no longer due one. A message still waiting for the API's
-/// answer, which no catch-up had, keeps its note for the next.
+/// Tests only: empties what this device noted for `user` in `conversation` that a catch-up can
+/// carry, as if a catch-up had carried all of it. The core never forgets a note but by a delivered
+/// catch-up that carried it (`catch_up_delivered`), so nothing else calls this: a caller would lose
+/// messages a member never got. A message still waiting for the API's answer keeps its note.
+#[cfg(feature = "test-hooks")]
 pub fn forget_noted(tx: &Tx<'_>, conversation: Uuid, user: Uuid) -> Result<(), Error> {
     tx.conn().execute(
         &format!(
