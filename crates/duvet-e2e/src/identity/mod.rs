@@ -11,9 +11,10 @@ mod recover;
 pub mod recovery;
 
 pub(crate) use approval::{
-    ApprovalCheck, ApprovalFromQr, ApprovalOffer, ApprovalReceive, ApprovalReveal, Enrolled,
-    TRANSFER as APPROVAL_TRANSFER, approval_begin, approval_check, approval_confirm,
-    approval_from_qr, approval_offer, approval_receive, approval_reveal, receive_transfer,
+    ApprovalAccept, ApprovalCheck, ApprovalFromQr, ApprovalOffer, ApprovalReceive, ApprovalReveal,
+    Enrolled, TRANSFER as APPROVAL_TRANSFER, approval_accept, approval_begin, approval_check,
+    approval_confirm, approval_from_qr, approval_offer, approval_receive, approval_reveal,
+    receive_transfer,
 };
 pub(crate) use contacts::{observe_user, safety_number, verify_user};
 pub(crate) use device::{create_device, key_packages};

@@ -2,17 +2,18 @@
 //! identity. The approver certifies the new device, signs the user's next device list with it on
 //! it, and sends it the transfer: the identity, the backup key, the new device's certificate, the
 //! list and the approver's own certificate, encrypted to a key the new device drew for that
-//! attempt alone (the attempt's key, X25519) and signed by the approver's device, as a direct
-//! message of type `approval.transfer`.
+//! attempt alone (X25519) and signed by the approver's device, as a direct message of type
+//! `approval.transfer`. An attempt draws two such keys, one for each way.
 //!
 //! - **By QR**, the QR holds the new device as it asks to be certified (its user, its ID, its
-//!   signature and HPKE keys) and the attempt's key. It never passes through the server, so only
-//!   the device that scans it can encrypt to that key.
+//!   signature and HPKE keys) and the QR's key. It never passes through the server, so only the
+//!   device that scans it can encrypt to that key, and the new device takes a transfer sealed to it
+//!   from whichever approver that is.
 //! - **By the notice**, all of it passes through the server, and the person compares a code on
 //!   both screens. A hash commitment, as in ZRTP, leaves a server in the middle one try at making
 //!   the two codes match:
 //!   1. the new device sends its request and the commitment, SHA-256("duvet approval commit v1"
-//!      || key || nonce), with 32 random bytes as the nonce, and keeps the key and the nonce;
+//!      || key || nonce), with its other key and 32 random bytes as the nonce, and keeps both;
 //!   2. the approver answers with its offer: its certificate, and 32 random bytes of its own;
 //!   3. only then does the new device reveal the key and the nonce, which the approver holds to
 //!      the commitment;
@@ -24,6 +25,10 @@
 //!   certifies, and the approver the new device trusts. A server in the middle commits to its
 //!   side's key before the approver's nonce is out, and picks the offer it hands the new device
 //!   before the new device's key is: either way, the codes match once in a million.
+//!
+//!   The reveal sends the key through the server, which can seal to it too, after an offer of its
+//!   own. So the new device takes a transfer sealed to that key only once the person typed on it
+//!   the code the approver shows (`approval_accept`), and only from that approver.
 //!
 //! An attempt's state lasts 10 minutes by the core's clock, in `approvals`: the new device's
 //! (`new`) from `approval_begin`, the approver's (`approver`) from `approval_offer`. Each device
@@ -175,16 +180,19 @@ struct Answer {
 #[derive(Clone, Copy, Serialize, Deserialize)]
 struct Bytes32(#[serde(with = "serde_bytes")] [u8; 32]);
 
-/// The new device's attempt: the attempt key's private and public parts, the nonce its commitment
-/// hides, and the approver's answer once an offer came.
+/// The new device's attempt: the QR's key's secret; the commitment's key, its private and public
+/// parts, and the nonce the commitment hides; the approver's answer once an offer came; and
+/// whether the person typed here that approver's code.
 #[derive(Serialize, Deserialize)]
 struct Attempt {
+    qr: Secret,
     secret: Secret,
     #[serde(with = "serde_bytes")]
     key: [u8; 32],
     #[serde(with = "serde_bytes")]
     nonce: [u8; 32],
     answer: Option<Answer>,
+    accepted: bool,
 }
 
 /// The approver's attempt: the device it would approve, the commitment, its own answer, and the
@@ -246,8 +254,8 @@ pub(crate) struct Begun {
     commitment: Vec<u8>,
 }
 
-/// A new attempt at having this device approved: a key drawn for it alone, which the QR shows and
-/// the commitment hides. The attempt before it, if any, is over.
+/// A new attempt at having this device approved: a key for the QR to show, and another the
+/// commitment hides, both drawn for it alone. The attempt before it, if any, is over.
 pub(crate) fn approval_begin(tx: &mut Tx<'_>) -> Result<Begun, Error> {
     let own = tx.own_device()?;
     if tx.own_identity_key()?.is_some() {
@@ -256,14 +264,9 @@ pub(crate) fn approval_begin(tx: &mut Tx<'_>) -> Result<Begun, Error> {
         });
     }
     let asked = Asked::of(&own)?;
-    let provider = tx.provider();
-    let pair = provider
-        .crypto()
-        .derive_hpke_keypair(SUITE.hpke_config(), &random(provider.rand(), 32)?)
-        .map_err(|_| Error::Internal("the attempt's key couldn't be made".into()))?;
-    let key = thirty_two(&pair.public)?;
-    let secret = Secret::copy(&pair.private)?;
-    let nonce = thirty_two(&random(provider.rand(), 32)?)?;
+    let (qr_key, qr_secret) = attempt_key(tx)?;
+    let (key, secret) = attempt_key(tx)?;
+    let nonce = thirty_two(&random(tx.provider().rand(), 32)?)?;
     let hash = commitment_hash(&key, &nonce);
 
     let qr = to_cbor(&Qr {
@@ -272,7 +275,7 @@ pub(crate) fn approval_begin(tx: &mut Tx<'_>) -> Result<Begun, Error> {
         device: asked.device,
         signature_key: asked.signature_key,
         hpke_key: asked.hpke_key,
-        key,
+        key: qr_key,
     })?;
     let commitment = to_cbor(&Commitment {
         v: 1,
@@ -283,10 +286,12 @@ pub(crate) fn approval_begin(tx: &mut Tx<'_>) -> Result<Begun, Error> {
         hash,
     })?;
     let attempt = Attempt {
+        qr: qr_secret,
         secret,
         key,
         nonce,
         answer: None,
+        accepted: false,
     };
     store(
         tx,
@@ -296,6 +301,16 @@ pub(crate) fn approval_begin(tx: &mut Tx<'_>) -> Result<Begun, Error> {
         &to_secret_cbor(&attempt, FIXED_PARTS)?,
     )?;
     Ok(Begun { qr, commitment })
+}
+
+/// An X25519 key drawn for one attempt: its public part and its secret.
+fn attempt_key(tx: &Tx<'_>) -> Result<([u8; 32], Secret), Error> {
+    let provider = tx.provider();
+    let pair = provider
+        .crypto()
+        .derive_hpke_keypair(SUITE.hpke_config(), &random(provider.rand(), 32)?)
+        .map_err(|_| Error::Internal("the attempt's key couldn't be made".into()))?;
+    Ok((thirty_two(&pair.public)?, Secret::copy(&pair.private)?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -424,6 +439,46 @@ pub(crate) fn approval_reveal(tx: &mut Tx<'_>, request: ApprovalReveal) -> Resul
         nonce: attempt.nonce,
     })?;
     Ok(Revealed { reveal, code })
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ApprovalAccept {
+    code: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct Accepted {}
+
+/// The person typed on this device the code the approver shows, and it's this device's: from now
+/// on the transfer sealed to the key the reveal disclosed counts, from that approver alone. Another
+/// code is `rule_violation` (`code_mismatch`), and leaves the attempt as it was. Before the attempt
+/// took an offer, there's no code (`not_found`, `code`).
+pub(crate) fn approval_accept(tx: &mut Tx<'_>, request: ApprovalAccept) -> Result<Accepted, Error> {
+    let own = tx.own_device()?;
+    let (id, expires_at, mut attempt) = under_way::<Attempt>(tx, NEW)?;
+    let answer = attempt.answer.as_ref().ok_or_else(|| not_found("code"))?;
+    let code = code_digits(
+        &attempt.key,
+        &attempt.nonce,
+        &answer.certificate,
+        &Asked::of(&own)?,
+        &answer.nonce,
+    );
+    if !same_code(&code, &request.code) {
+        return Err(rule("code_mismatch"));
+    }
+    let capacity = FIXED_PARTS + answer.certificate.len();
+    if !attempt.accepted {
+        attempt.accepted = true;
+        store(
+            tx,
+            NEW,
+            &id,
+            expires_at,
+            &to_secret_cbor(&attempt, capacity)?,
+        )?;
+    }
+    Ok(Accepted {})
 }
 
 #[derive(Debug, Deserialize)]
@@ -657,10 +712,12 @@ pub(crate) fn approval_receive(
 }
 
 /// The transfer an approver sent this device, for its attempt under way. It counts only if it holds
-/// up: sealed to the attempt's key, and signed by the device whose certificate it carries (by the
-/// notice, the approver the person compared the code with); and the identity it brings signs that
-/// certificate, this device's own, and the user's list with both devices on it. Then this device
-/// has the identity, its certificate, the list and the backup key.
+/// up: sealed to one of the attempt's keys, and signed by the device whose certificate it carries;
+/// and the identity it brings signs that certificate, this device's own, and the user's list with
+/// both devices on it. Sealed to the QR's key, it comes from the device that scanned the QR. Sealed
+/// to the key the reveal disclosed, it counts only once the person typed here the approver's code
+/// (`not_found`, `code`, until then), and only from that approver. Then this device has the
+/// identity, its certificate, the list and the backup key.
 pub(crate) fn receive_transfer(tx: &Tx<'_>, message: &[u8]) -> Result<Enrolled, Error> {
     let own = tx.own_device()?;
     if tx.own_identity_key()?.is_some() {
@@ -670,24 +727,45 @@ pub(crate) fn receive_transfer(tx: &Tx<'_>, message: &[u8]) -> Result<Enrolled, 
     }
     let (_, _, attempt) = under_way::<Attempt>(tx, NEW)?;
     let provider = tx.provider();
-    let secret = &attempt.secret.0[..];
 
     // The sender's certificate is inside: read it, then open the message as every direct message
-    // is opened, verified with the key that certificate holds.
+    // is opened, verified with the key that certificate holds. The key that opens it tells the way
+    // it came.
     let (_, from) = DirectMessage::header(message)?;
-    let claimed = read_transfer(&DirectMessage::peek(provider, secret, own.device, message)?)?;
+    let (secret, peeked, only_from) =
+        match DirectMessage::peek(provider, &attempt.qr.0[..], own.device, message) {
+            Ok(peeked) => (&attempt.qr, peeked, None),
+            Err(Error::DecryptFailed { .. }) => {
+                let peeked =
+                    DirectMessage::peek(provider, &attempt.secret.0[..], own.device, message)?;
+                let answer = attempt
+                    .answer
+                    .as_ref()
+                    .filter(|_| attempt.accepted)
+                    .ok_or_else(|| not_found("code"))?;
+                (&attempt.secret, peeked, Some(answer))
+            }
+            Err(error) => return Err(error),
+        };
+    let claimed = read_transfer(&peeked)?;
     let sender_key = DeviceCertificate::read_unverified(&claimed.approver)
         .ok()
         .and_then(|certificate| <[u8; 32]>::try_from(certificate.signature_key.as_slice()).ok())
         .ok_or_else(unreadable)?;
-    let (_, payload) =
-        DirectMessage::open(provider, secret, own.device, from, &sender_key, message)?;
+    let (_, payload) = DirectMessage::open(
+        provider,
+        &secret.0[..],
+        own.device,
+        from,
+        &sender_key,
+        message,
+    )?;
     let transfer = read_transfer(&payload)?;
     if transfer.approver != claimed.approver {
         return Err(unreadable());
     }
-    // By the notice, only the approver the person compared the code with.
-    if let Some(answer) = &attempt.answer
+    // By the notice, only the approver whose code the person typed here.
+    if let Some(answer) = only_from
         && transfer.approver != answer.certificate
     {
         return Err(Error::InvalidSignature {
@@ -779,6 +857,17 @@ fn code_digits(
     let mut first = [0u8; 8];
     first.copy_from_slice(&digest[..8]);
     format!("{:06}", u64::from_be_bytes(first) % 1_000_000)
+}
+
+/// Whether `typed` is `code`, compared in constant time.
+fn same_code(code: &str, typed: &str) -> bool {
+    // ponytail: std's black_box keeps the fold from ending early, best effort as `subtle`'s own
+    // is; `subtle::ConstantTimeEq` if a build ever branches on it.
+    let differ = code
+        .bytes()
+        .zip(typed.bytes())
+        .fold(0u8, |differ, (a, b)| std::hint::black_box(differ | (a ^ b)));
+    differ == 0 && code.len() == typed.len()
 }
 
 /// The attempt of `role` under way, with its row's ID and the time it ends. One 10 minutes old is

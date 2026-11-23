@@ -194,6 +194,18 @@ fn confirm() -> Value {
     json!({"cmd": "approval_confirm"})
 }
 
+/// The person types on the new device the code the approver shows.
+fn accept(code: &str) -> Value {
+    json!({"cmd": "approval_accept", "code": code})
+}
+
+/// 6 digits that differ from `code`'s in every place.
+fn other_code(code: &str) -> String {
+    code.bytes()
+        .map(|digit| char::from(b'0' + (digit - b'0' + 1) % 10))
+        .collect()
+}
+
 fn from_qr(qr: &Value) -> Value {
     json!({"cmd": "approval_from_qr", "qr": qr})
 }
@@ -420,10 +432,15 @@ fn approval_by_code() {
     );
     let refused = error(&mut n.core, confirm());
     assert_eq!(refusal(&refused), expect("not_found", "approval"));
+    // Nor is there a code to accept before an attempt, or before it took an offer.
+    let refused = error(&mut n.core, accept("000000"));
+    assert_eq!(refusal(&refused), expect("not_found", "approval"));
 
     // The new device sends its commitment through the server; the approver answers with its
     // offer; only then does the new device reveal what the commitment hid.
     let begun = begin(&mut n);
+    let refused = error(&mut n.core, accept("000000"));
+    assert_eq!(refusal(&refused), expect("not_found", "code"));
     let refused = error(&mut n.core, offer(&begun["commitment"]));
     assert_eq!(refusal(&refused), expect("not_found", "identity"));
     let offered = ok(&mut a1.core, offer(&begun["commitment"]));
@@ -462,15 +479,20 @@ fn approval_by_code() {
     assert_eq!(offer.certificate, bytes(&identity["certificate"]));
     assert_eq!(code_of(&revealed_parts, &offer, &commitment), code);
     let qr: Qr = read(&begun["qr"]);
-    assert_eq!(qr.key, revealed_parts.key, "one key for the attempt");
+    assert_ne!(
+        qr.key, revealed_parts.key,
+        "the QR's key is its own: the reveal doesn't disclose it"
+    );
 
     // The person sees the codes match, and confirms on the approver: it hands the server the new
-    // device's certificate and the next list, and the transfer for the new device's inbox.
+    // device's certificate and the next list, and the transfer for the new device's inbox. On the
+    // new device, they type the code the approver shows.
     let approved = ok(&mut a1.core, confirm());
     server.take_device(a, &approved["certificate"], &approved["device_list"]);
     server.post(n.id, bytes(&approved["transfer"]));
     let inbox = server.inbox(n.id);
     assert_eq!(inbox.len(), 1);
+    assert_eq!(ok(&mut n.core, accept(code)), json!({}));
     let received = ok(&mut n.core, receive_direct(&inbox[0]));
     assert_eq!(received["type"], "approval.transfer");
     assert_eq!(received["identity_key"], identity["identity_key"]);
@@ -968,9 +990,10 @@ fn transfer_from_a_forged_identity_is_rejected() {
     let received = ok(&mut n.core, approval_receive(&approved["transfer"]));
     assert_eq!(received["identity_key"], identity["identity_key"]);
 
-    // By the code, the server holds the attempt's key once it's revealed, so it can seal a
-    // transfer that holds together, its own identity signing everything. The new device takes the
-    // transfer only from the approver its code named.
+    // By the code, the server holds the commitment's key once it's revealed, so it can seal a
+    // transfer that holds together, its own identity signing everything. The new device takes no
+    // transfer sealed to that key before the person types the approver's code, and then only the
+    // approver's.
     let mut n2 = server.bare_device(a);
     let begun = begin(&mut n2);
     let asked: Commitment = read(&begun["commitment"]);
@@ -985,12 +1008,97 @@ fn transfer_from_a_forged_identity_is_rejected() {
         approver,
     );
     let refused = error(&mut n2.core, receive_direct(&consistent));
+    assert_eq!(refusal(&refused), expect("not_found", "code"));
+    let checked = ok(&mut a1.core, check(&revealed["reveal"]));
+    ok(&mut n2.core, accept(checked["code"].as_str().unwrap()));
+    let refused = error(&mut n2.core, receive_direct(&consistent));
     assert_eq!(refusal(&refused), expect("invalid_signature", "transfer"));
     assert_eq!(status(&mut n2)["has_identity"], false);
-    ok(&mut a1.core, check(&revealed["reveal"]));
     let approved = ok(&mut a1.core, confirm());
     let received = ok(&mut n2.core, receive_direct(&bytes(&approved["transfer"])));
     assert_eq!(received["identity_key"], identity["identity_key"]);
+}
+
+#[test]
+fn a_transfer_by_the_notice_waits_for_the_code() {
+    let mut server = FakeServer::new();
+    let a = new_id();
+    server.first_device(a);
+    let mut n = server.bare_device(a);
+    let begun = begin(&mut n);
+    let asked: Commitment = read(&begun["commitment"]);
+
+    // The server answers the commitment with an offer of its own: a device of the user that an
+    // identity of its own, X, certifies. No approver took part.
+    let forger = Forger::new();
+    let x = &forger.identity;
+    let server_offer = Offer {
+        v: 1,
+        hash: asked.hash.clone(),
+        certificate: forger.own_certificate(a, x),
+        nonce: random32().to_vec(),
+    };
+    let revealed = ok(&mut n.core, reveal(&json!(b64(&cbor(&server_offer)))));
+    // The reveal hands it the commitment's key, so it seals a transfer that holds together under X.
+    let key = read::<Reveal>(&revealed["reveal"]).key;
+    let consistent = forger.transfer(
+        n.id,
+        &key,
+        forger.certificate_for(&asked),
+        forger.list(a, &[forger.device, n.id], x),
+        forger.own_certificate(a, x),
+    );
+
+    // Until the person types here the code the approver shows, neither command takes it, and
+    // nothing changes.
+    let before = identity_rows(&mut n);
+    for command in [
+        receive_direct(&consistent),
+        approval_receive(&json!(b64(&consistent))),
+    ] {
+        let refused = error(&mut n.core, command);
+        assert_eq!(refusal(&refused), expect("not_found", "code"));
+    }
+    assert_eq!(identity_rows(&mut n), before);
+    // A code that isn't this device's is refused, and leaves the attempt as it was.
+    let wrong = other_code(revealed["code"].as_str().unwrap());
+    let refused = error(&mut n.core, accept(&wrong));
+    assert_eq!(refusal(&refused), expect("rule_violation", "code_mismatch"));
+    assert_eq!(identity_rows(&mut n), before);
+    let refused = error(&mut n.core, receive_direct(&consistent));
+    assert_eq!(refusal(&refused), expect("not_found", "code"));
+    assert_eq!(status(&mut n)["has_identity"], false);
+}
+
+#[test]
+fn a_server_offer_leaves_the_qr_alone() {
+    let mut server = FakeServer::new();
+    let a = new_id();
+    let (mut a1, identity) = server.first_device(a);
+    let mut n = server.bare_device(a);
+    let begun = begin(&mut n);
+
+    // While the QR shows, the server answers the commitment with an offer of its own, and the new
+    // device reveals for it.
+    let forger = Forger::new();
+    let server_offer = Offer {
+        v: 1,
+        hash: read::<Commitment>(&begun["commitment"]).hash,
+        certificate: forger.own_certificate(a, &forger.identity),
+        nonce: random32().to_vec(),
+    };
+    let revealed = ok(&mut n.core, reveal(&json!(b64(&cbor(&server_offer)))));
+
+    // The real approver scans the QR, and the new device takes its transfer.
+    let approved = ok(&mut a1.core, from_qr(&begun["qr"]));
+    let received = ok(&mut n.core, receive_direct(&bytes(&approved["transfer"])));
+    assert_eq!(received["identity_key"], identity["identity_key"]);
+    assert_eq!(status(&mut n)["identity_key"], identity["identity_key"]);
+    // The QR's key is its own: the reveal didn't disclose it.
+    assert_ne!(
+        read::<Reveal>(&revealed["reveal"]).key,
+        read::<Qr>(&begun["qr"]).key
+    );
 }
 
 #[test]
