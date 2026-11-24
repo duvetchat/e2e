@@ -12,7 +12,8 @@ use crate::signed::{decode, encode};
 /// The member list's extension type, in RFC 9420's private range.
 pub const MEMBER_LIST_EXTENSION: u16 = 0xF0D1;
 
-/// The most people a conversation holds.
+/// The most people a new conversation holds, and that any takes someone in up to. One from before
+/// the cutover may have had more: it keeps them (ruling 38).
 pub const MAX_MEMBERS: usize = 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

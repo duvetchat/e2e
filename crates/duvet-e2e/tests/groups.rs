@@ -544,6 +544,93 @@ fn create_group_keeps_to_the_record() {
     }
 }
 
+/// A group from before the cutover with more than 20 people keeps them all (ruling 38): it starts
+/// with every one of them, its devices holding it to their records of the conversation, and its
+/// members renew their leaves and take someone out; but it takes no one in while it's past 20,
+/// from its owner's core or past a server that skips its validator.
+#[test]
+fn a_legacy_group_past_20_keeps_its_members() {
+    let mut server = FakeServer::new();
+    let (o, a, b, c) = (new_id(), new_id(), new_id(), new_id());
+    let [mut o1, mut a1, mut b1, mut c1] = new_devices(&mut server, [o, a, b, c]);
+    // O, its owner, A, B, and 19 people whose devices haven't come yet.
+    let mut users = vec![o, a, b];
+    users.extend((0..19).map(|_| new_id()));
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(o), &users, true);
+    o1.remember(conversation, Some(o), &users);
+    b1.remember(conversation, Some(o), &users);
+
+    // A, not its owner, makes epoch 0 with all 22, as its own record has them, and the validator
+    // takes it as the conversation's; O and B take the welcome, held to their records.
+    let create = json!({
+        "cmd": "create_group",
+        "conversation_id": conversation,
+        "kind": "group",
+        "owner": o,
+        "members": users,
+        "key_packages": server.claim(&[o, a, b]),
+        "external_sender": server.external_sender(),
+        "legacy": true,
+        "expected": {"owner": o, "members": users},
+    });
+    server.commit(&mut a1, conversation, create).unwrap();
+    server.deliver_all(&mut [&mut o1, &mut a1, &mut b1]);
+    let state = same_group(&mut [&mut o1, &mut a1, &mut b1], conversation);
+    assert_eq!(members(&state), users);
+
+    // A renews its leaf, and O takes B out: 21 stay.
+    server
+        .commit(&mut a1, conversation, command("refresh", conversation))
+        .unwrap();
+    server.deliver_all(&mut [&mut o1, &mut a1, &mut b1]);
+    let remove = json!({"cmd": "remove_members", "conversation_id": conversation, "users": [b]});
+    server.commit(&mut o1, conversation, remove).unwrap();
+    server.deliver_all(&mut [&mut o1, &mut a1, &mut b1]);
+    let state = same_group(&mut [&mut o1, &mut a1], conversation);
+    assert_eq!(state["epoch"], 3);
+    assert_eq!(members(&state).len(), 21);
+    assert_eq!(b1.no_group(conversation)["what"], "membership");
+
+    // No one comes in while it's past 20: O's core makes no such add...
+    let add = adding(&mut server, conversation, c);
+    let refused = error(&mut o1.core, add.clone());
+    assert_eq!(
+        (&refused["code"], &refused["rule"]),
+        (&json!("rule_violation"), &json!("too_many_members"))
+    );
+
+    // ...the validator takes none O makes by hand, and when a server that skips it queues one, A
+    // refuses the commit and C its welcome.
+    let key_package = &add["users"][0]["key_packages"][0];
+    let (commit, welcome, group_info) = add_by_hand(&mut o1, conversation, Some(c), key_package);
+    let checked = server.check(conversation, &commit, &group_info);
+    assert_eq!(
+        checked.error.map(|refusal| refusal.code).as_deref(),
+        Some("too_many_members")
+    );
+    let commit_seq = server.force(conversation, "commit", commit);
+    let welcome_seq = server.force(conversation, "welcome", welcome);
+    assert_eq!(
+        results(&server.deliver(&mut a1)),
+        [
+            json!([commit_seq, "commit", "rejected", "too_many_members"]),
+            json!([welcome_seq, "welcome", "ignored", null]),
+        ]
+    );
+    let welcome = server.entries(conversation)[welcome_seq as usize - 1].clone();
+    let refused = ok(&mut c1.core, apply(conversation, &[welcome]));
+    assert_eq!(
+        results(&[refused]),
+        [json!([
+            welcome_seq,
+            "welcome",
+            "rejected",
+            "too_many_members"
+        ])]
+    );
+}
+
 #[test]
 fn reset_without_the_group_is_refused() {
     let mut server = FakeServer::new();

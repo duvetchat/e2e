@@ -4,10 +4,12 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use duvet_e2e_rules::{
-    CommitAad, DeviceCertificate, DeviceList, Entry, Kind, LeaveStatement, MEMBER_LIST_EXTENSION,
-    MemberList, MembershipChange, Removed, RuleContext, RuleViolation, SUITE, check_applied_change,
-    check_change, check_joined_state, check_state, extract_change, group_config, group_id,
-    is_record, join_config, keeps_record, leaf_capabilities, leaves,
+    BindProof, CommitAad, DEVICE_BIND, DEVICE_CERTIFICATE, DEVICE_LIST, DIRECT_MESSAGE,
+    DeviceCertificate, DeviceList, Entry, HISTORY_SHARE, Kind, LEAVE, LeaveStatement,
+    MEMBER_LIST_EXTENSION, MemberList, MembershipChange, Record, Removed, RuleContext,
+    RuleViolation, SUITE, check_applied_change, check_change, check_joined_state, check_state,
+    extract_change, group_config, group_id, is_record, join_config, keeps_record,
+    leaf_capabilities, leaves, sign, verify,
 };
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
@@ -1037,6 +1039,109 @@ fn too_many_members_is_rejected() {
     );
 }
 
+/// 22 people of a conversation from before the cutover, O its owner: O, A and B, and 19 whose
+/// devices haven't come yet.
+fn crowded(world: &World) -> MemberList {
+    let mut users = vec![world.entry(O, 0), world.entry(A, 0), world.entry(B, 0)];
+    users.extend((0..19).map(|_| Entry {
+        user: new_id(),
+        generation: GENERATION,
+        epoch: 0,
+    }));
+    MemberList::new(Kind::Group, Some(world.id(O)), users)
+}
+
+/// A group from before the cutover keeps the people it had past 20 (ruling 38): its epoch 0 lists
+/// them all as the conversation expects them, a device takes it held to its record, and its
+/// members' commits go through, but one that brings someone in. As a new group it's refused.
+#[test]
+fn a_legacy_group_past_20_keeps_its_members() {
+    // A, not its owner, makes epoch 0 with all 22: the conversation's start, but no new group's.
+    let world = World::new(&[1, 1, 1, 1]);
+    let members = crowded(&world);
+    let mut legacy = world.context();
+    legacy.expected_initial = Some(members.clone());
+    let (group, bundle) = world.first_commit((A, 0), &members, &[(O, 0), (B, 0)]);
+    let context = group.public_group().group_context();
+    let start = own_change(&group, &[]).unwrap();
+    assert_eq!(state_of(&legacy, context, group.members()), Ok(()));
+    assert_eq!(check_change(&legacy, &start), Ok(()));
+    assert_eq!(
+        state_of(&world.context(), context, group.members()),
+        Err(RuleViolation::TooManyMembers)
+    );
+    assert_eq!(
+        check_change(&world.context(), &start),
+        Err(RuleViolation::TooManyMembers)
+    );
+
+    // B takes the welcome held to its record of the conversation, at its founding or later;
+    // without one, it's a new group of more than 20 to B.
+    let welcome = world.welcomed((B, 0), &bundle);
+    let joined = leaves(welcome.members()).unwrap();
+    for record in [
+        Record::Founding(members.clone()),
+        Record::Joined(members.clone()),
+    ] {
+        let mut recorded = world.context();
+        recorded.record = Some(record);
+        assert_eq!(
+            check_joined_state(&recorded, welcome.group_context(), &joined),
+            Ok(())
+        );
+    }
+    assert_eq!(
+        check_joined_state(&world.context(), welcome.group_context(), &joined),
+        Err(RuleViolation::TooManyMembers)
+    );
+
+    // In the group: A renews its leaf, A's second device joins, and O takes B out...
+    let world = World::new(&[1, 2, 1, 1]);
+    let members = crowded(&world);
+    let mut s = Scene::new(world, members, (O, 0), &[(A, 0), (B, 0)]);
+    let ctx = s.world.context();
+    assert_eq!(s.verdict((A, 0), Commit::default(), &ctx), Ok(()));
+    let joining = s.external_change((A, 1), (O, 0));
+    assert_eq!(check_change(&ctx, &joining), Ok(()));
+    let without_b = Commit {
+        removes: vec![(B, 0)],
+        members: Some(removing(&s.list(), s.id(B))),
+        ..Commit::default()
+    };
+    assert_eq!(s.verdict((O, 0), without_b, &ctx), Ok(()));
+
+    // ...but no one comes in while the group is past 20, in someone's place neither.
+    let c = s.world.device((C, 0)).key_package();
+    let adds_c = Commit {
+        adds: vec![c.clone()],
+        members: Some(adding(&s.list(), s.id(C), s.epoch() + 1)),
+        ..Commit::default()
+    };
+    let change = s.change((O, 0), adds_c).unwrap();
+    assert_eq!(
+        check_change(&ctx, &change),
+        Err(RuleViolation::TooManyMembers)
+    );
+    assert_eq!(
+        check_applied_change(&ctx, &change),
+        Err(RuleViolation::TooManyMembers)
+    );
+    let in_b_s_place = Commit {
+        adds: vec![c],
+        removes: vec![(B, 0)],
+        members: Some(adding(
+            &removing(&s.list(), s.id(B)),
+            s.id(C),
+            s.epoch() + 1,
+        )),
+        ..Commit::default()
+    };
+    assert_eq!(
+        s.verdict((O, 0), in_b_s_place, &ctx),
+        Err(RuleViolation::TooManyMembers)
+    );
+}
+
 #[test]
 fn context_changed_is_rejected() {
     let mut s = Scene::group();
@@ -1941,6 +2046,77 @@ fn signed_objects_reject_tampering() {
         DeviceList::verify(&list, &public(&stranger.identity)),
         Err(RuleViolation::InvalidSignature)
     );
+}
+
+/// A bind proof is no other signed object, and no other is a bind proof: each signs under its own
+/// label, so the same key and the same body don't carry from one to another.
+#[test]
+fn bind_proof_is_domain_separated() {
+    let user = User::new(1);
+    let device = &user.devices[0];
+    let key = public(&device.signer);
+    let proof = BindProof::new(user.id, device.id, [7; 32], [0xc4; 32])
+        .sign(&device.signer)
+        .unwrap();
+    assert!(BindProof::verify(&proof, &key).is_ok());
+    let others = [
+        DEVICE_CERTIFICATE,
+        DEVICE_LIST,
+        LEAVE,
+        DIRECT_MESSAGE,
+        HISTORY_SHARE,
+    ];
+
+    // The proof verifies as nothing else the device's key could sign...
+    let certificate = DeviceCertificate::read_unverified(&device.certificate).unwrap();
+    assert_eq!(
+        LeaveStatement::verify(&proof, &certificate),
+        Err(RuleViolation::InvalidSignature)
+    );
+    assert_eq!(
+        DeviceCertificate::verify(&proof, &key),
+        Err(RuleViolation::InvalidSignature)
+    );
+    assert_eq!(
+        DeviceList::verify(&proof, &key),
+        Err(RuleViolation::InvalidSignature)
+    );
+    for label in others {
+        assert_eq!(
+            verify(label, &proof, &key),
+            Err(RuleViolation::InvalidSignature),
+            "{label}"
+        );
+    }
+
+    // ...its body, signed under another label, isn't a proof...
+    let body = verify(DEVICE_BIND, &proof, &key).unwrap();
+    for label in others {
+        let signed = sign(label, body.clone(), &device.signer).unwrap();
+        assert_eq!(
+            BindProof::verify(&signed, &key),
+            Err(RuleViolation::InvalidSignature),
+            "{label}"
+        );
+    }
+
+    // ...and nothing else the device signs is one.
+    let statement = LeaveStatement::new(user.id, CONVERSATION, GENERATION, 1, device.id)
+        .sign(&device.signer)
+        .unwrap();
+    let list = user.list.sign(&device.signer).unwrap();
+    let certified = certificate.sign(&device.signer).unwrap();
+    for (what, signed) in [
+        ("a leave statement", statement),
+        ("a device list", list),
+        ("a certificate", certified),
+    ] {
+        assert_eq!(
+            BindProof::verify(&signed, &key),
+            Err(RuleViolation::InvalidSignature),
+            "{what}"
+        );
+    }
 }
 
 #[test]

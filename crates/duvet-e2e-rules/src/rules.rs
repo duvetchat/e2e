@@ -33,7 +33,7 @@ pub enum RuleViolation {
     ExternalJoinChangesMembers,
     #[error("the server proposed something other than removing a leaf")]
     ServerProposalNotRemove,
-    #[error("more than 20 members")]
+    #[error("a new group of more than 20 members, or someone added past 20")]
     TooManyMembers,
     #[error("the group's context isn't Duvet's, or the commit changes it beyond its members")]
     ContextChanged,
@@ -170,7 +170,10 @@ fn change_rules(
     if change.context_changed || after.kind != before.kind {
         return Err(ContextChanged);
     }
-    if after.users.len() > MAX_MEMBERS {
+    // No one comes in past 20 people. A conversation from before the cutover may start with more
+    // (`check_state`): it keeps them, and takes no one in while it would stay past 20.
+    let brings_someone = after.users.iter().any(|entry| !before.contains(entry.user));
+    if brings_someone && after.users.len() > MAX_MEMBERS {
         return Err(TooManyMembers);
     }
     if change
@@ -378,6 +381,13 @@ fn state(
 
     let list = MemberList::from_group_context(context)?;
     let (_, generation) = group_id_parts(context.group_id())?;
+    // More than 20 people only in a conversation from before the cutover that the expected list or
+    // the device's record describes (ruling 38): the list is then that one, or keeps to that
+    // record, which holds no one the conversation didn't have.
+    let described = ctx.expected_initial.is_some() || ctx.record.is_some();
+    if list.users.len() > MAX_MEMBERS && !described {
+        return Err(TooManyMembers);
+    }
     well_formed(&list, generation, context.epoch().as_u64())?;
     if let Some(expected) = &ctx.expected_initial {
         let users = |list: &MemberList| {
@@ -491,12 +501,9 @@ pub fn keeps_record(list: &MemberList, record: &MemberList) -> bool {
         && owner_kept
 }
 
-/// A member list as Duvet keeps it: at most 20 users, each once, entered in this generation and by
-/// `epoch`; a group's owner among them, and a DM's two users without one.
+/// A member list as Duvet keeps it: each user once, entered in this generation and by `epoch`; a
+/// group's owner among them, and a DM's two users without one.
 fn well_formed(list: &MemberList, generation: u32, epoch: u64) -> Result<(), RuleViolation> {
-    if list.users.len() > MAX_MEMBERS {
-        return Err(RuleViolation::TooManyMembers);
-    }
     let users: BTreeSet<Uuid> = list.users.iter().map(|entry| entry.user).collect();
     let entered = list
         .users

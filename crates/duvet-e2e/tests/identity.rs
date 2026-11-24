@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use duvet_e2e::{Clock, Core, FakeClock, OpenConfig, recovery};
-use duvet_e2e_rules::{DeviceCertificate, DeviceList, MEMBER_LIST_EXTENSION, SUITE};
+use duvet_e2e_rules::{
+    BindProof, DEVICE_BIND, DeviceCertificate, DeviceList, MEMBER_LIST_EXTENSION, RuleViolation,
+    SUITE,
+};
 use openmls::prelude::tls_codec::{DeserializeBytes as _, Serialize as _};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -1093,4 +1096,144 @@ fn safety_number_is_symmetric() {
     );
     assert_eq!(refused["code"], "bad_command", "{refused}");
     assert_eq!(refused["field"], "qr", "{refused}");
+}
+
+/// The bind proof's fixture, which the API's Go test reads too: a seed for the device's key, what
+/// the proof says, and the proof.
+const BIND_PROOF_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/bind-proof.json"
+);
+
+/// The Ed25519 key pair of `seed`, as OpenMLS holds a device's.
+fn seed_signer(seed: &[u8; 32]) -> SignatureKeyPair {
+    let public = ed25519_dalek::SigningKey::from_bytes(seed)
+        .verifying_key()
+        .to_bytes();
+    SignatureKeyPair::from_raw(SignatureScheme::ED25519, seed.to_vec(), public.to_vec())
+}
+
+fn bind_proof(core: &mut Core, challenge: &[u8]) -> Value {
+    run(
+        core,
+        &json!({"cmd": "bind_proof", "challenge": b64(challenge)}),
+    )
+}
+
+#[test]
+fn bind_proof_signs_the_challenge_with_the_device_key() {
+    let clock = FakeClock::now();
+    let dir = tempfile::tempdir().unwrap();
+    let mut core = open(&dir, &clock);
+    let (user, device) = (new_id(), new_id());
+    let created = ok(
+        &mut core,
+        json!({"cmd": "create_device", "user_id": user, "device_id": device}),
+    );
+    let signature_key = key(&created["signature_key"]);
+    let challenge = [0xc4; 32];
+    let says = BindProof::new(user, device, key(&created["hpke_key"]), challenge);
+
+    // From its start, before it has a certificate: the device binds its HPKE key itself.
+    let proof = bytes(&bind_proof(&mut core, &challenge)["ok"]["proof"]);
+    assert_eq!(BindProof::verify(&proof, &signature_key), Ok(says.clone()));
+
+    // With a certificate the same: the device's key signs it, not the identity's.
+    let identity = ok(&mut core, json!({"cmd": "create_identity"}));
+    let proof = bytes(&bind_proof(&mut core, &challenge)["ok"]["proof"]);
+    assert_eq!(BindProof::verify(&proof, &signature_key), Ok(says));
+    assert_eq!(
+        BindProof::verify(&proof, &key(&identity["identity_key"])),
+        Err(RuleViolation::InvalidSignature)
+    );
+
+    // Each session's challenge is in its own proof.
+    let other = [0x3d; 32];
+    let proof = bytes(&bind_proof(&mut core, &other)["ok"]["proof"]);
+    assert_eq!(
+        BindProof::verify(&proof, &signature_key).map(|bound| bound.challenge),
+        Ok(other.to_vec())
+    );
+}
+
+#[test]
+fn bind_proof_needs_32_bytes() {
+    let clock = FakeClock::now();
+    let dir = tempfile::tempdir().unwrap();
+    let mut core = open(&dir, &clock);
+
+    // Without a device there's no key to sign with.
+    let missing = bind_proof(&mut core, &[0xc4; 32])["error"].clone();
+    assert_eq!(
+        (&missing["code"], &missing["what"]),
+        (&json!("not_found"), &json!("device")),
+        "{missing}"
+    );
+
+    ok(
+        &mut core,
+        json!({"cmd": "create_device", "user_id": new_id(), "device_id": new_id()}),
+    );
+    for length in [0, 16, 31, 33, 64] {
+        let refused = bind_proof(&mut core, &vec![0xc4; length])["error"].clone();
+        assert_eq!(
+            (&refused["code"], &refused["field"]),
+            (&json!("bad_command"), &json!("challenge")),
+            "{length} bytes: {refused}"
+        );
+    }
+    let without = error(&mut core, json!({"cmd": "bind_proof"}));
+    assert_eq!(
+        (&without["code"], &without["field"]),
+        (&json!("bad_command"), &json!("challenge")),
+        "{without}"
+    );
+    assert!(bind_proof(&mut core, &[0xc4; 32])["ok"]["proof"].is_string());
+}
+
+/// The fixture's seed makes the fixture's proof: Ed25519 signs deterministically, and the proof's
+/// body has one encoding. The API's Go test verifies the same proof.
+#[test]
+fn bind_proof_matches_its_fixture() {
+    let fixture: Value =
+        serde_json::from_str(&std::fs::read_to_string(BIND_PROOF_FIXTURE).unwrap()).unwrap();
+    assert_eq!(fixture["label"], DEVICE_BIND);
+    let signer = seed_signer(&key(&fixture["seed"]));
+    let signature_key = key(&fixture["signature_key"]);
+    assert_eq!(signer.public(), signature_key);
+    let uuid = |field: &str| -> Uuid { fixture[field].as_str().unwrap().parse().unwrap() };
+    let says = BindProof::new(
+        uuid("user"),
+        uuid("device"),
+        key(&fixture["hpke_key"]),
+        key(&fixture["challenge"]),
+    );
+    let proof = bytes(&fixture["proof"]);
+    assert_eq!(says.sign(&signer).unwrap(), proof);
+    assert_eq!(BindProof::verify(&proof, &signature_key), Ok(says));
+}
+
+#[test]
+#[ignore = "writes tests/fixtures/bind-proof.json, which the API's Go test reads too"]
+fn write_bind_proof_fixture() {
+    let seed = [0x5b; 32];
+    let signer = seed_signer(&seed);
+    let user = Uuid::from_u128(0x0193_8a5c_4e00_7b3a_9c1d_2e3f_4a5b_6c7d);
+    let device = Uuid::from_u128(0x0193_8a5c_4e01_7d2e_8f30_4152_6374_8596);
+    let (hpke_key, challenge) = ([0x11; 32], [0xc4; 32]);
+    let proof = BindProof::new(user, device, hpke_key, challenge)
+        .sign(&signer)
+        .unwrap();
+    let fixture = json!({
+        "label": DEVICE_BIND,
+        "seed": b64(&seed),
+        "signature_key": b64(signer.public()),
+        "user": user,
+        "device": device,
+        "hpke_key": b64(&hpke_key),
+        "challenge": b64(&challenge),
+        "proof": b64(&proof),
+    });
+    let text = serde_json::to_string_pretty(&fixture).unwrap() + "\n";
+    std::fs::write(BIND_PROOF_FIXTURE, text).unwrap();
 }

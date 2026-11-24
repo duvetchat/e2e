@@ -39,6 +39,11 @@ pub(crate) enum Command {
         qr: Option<Vec<u8>>,
     },
     KeyPackages,
+    /// This device's proof that a session is its own: the session's challenge, signed.
+    BindProof {
+        #[serde(with = "b64")]
+        challenge: Vec<u8>,
+    },
 
     /// The server took what the last identity command made: its kept copy goes.
     IdentityUploaded,
@@ -149,6 +154,7 @@ pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error
             reply(identity::verify_user(tx, user_id, qr.as_deref())?)
         }
         Command::KeyPackages => reply(identity::key_packages(tx)?),
+        Command::BindProof { challenge } => reply(identity::bind_proof(tx, &challenge)?),
         Command::IdentityUploaded => reply(identity::identity_uploaded(tx)?),
         Command::DeviceListUploaded { version } => {
             reply(identity::device_list_uploaded(tx, version)?)

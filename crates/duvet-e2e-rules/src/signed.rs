@@ -13,6 +13,7 @@ pub const DEVICE_LIST: &str = "duvet device list v1";
 pub const LEAVE: &str = "duvet leave v1";
 pub const DIRECT_MESSAGE: &str = "duvet direct message v1";
 pub const HISTORY_SHARE: &str = "duvet history share v1";
+pub const DEVICE_BIND: &str = "duvet device bind v1";
 
 #[derive(Serialize, Deserialize)]
 struct Signed {
