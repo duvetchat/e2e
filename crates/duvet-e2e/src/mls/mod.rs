@@ -401,9 +401,11 @@ pub(crate) fn note_removed(
             continue;
         }
         tx.conn().execute(
-            "INSERT OR IGNORE INTO removed_devices (conversation_id, device_id) VALUES (?1, ?2)",
+            "INSERT OR IGNORE INTO removed_devices (conversation_id, user_id, device_id) \
+             VALUES (?1, ?2, ?3)",
             params![
                 conversation.as_bytes().as_slice(),
+                leaf.user.as_bytes().as_slice(),
                 leaf.device.as_bytes().as_slice()
             ],
         )?;
@@ -452,10 +454,10 @@ fn removed_identities(tx: &Tx<'_>, conversation: Uuid, user: Uuid) -> Result<Vec
 /// group ([`note_removed`]), its device off its user's latest list as this device holds it. Such a
 /// commit is refused as [`check`] refuses it, whatever identity certified the leaf: a device the
 /// group took out (lost, then left out of a rotation or a list) doesn't come back by the server's
-/// leave. The record knows that device alone: a new device ID its holder makes under the identity
-/// from before a rotation is refused by what [`check_applied`] hands the rules. The cost: a device
-/// added again after its removal, and taken off its list since, blocks a member that applies its
-/// return late, as any such leaf did before `check_applied`.
+/// leave. The record knows that device alone, by its user and its ID: a new device ID its holder
+/// makes under the identity from before a rotation is refused by what [`check_applied`] hands the
+/// rules. The cost: a device added again after its removal, and taken off its list since, blocks a
+/// member that applies its return late, as any such leaf did before `check_applied`.
 pub(crate) fn brings_back_removed(tx: &Tx<'_>, change: &MembershipChange) -> Result<bool, Error> {
     let brought = change
         .added
@@ -470,9 +472,10 @@ pub(crate) fn brings_back_removed(tx: &Tx<'_>, change: &MembershipChange) -> Res
             .is_some_and(|list| list.contains(claimed.device));
         let removed: bool = tx.conn().query_row(
             "SELECT EXISTS (SELECT 1 FROM removed_devices WHERE conversation_id = ?1 \
-             AND device_id = ?2)",
+             AND user_id = ?2 AND device_id = ?3)",
             params![
                 change.conversation.as_bytes().as_slice(),
+                claimed.user.as_bytes().as_slice(),
                 claimed.device.as_bytes().as_slice()
             ],
             |row| row.get(0),

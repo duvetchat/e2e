@@ -272,13 +272,17 @@ impl FakeServer {
     /// A new device of `user`. The user's first device makes their identity; the next ones get
     /// it as a recovered device would (the test signs their certificates and the list with them).
     pub fn device(&mut self, user: Uuid) -> TestDevice {
+        self.device_with_id(user, new_id())
+    }
+
+    /// As [`FakeServer::device`], whose ID is `id`.
+    pub fn device_with_id(&mut self, user: Uuid, id: Uuid) -> TestDevice {
         let dir = tempfile::tempdir().unwrap();
         let mut core = Core::open(OpenConfig {
             clock: Box::new(self.clock.clone()),
             ..OpenConfig::new(dir.path().join("core.db"), [1; 32])
         })
         .unwrap();
-        let id = new_id();
         let created = ok(
             &mut core,
             json!({"cmd": "create_device", "user_id": user, "device_id": id}),

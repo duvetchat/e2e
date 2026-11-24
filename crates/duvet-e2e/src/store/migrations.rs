@@ -44,8 +44,9 @@ pub(crate) fn run(conn: &mut Connection) -> Result<(), Error> {
 const V3: &str = r#"
 CREATE TABLE removed_devices (
     conversation_id BLOB NOT NULL,
+    user_id BLOB NOT NULL,
     device_id BLOB NOT NULL,
-    PRIMARY KEY (conversation_id, device_id)
+    PRIMARY KEY (conversation_id, user_id, device_id)
 );
 CREATE TABLE removed_identities (
     conversation_id BLOB NOT NULL,

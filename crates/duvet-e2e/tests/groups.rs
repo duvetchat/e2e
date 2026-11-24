@@ -2111,6 +2111,65 @@ fn a_device_taken_off_its_list_while_a_member_was_away_applies_late() {
     assert!(!device_set(&state).contains(&b2.id));
 }
 
+/// B takes a device off its list and A1 takes it out of A's group, which C1 applies. While C1 is
+/// away, a device of D's with the same ID joins by external commit, and then D takes it off its
+/// list. Back, C1 sees D's newest list: D's device isn't the one the group took out, which was B's,
+/// so its join applies, as any device's that left its list after the server took it.
+#[test]
+fn a_device_with_the_id_of_another_user_s_removed_one_applies_late() {
+    let mut server = FakeServer::new();
+    let (a, b, c, d) = (new_id(), new_id(), new_id(), new_id());
+    let [mut a1, mut b1, mut c1, mut d1] = new_devices(&mut server, [a, b, c, d]);
+    let shared = new_id();
+    let mut bx = server.device_with_id(b, shared);
+    server.publish(&mut bx);
+    for device in [&mut a1, &mut b1, &mut c1, &mut d1, &mut bx] {
+        server.introduce(device);
+    }
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b, c, d], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1, &mut d1, &mut bx]);
+    assert!(device_set(&c1.group(conversation)).contains(&shared));
+
+    let list = ok(
+        &mut b1.core,
+        json!({"cmd": "sign_device_list", "remove": [shared]}),
+    );
+    server.take_list(b, &list["device_list"]);
+    server.introduce(&mut a1);
+    server.remove_device(conversation, shared);
+    server.deliver(&mut a1);
+    server
+        .commit(
+            &mut a1,
+            conversation,
+            command("commit_pending", conversation),
+        )
+        .unwrap();
+    take_queue(&server, &mut c1, conversation);
+    assert!(!device_set(&c1.group(conversation)).contains(&shared));
+
+    let mut dx = server.device_with_id(d, shared);
+    server.introduce(&mut dx);
+    let joined = server
+        .commit(&mut dx, conversation, joining(&server, conversation))
+        .unwrap();
+    assert!(joined.get("commit").is_some());
+    server.introduce(&mut d1);
+    let list = ok(
+        &mut d1.core,
+        json!({"cmd": "sign_device_list", "remove": [shared]}),
+    );
+    server.take_list(d, &list["device_list"]);
+
+    let (_, taken) = take_queue(&server, &mut c1, conversation);
+    let taken = results(&[taken]);
+    assert_eq!(taken.last().unwrap()[2], "applied", "{taken:?}");
+    assert_eq!(c1.group(conversation)["blocked"], false);
+    assert!(device_set(&c1.group(conversation)).contains(&shared));
+}
+
 /// While C1 is away, B leaves from B2, and A1's commit takes B out with B2's statement; then B takes
 /// B2 off its list, which C1 sees. The statement holds for C1 all the same: B's identity certified
 /// B2's leaf, and the server took the commit while B2 was listed.
