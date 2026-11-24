@@ -229,7 +229,7 @@ func TestValidatorUnderWazero(t *testing.T) {
 		v := instantiate(t, ctx, runtime, compiled, apis)
 		// The validator's MAX_REQUEST (crates/duvet-e2e-validator/src/lib.rs): alloc makes no room
 		// past it, and validate refuses it unread.
-		const maxRequest = 4 << 20
+		const maxRequest = 8 << 20
 		if results, err := v.alloc.Call(ctx, maxRequest+1); err != nil || results[0] != 0 {
 			t.Errorf("alloc past the cap: %v, %v", results, err)
 		}

@@ -1537,6 +1537,30 @@ fn requests_hold_to_the_size_cap() {
     assert_eq!(code(&refused), "too_large");
 }
 
+/// The largest commit request step 3 allows: a group of 20 people with 20 devices each, whose state
+/// takes 4 MiB at most, its group info 1 MiB and the commit 256 KiB, with each user's identity and
+/// list. It's under `MAX_REQUEST`, and read: refused for what it holds (its state is no state), not
+/// for its size.
+#[test]
+fn the_largest_group_s_commit_fits_under_the_cap() {
+    let mut request = Request::new(Op::Commit, CONVERSATION, 0);
+    request.state = Some(ByteBuf::from(vec![0; 4 << 20]));
+    request.new_group_info = Some(ByteBuf::from(vec![0; 1 << 20]));
+    request.message = Some(ByteBuf::from(vec![0; 256 << 10]));
+    for _ in 0..20 {
+        let user = new_id();
+        request.identities.insert(user, ByteBuf::from(vec![0; 32]));
+        // A list of 20 devices, signed, is under 1 KiB.
+        request
+            .device_lists
+            .insert(user, ByteBuf::from(vec![0; 1024]));
+    }
+    let bytes = encode(&request);
+    assert!(bytes.len() <= MAX_REQUEST, "{} bytes", bytes.len());
+    let response: Response = ciborium::from_reader(validate_bytes(&bytes).as_slice()).unwrap();
+    assert_ne!(code(&response), "too_large");
+}
+
 /// A request's `Debug` shows no `signer_key`: the API's private key, the groups' external sender.
 #[test]
 fn debug_leaves_the_api_key_out() {

@@ -210,16 +210,21 @@ pub struct Failure {
     pub users: Vec<Uuid>,
 }
 
-/// The largest request the validator reads, in bytes: 4 MiB. A group of 20 people with 10 devices
-/// each starts with a request of about 190 KB, and a commit in it takes one of about 450 KB, its
-/// state about 340 KB. The API sizes the module's memory by it.
-pub const MAX_REQUEST: usize = 4 << 20;
+/// The largest request the validator reads, in bytes: 8 MiB. The largest group step 3 allows, 20
+/// people with 20 devices each, takes a commit request of up to 5.3 MiB: its state 4 MiB at most,
+/// the group info 1 MiB and the commit 256 KiB, with each user's identity and list. A group of 20
+/// people with 10 devices each starts with a request of about 190 KB, and a commit in it takes one
+/// of about 450 KB, its state about 340 KB. The API sizes the module's memory by it.
+pub const MAX_REQUEST: usize = 8 << 20;
+
+/// What a request over [`MAX_REQUEST`] is refused with.
+const OVER_CAP: &str = "the request is over 8 MiB";
 
 /// Answers a CBOR request with a CBOR response, a refusal included: nothing fails through it. A
 /// request over [`MAX_REQUEST`] is refused before it's read.
 pub fn validate_bytes(input: &[u8]) -> Vec<u8> {
     if input.len() > MAX_REQUEST {
-        return refused(TOO_LARGE, "the request is over 4 MiB");
+        return refused(TOO_LARGE, OVER_CAP);
     }
     // A panic is caught natively; the module aborts on one, as wasm32 can't unwind.
     let response = match catch_unwind(AssertUnwindSafe(|| handle(input))) {
@@ -877,7 +882,7 @@ mod exports {
     pub unsafe extern "C" fn validate(ptr: u32, len: u32) -> u64 {
         let response = if len as usize > super::MAX_REQUEST {
             // Refused unread, as `validate_bytes` refuses it.
-            super::refused(super::TOO_LARGE, "the request is over 4 MiB")
+            super::refused(super::TOO_LARGE, super::OVER_CAP)
         } else if len == 0 {
             super::validate_bytes(&[])
         } else if ptr == 0 {
