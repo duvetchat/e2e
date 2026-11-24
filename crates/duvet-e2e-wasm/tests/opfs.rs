@@ -35,3 +35,23 @@ async fn open_refuses_without_opfs() {
     let memory = unsafe { MemVfsUtil::get() }.expect("the in-memory VFS");
     assert!(memory.export_db("no-opfs.db").is_err());
 }
+
+#[wasm_bindgen_test]
+fn a_path_sqlite_wouldnt_keep_in_opfs_is_refused() {
+    // In memory, a private temporary database, or a URI, which can name a VFS or a mode of its own:
+    // refused whether or not OPFS is installed.
+    for path in [
+        "",
+        ":memory:",
+        "file:core.db",
+        "file:core.db?mode=memory",
+        "file::memory:",
+    ] {
+        let config = serde_json::json!({ "path": path }).to_string();
+        let error = WasmCore::open(&config, &[1; 32]).err().expect(path);
+        let text = error.as_string().expect("the error reply, as a string");
+        let reply: Value = serde_json::from_str(&text).expect("a JSON reply");
+        assert_eq!(reply["error"]["code"], "bad_command", "{path:?}");
+        assert_eq!(reply["error"]["field"], "path", "{path:?}");
+    }
+}

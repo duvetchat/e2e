@@ -55,10 +55,19 @@ pub struct WasmCore(Core);
 impl WasmCore {
     /// Opens the database `config_json` names (`{"path"}`) with its raw 32-byte key, or creates it.
     /// `storage` until [`install_opfs`] succeeded in this instance: a database kept in memory
-    /// would be gone at the next reload, with its device already on the user's list.
+    /// would be gone at the next reload, with its device already on the user's list. And
+    /// `bad_command` for a path SQLite never keeps in OPFS: empty, `:memory:`, or a `file:` URI.
     pub fn open(config_json: &str, db_key: &[u8]) -> Result<WasmCore, JsValue> {
         let config: Config =
             serde_json::from_str(config_json).map_err(|error| reply(&Error::bad_command(error)))?;
+        // SQLite keeps these in memory, or reads them as a URI, which can name a VFS of its own.
+        let path = config.path.as_str();
+        if path.is_empty() || path == ":memory:" || path.starts_with("file:") {
+            return Err(reply(&Error::BadCommand {
+                message: "path must name a database file in OPFS",
+                field: Some("path".into()),
+            }));
+        }
         if db_key.len() != 32 {
             return Err(reply(&Error::BadCommand {
                 message: "db_key must be 32 bytes",
