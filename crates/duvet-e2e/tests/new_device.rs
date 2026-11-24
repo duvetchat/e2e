@@ -1625,6 +1625,68 @@ fn own_list_that_lost_to_another_of_its_version_is_replaced() {
     assert!(next.contains(a2.id) && next.contains(a3.id));
 }
 
+/// A1 signs version 3 of A's list without A2, the server takes it, and the client confirms the
+/// upload (`device_list_uploaded`). The server never serves A1 that list: it serves the one from
+/// before (`older_list`). A3 recovers against that older list and signs it, with A2 and itself, into
+/// a version 3 of its own: served to A1, it's a conflict, and A2 stays off the list A1 holds.
+#[test]
+fn own_list_confirmed_as_uploaded_gives_way_to_none_of_its_version() {
+    let mut server = FakeServer::new();
+    let a = new_id();
+    let (mut a1, identity) = server.first_device(a);
+    let a2 = server.device(a);
+    server.introduce(&mut a1);
+    let old = server.observed(a);
+    let signed = ok(
+        &mut a1.core,
+        json!({"cmd": "sign_device_list", "remove": [a2.id]}),
+    );
+    server.take_list(a, &signed["device_list"]);
+    let confirmed = run(
+        &mut a1.core,
+        &json!({"cmd": "device_list_uploaded", "version": 3}),
+    );
+    let seen = ok(&mut a1.core, old.clone());
+    assert_eq!(
+        (&seen["state"], &seen["reason"]),
+        (&json!("rejected"), &json!("older_list"))
+    );
+
+    let mut a3 = server.bare_device(a);
+    let recovered = ok(
+        &mut a3.core,
+        recovering(
+            identity["recovery_key"].as_str().unwrap(),
+            &identity,
+            &old["device_list"],
+        ),
+    );
+    let mut served = old.clone();
+    served["device_list"] = recovered["device_list"].clone();
+    served["certificates"]
+        .as_array_mut()
+        .unwrap()
+        .push(recovered["certificate"].clone());
+    let refused = ok(&mut a1.core, served);
+    assert_eq!(
+        (&refused["state"], &refused["reason"]),
+        (&json!("rejected"), &json!("conflicting_list"))
+    );
+    let held = a1.rolled_back(|tx| tx.device_list_of(a)).unwrap();
+    assert_eq!((held.version, held.contains(a2.id)), (3, false));
+    assert_eq!(confirmed, json!({"ok": {}}));
+
+    // Confirming a version this device doesn't hold is `not_found` `upload`.
+    let stale = error(
+        &mut a1.core,
+        json!({"cmd": "device_list_uploaded", "version": 2}),
+    );
+    assert_eq!(
+        (&stale["code"], &stale["what"]),
+        (&json!("not_found"), &json!("upload"))
+    );
+}
+
 /// What an identity command made, its reply lost before the upload, can be had again: a recovered
 /// device's certificate and its user's list from `status`; `create_identity`'s and
 /// `reset_identity`'s recovery key and blobs from the same command run again, until the client

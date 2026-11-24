@@ -42,6 +42,10 @@ pub(crate) enum Command {
 
     /// The server took what the last identity command made: its kept copy goes.
     IdentityUploaded,
+    /// The server took this device's upload of its own user's list of `version`.
+    DeviceListUploaded {
+        version: u64,
+    },
 
     // Starting over and changing the keys.
     ResetIdentity,
@@ -146,6 +150,9 @@ pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error
         }
         Command::KeyPackages => reply(identity::key_packages(tx)?),
         Command::IdentityUploaded => reply(identity::identity_uploaded(tx)?),
+        Command::DeviceListUploaded { version } => {
+            reply(identity::device_list_uploaded(tx, version)?)
+        }
 
         Command::ResetIdentity => reply(identity::reset_identity(tx)?),
         Command::RotateKeys {

@@ -19,7 +19,7 @@ pub(crate) use approval::{
     approval_reveal, receive_transfer,
 };
 pub(crate) use certificates::{keep_certificates, keep_earlier_identity};
-pub(crate) use contacts::{observe_user, safety_number, verify_user};
+pub(crate) use contacts::{device_list_uploaded, observe_user, safety_number, verify_user};
 pub(crate) use device::{create_device, key_packages};
 pub(crate) use identity::{create_identity, identity_uploaded, sign_device_list};
 pub(crate) use recover::{Recover, recover};
