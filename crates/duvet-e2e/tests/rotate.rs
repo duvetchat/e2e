@@ -1545,3 +1545,32 @@ fn a_rotation_run_again_reseals_its_transfers() {
     let next = ok(&mut a1.core, rotating(&server, a, &[]));
     assert_ne!(next["identity_key"], rotated["identity_key"]);
 }
+
+/// A1 made A's identity, and its client never confirmed the upload, though the server took it. A2
+/// changes the keys, and A1 takes its transfer: what A1 kept of the identity it made goes with that
+/// identity. `create_identity` is `exists` again, as for any device that holds an identity, and
+/// nothing waits for `identity_uploaded`.
+#[test]
+fn a_kept_reply_goes_with_the_identity_it_was_made_for() {
+    let mut server = FakeServer::new();
+    let a = new_id();
+    let (mut a1, _) = server.first_device(a);
+    let mut a2 = server.device(a);
+    meet(&mut server, &mut [&mut a1, &mut a2]);
+
+    let rotated = ok(&mut a2.core, rotating(&server, a, &[]));
+    server.take_identity(a, &rotated);
+    let served = key(&rotated["identity_key"]);
+    for message in server.inbox(a1.id) {
+        ok(&mut a1.core, receiving(&message, &served));
+    }
+    assert_eq!(identity_key(&mut a1.core), served);
+
+    let again = error(&mut a1.core, json!({"cmd": "create_identity"}));
+    assert_eq!(again["code"], "exists");
+    let confirmed = error(&mut a1.core, json!({"cmd": "identity_uploaded"}));
+    assert_eq!(
+        (&confirmed["code"], &confirmed["what"]),
+        (&json!("not_found"), &json!("upload"))
+    );
+}

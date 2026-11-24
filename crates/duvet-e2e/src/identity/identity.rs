@@ -101,13 +101,18 @@ pub(super) fn kept(tx: &Tx<'_>) -> Result<Option<Kept>, Error> {
 /// The server took what the last identity command made: its kept copy, the recovery key with it,
 /// goes (wiped: the database deletes securely). Nothing kept is `not_found` (`upload`).
 pub(crate) fn identity_uploaded(tx: &mut Tx<'_>) -> Result<Empty, Error> {
-    let deleted = tx
-        .conn()
-        .execute("DELETE FROM meta WHERE key = ?1", [KEPT_IDENTITY])?;
-    if deleted == 0 {
+    if !drop_kept(tx)? {
         return Err(not_found("upload"));
     }
     Ok(Empty {})
+}
+
+/// Drops what the last identity command kept for its upload, if anything: whether it did.
+pub(super) fn drop_kept(tx: &Tx<'_>) -> Result<bool, Error> {
+    let deleted = tx
+        .conn()
+        .execute("DELETE FROM meta WHERE key = ?1", [KEPT_IDENTITY])?;
+    Ok(deleted > 0)
 }
 
 /// The identity, on this device: it certifies the device, starts the device list at version 1, and

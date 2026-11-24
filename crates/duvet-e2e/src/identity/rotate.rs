@@ -29,7 +29,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::identity::{
-    CreatedIdentity, Kept, KeptRotation, create_identity, keep, kept, new_identity,
+    CreatedIdentity, Kept, KeptRotation, create_identity, drop_kept, keep, kept, new_identity,
 };
 use super::{
     BACKUP_KEY, DEVICE_LIST, IDENTITY_KEY, IDENTITY_SECRET, Identity, OwnDevice, from_cbor,
@@ -478,8 +478,9 @@ fn hand_over(
 ///   of this device's own keys.
 ///
 /// Then this device has the new identity, its certificate, the list and the backup key, keeps its
-/// own backup keys from before with the transfer's, and every group of it is due for `refresh`. A
-/// transfer it took already is `exists`.
+/// own backup keys from before with the transfer's, and every group of it is due for `refresh`.
+/// What an identity command of its own kept for its upload goes: it was made for the identity
+/// replaced. A transfer it took already is `exists`.
 pub(crate) fn receive_rotation(
     tx: &Tx<'_>,
     message: &[u8],
@@ -601,6 +602,9 @@ pub(crate) fn receive_rotation(
     meta_put(tx, IDENTITY_SECRET, &*transfer.identity)?;
     meta_put(tx, DEVICE_LIST, &transfer.device_list)?;
     meta_put(tx, BACKUP_KEY, &*transfer.backup_key)?;
+    // What an identity command of this device kept for its upload was made for the identity
+    // replaced now: run again, it would hand that one out.
+    drop_kept(tx)?;
     keep_previous(tx, own.user, &*transfer.backup_key, &kept)?;
     keep_earlier_identity(tx, own.user, &held)?;
     keep_certificates(
