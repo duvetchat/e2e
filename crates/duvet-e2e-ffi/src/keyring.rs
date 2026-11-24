@@ -163,7 +163,8 @@ fn lock_key(path: &Path) -> Result<File, Error> {
 }
 
 /// Deletes the database at `path` and what's beside it: SQLite's journals, `<path>.key` and the
-/// file it's written to first, then its key in `entry`.
+/// file it's written to first, then its key in `entry`. The database's deletion is on the disk
+/// before the key goes (`sync_folder`; Windows has no folder sync).
 ///
 /// It takes `<path>.key.lock`, as an open does, then the core's `<path>.lock`: `locked` while a
 /// core has the database open, and nothing is deleted then. Both locks stay, empty. An open may be
@@ -188,7 +189,12 @@ fn destroy_with(path: &Path, entry: Option<Result<impl KeyStore, NoKeyring>>) ->
     let _choosing = lock_key(path)?;
     let _open = duvet_e2e::lock_database(path)?;
     // The database first: what a destroy cut short leaves is a key, which a new database takes.
-    for suffix in ["", "-journal", "-wal", "-shm", ".key", ".key.tmp"] {
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        remove(&beside(path, suffix), "the database's files")?;
+    }
+    // On the disk before its key goes, so a power loss can't bring the database back without it.
+    sync_folder(path)?;
+    for suffix in [".key", ".key.tmp"] {
         remove(&beside(path, suffix), "the database's files")?;
     }
     delete_key(entry)
@@ -284,6 +290,20 @@ fn folder_of(file: &Path) -> &Path {
         .unwrap_or(Path::new("."))
 }
 
+/// Puts on the disk what was renamed into or deleted from `file`'s folder.
+#[cfg(unix)]
+fn sync_folder(file: &Path) -> Result<(), Error> {
+    File::open(folder_of(file))
+        .and_then(|folder| folder.sync_all())
+        .map_err(|error| Error::Storage(format!("the database's folder: {}", error.kind())))
+}
+
+/// Windows has no folder sync: there it does nothing.
+#[cfg(not(unix))]
+fn sync_folder(_: &Path) -> Result<(), Error> {
+    Ok(())
+}
+
 /// Deletes `file`, which may not be there. `what` names it in the error.
 fn remove(file: &Path, what: &str) -> Result<(), Error> {
     match std::fs::remove_file(file) {
@@ -296,7 +316,7 @@ fn remove(file: &Path, what: &str) -> Result<(), Error> {
 
 #[cfg(secret_service)]
 mod file {
-    use std::fs::{File, OpenOptions};
+    use std::fs::OpenOptions;
     use std::io::{ErrorKind, Read, Write};
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
@@ -343,9 +363,7 @@ mod file {
             .map_err(failed)?;
         std::fs::rename(&temporary, &key_file).map_err(failed)?;
         // The rename itself on the disk, before the database the key opens is made.
-        File::open(super::folder_of(&key_file))
-            .and_then(|folder| folder.sync_all())
-            .map_err(failed)?;
+        super::sync_folder(&key_file)?;
         Ok(key)
     }
 
