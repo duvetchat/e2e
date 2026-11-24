@@ -58,6 +58,10 @@ struct KeyringEntry {
 /// `{"path", "keyring": {"service", "account"}}`, which takes the key from the system's keyring
 /// and makes it on the database's first open.
 ///
+/// An open through the keyring waits, with no limit, while another open of the same database
+/// chooses its key (`<path>.key.lock`), that open's keyring prompt included, and asking the keyring
+/// can raise a prompt of its own: call it off the thread that draws the app.
+///
 /// # Safety
 ///
 /// `config_json` is a NUL-terminated string that stays valid for the call.

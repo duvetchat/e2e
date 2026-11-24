@@ -120,12 +120,13 @@ fn absent(_: &keyring_core::Result<()>) -> bool {
 }
 
 /// A keyring that's there but failed, which never sends the key to a file. Its text can name the
-/// entry, so the message is fixed.
+/// entry, so the message is fixed. Access is refused by a locked keyring, and by a Secret Service
+/// with no default collection (`NoResult`), which unlocking doesn't give.
 fn keyring_failed(error: &keyring_core::Error) -> Error {
     Error::Storage(
         match error {
             keyring_core::Error::NoStorageAccess(_) => {
-                "the system keyring is locked or refused access: unlock it and try again"
+                "the system keyring refused access: it's locked, or has no default keyring"
             }
             _ => "the system keyring failed",
         }
@@ -520,20 +521,44 @@ mod tests {
     fn only_a_missing_secret_service_counts_as_none() {
         use std::io::{self, ErrorKind};
 
+        // The store's errors as its construction gives them: the Secret Service's own, from
+        // `SecretService::connect`, in a `PlatformFailure`.
         let failure = |cause: secret_service::Error| -> keyring_core::Result<()> {
             Err(keyring_core::Error::PlatformFailure(Box::new(cause)))
         };
-        let bus = |kind: ErrorKind| {
-            failure(secret_service::Error::Zbus(zbus::Error::InputOutput(
+        // zbus can't connect to the session bus's socket: its I/O error, and the bus's address.
+        let socket = |kind: ErrorKind| {
+            failure(secret_service::Error::Zbus(zbus::Error::Connection(
                 Arc::new(io::Error::from(kind)),
+                "unix:path=/run/user/1000/bus".parse().unwrap(),
             )))
         };
+        // The bus's answer to `OpenSession` when nothing on it provides the Secret Service and
+        // nothing can be started to.
+        let open_session = zbus::Message::method_call("/org/freedesktop/secrets", "OpenSession")
+            .unwrap()
+            .build(&())
+            .unwrap();
+        let unknown = "org.freedesktop.DBus.Error.ServiceUnknown";
+        let no_provider = zbus::Error::from(
+            zbus::Message::error(&open_session.header(), unknown)
+                .unwrap()
+                .build(&("The name is not activatable",))
+                .unwrap(),
+        );
+        assert!(
+            matches!(no_provider, zbus::Error::MethodError(..)),
+            "{no_provider:?}"
+        );
         for none in [
+            // No address for the session bus at all.
             failure(secret_service::Error::Unavailable),
             // No socket where the session bus would be, or nothing listening on it.
-            bus(ErrorKind::NotFound),
-            bus(ErrorKind::ConnectionRefused),
+            socket(ErrorKind::NotFound),
+            socket(ErrorKind::ConnectionRefused),
             // A bus, but nothing on it provides the Secret Service.
+            failure(secret_service::Error::Zbus(no_provider)),
+            // The same answer as zbus's own D-Bus interfaces give it.
             failure(secret_service::Error::Zbus(zbus::Error::FDO(Box::new(
                 zbus::fdo::Error::ServiceUnknown("no provider".into()),
             )))),
@@ -544,7 +569,7 @@ mod tests {
         for there in [
             failure(secret_service::Error::Locked),
             failure(secret_service::Error::Prompt),
-            bus(ErrorKind::PermissionDenied),
+            socket(ErrorKind::PermissionDenied),
             Err(keyring_core::Error::NoStorageAccess(Box::new(
                 secret_service::Error::Unavailable,
             ))),
@@ -577,12 +602,17 @@ mod tests {
         assert!(no_entry(&store));
     }
 
+    /// What a keyring that refuses access answers: locked, or with no default keyring to keep a
+    /// key in, which unlocking doesn't give.
+    const REFUSED: &str =
+        "the system keyring refused access: it's locked, or has no default keyring";
+
     #[test]
     fn a_locked_or_failing_keyring_writes_no_file() {
         for (refusal, message) in [
             (
                 keyring_core::Error::NoStorageAccess("locked".into()),
-                "the system keyring is locked or refused access: unlock it and try again",
+                REFUSED,
             ),
             (
                 keyring_core::Error::PlatformFailure("a running service failed".into()),
@@ -601,6 +631,32 @@ mod tests {
             assert_eq!(error.to_string(), format!("storage: {message}"));
             assert!(!dir.path().join("core.db.key").exists(), "{message}");
             assert!(no_entry(&store));
+        }
+
+        // A locked Secret Service finds no key, then refuses as the new one is stored, its unlock
+        // prompt dismissed.
+        let dir = tempfile::tempdir().unwrap();
+        let error = database_key(&dir.path().join("core.db"), Ok(RefusesToStore)).unwrap_err();
+        assert_eq!(error.to_string(), format!("storage: {REFUSED}"));
+        assert!(!dir.path().join("core.db.key").exists());
+    }
+
+    /// An entry with no key, whose keyring refuses to store one.
+    struct RefusesToStore;
+
+    impl KeyStore for RefusesToStore {
+        fn get(&self) -> keyring_core::Result<Vec<u8>> {
+            Err(keyring_core::Error::NoEntry)
+        }
+
+        fn set(&self, _: &[u8]) -> keyring_core::Result<()> {
+            Err(keyring_core::Error::NoStorageAccess(
+                "the prompt was dismissed".into(),
+            ))
+        }
+
+        fn delete(&self) -> keyring_core::Result<()> {
+            Err(keyring_core::Error::NoEntry)
         }
     }
 
