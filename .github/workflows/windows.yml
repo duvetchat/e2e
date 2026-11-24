@@ -1,0 +1,50 @@
+name: Windows
+
+# The C ABI on Windows, as the desktop loads it: an artifacts release's DLL (artifacts.yml) under
+# Bun 1.3.9, the one Electrobun 1.15.1 ships. It runs on GitHub's Windows runner, whose minutes
+# count against the account's: by hand only.
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "The release to test: artifacts-<commit>"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  bun:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      # The tests of the commit the release was built from.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release }}
+          persist-credentials: false
+      - name: Download the release's DLL and check it against its SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.release }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          gh release download $env:RELEASE --repo $env:GITHUB_REPOSITORY --dir "$env:RUNNER_TEMP\core" --pattern duvet_e2e_ffi.dll --pattern SHA256SUMS
+          $expected = (Select-String -Path "$env:RUNNER_TEMP\core\SHA256SUMS" -Pattern '^([0-9a-f]{64})  duvet_e2e_ffi\.dll$').Matches[0].Groups[1].Value
+          if ((Get-FileHash "$env:RUNNER_TEMP\core\duvet_e2e_ffi.dll" -Algorithm SHA256).Hash -ne $expected) { throw "duvet_e2e_ffi.dll isn't the one SHA256SUMS names" }
+      # The baseline build, which Electrobun ships.
+      - name: Install Bun 1.3.9
+        run: |
+          Invoke-WebRequest https://github.com/oven-sh/bun/releases/download/bun-v1.3.9/bun-windows-x64-baseline.zip -OutFile "$env:RUNNER_TEMP\bun.zip"
+          if ((Get-FileHash "$env:RUNNER_TEMP\bun.zip" -Algorithm SHA256).Hash -ne "cc22962b3dcc51f279f13bf843675e052479e64a323f85eb29442066cf3942fe") { throw "bun.zip has another SHA-256" }
+          Expand-Archive "$env:RUNNER_TEMP\bun.zip" -DestinationPath $env:RUNNER_TEMP
+      # With only Windows' own folders on the PATH: the runner's PATH has mingw-w64's runtime DLLs,
+      # which a user's PC doesn't, and the DLL must load without them.
+      - name: host-tests/bun against the DLL
+        working-directory: host-tests/bun
+        env:
+          DUVET_E2E_FFI: ${{ runner.temp }}\core\duvet_e2e_ffi.dll
+        run: |
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          & "$env:RUNNER_TEMP\bun-windows-x64-baseline\bun.exe" test

@@ -1,14 +1,15 @@
 // The core's C ABI, loaded through bun:ffi as the desktop's Bun loads it.
 // DUVET_E2E_FFI names the built library (`cargo build -p duvet-e2e-ffi --release`).
 import { describe, expect, test } from "bun:test";
-import { CString, dlopen, FFIType } from "bun:ffi";
+import { CString, dlopen, FFIType, suffix } from "bun:ffi";
 import { randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const library =
-  process.env.DUVET_E2E_FFI ?? join(import.meta.dir, "../../target/release/libduvet_e2e_ffi.so");
+// duvet_e2e_ffi.dll on Windows, libduvet_e2e_ffi.dylib on macOS, libduvet_e2e_ffi.so elsewhere.
+const name = `${process.platform === "win32" ? "" : "lib"}duvet_e2e_ffi.${suffix}`;
+const library = process.env.DUVET_E2E_FFI ?? join(import.meta.dir, "../../target/release", name);
 
 const { symbols: lib } = dlopen(library, {
   duvet_e2e_open: { args: [FFIType.ptr], returns: FFIType.ptr },
@@ -81,8 +82,9 @@ describe("the C ABI", () => {
     close(core);
   });
 
-  // Where no session bus runs, as in CI's container, there is no Secret Service.
-  test.skipIf(Boolean(process.env.DBUS_SESSION_BUS_ADDRESS))(
+  // Where no session bus runs, as in CI's container, Linux has no Secret Service. Windows and macOS
+  // keep the key in their own keyring, never in a file.
+  test.skipIf(process.platform !== "linux" || Boolean(process.env.DBUS_SESSION_BUS_ADDRESS))(
     "without Secret Service the key goes to a file only its user reads",
     () => {
       const path = database();
