@@ -211,15 +211,27 @@ jobs:
         run: |
           cargo build --locked --release -p duvet_e2e
           cd flutter/duvet_e2e && DUVET_E2E_LIB="$CARGO_TARGET_DIR/release/libduvet_e2e.so" flutter test
-      # cargokit builds with rustup's stable toolchain, and adds the Android targets it needs.
+      # cargokit builds with rust-toolchain.toml's toolchain and --locked (its builder.dart, patched
+      # for them), and adds the Android targets it needs. With CARGOKIT_VERBOSE it logs each command.
       - name: The example's APK
         working-directory: host/flutter/duvet_e2e/example
         env:
           RUSTUP_HOME: ${{ runner.tool_cache }}/duvet-e2e/rustup
           CARGO_HOME: ${{ runner.tool_cache }}/duvet-e2e/cargo
+          CARGOKIT_VERBOSE: "1"
         run: |
-          flutter build apk --debug
+          flutter build apk --debug -v > "$RUNNER_TEMP/apk.log" 2>&1 || { tail -n 300 "$RUNNER_TEMP/apk.log"; exit 1; }
           jar tf build/app/outputs/flutter-apk/app-debug.apk | grep -Fx lib/arm64-v8a/libduvet_e2e.so
+      # Every library cargokit built: none without the toolchain rust-toolchain.toml names, or the lock.
+      - name: cargokit built with rust-toolchain.toml's toolchain and --locked
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          builds=$(grep -o 'Running command rustup run .* cargo build.*' "$RUNNER_TEMP/apk.log" || true)
+          echo "$builds"
+          [ -n "$channel" ] || { echo "rust-toolchain.toml names no channel"; exit 1; }
+          [ -n "$builds" ] || { echo "cargokit's log shows no cargo build"; exit 1; }
+          others=$(grep -Fv "Running command rustup run $channel cargo build --locked " <<< "$builds" || true)
+          [ -z "$others" ] || { echo "Built without $channel and --locked:"; echo "$others"; exit 1; }
 
   validator:
     if: github.event_name != 'schedule' && !inputs.fuzz

@@ -6,6 +6,7 @@ import 'dart:io';
 import 'package:collection/collection.dart';
 import 'package:logging/logging.dart';
 import 'package:path/path.dart' as path;
+import 'package:toml/toml.dart';
 
 import 'android_environment.dart';
 import 'cargo.dart';
@@ -147,7 +148,12 @@ class RustBuilder {
   CargoBuildOptions? get _buildOptions =>
       environment.crateOptions.cargo[environment.configuration];
 
-  String get _toolchain => _buildOptions?.toolchain.name ?? 'stable';
+  // Duvet: unless cargokit.yaml names one, the toolchain rust-toolchain.toml pins, which every
+  // other build of the workspace takes, where cargokit's own default is rustup's stable.
+  String get _toolchain =>
+      _buildOptions?.toolchain.name ??
+      _pinnedToolchain(environment.manifestDir) ??
+      'stable';
   String get _effectiveToolchain => _resolvedToolchain ?? _toolchain;
 
   /// Returns the path of directory containing build artifacts.
@@ -163,6 +169,8 @@ class RustBuilder {
         (target.android == null && environment.glibcVersion != null)
             ? 'zigbuild'
             : 'build',
+        // Duvet: with the workspace's Cargo.lock as it is, as every other build of it.
+        '--locked',
         ...extraArgs,
         '--manifest-path',
         manifestPath,
@@ -257,5 +265,23 @@ class RustBuilder {
       'CC_${target.rust}': clangPath,
       'AR_${target.rust}': path.join(sdkPath, 'llvm', 'bin', 'llvm-ar$exe'),
     };
+  }
+}
+
+/// Duvet: the channel of the rust-toolchain.toml nearest [manifestDir], as rustup looks for it:
+/// in the crate's folder, then in each folder above.
+String? _pinnedToolchain(String manifestDir) {
+  var folder = Directory(manifestDir).absolute;
+  while (true) {
+    final file = File(path.join(folder.path, 'rust-toolchain.toml'));
+    if (file.existsSync()) {
+      final toolchain =
+          TomlDocument.parse(file.readAsStringSync()).toMap()['toolchain'];
+      return toolchain is Map ? toolchain['channel'] as String? : null;
+    }
+    if (folder.parent.path == folder.path) {
+      return null;
+    }
+    folder = folder.parent;
   }
 }
