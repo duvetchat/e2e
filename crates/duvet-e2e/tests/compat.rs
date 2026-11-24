@@ -9,8 +9,8 @@
 //! flight: in A1's, its own message encrypted and not yet `sent`, its own commit waiting for its
 //! `commit_result`, a waiting message, a member noted as without devices, backup days uploaded and
 //! due, an approval under way, and its queues half applied; in B1's, a kept proposal and a share's
-//! key not yet imported. The test checks each survives the open and, where a command completes it,
-//! completes.
+//! key not yet imported. From schema 3 on, both hold a device their group took out. The test checks
+//! each survives the open and, where a command completes it, completes.
 //!
 //! Nothing here depends on the date it runs. The core's clock is set to a minute after the fixtures
 //! were made. OpenMLS checks lifetimes against the system's clock, but only a key package's (as a
@@ -254,6 +254,21 @@ fn opens(name: &str, fixture: &Value) {
         assert_eq!(status["device_id"], json!(device), "{name}");
         assert_eq!(status["has_identity"], true, "{name}");
     }
+    // From schema 3 on, each database holds a device its group took out, for the migrations after
+    // it to carry.
+    let schema: u32 = name.trim_start_matches("db-v").parse().unwrap();
+    if schema >= 3 {
+        for core in [&mut a1, &mut b1] {
+            let removed: i64 = core
+                .transaction(|tx| {
+                    Ok(tx
+                        .conn()
+                        .query_row("SELECT count(*) FROM removed_devices", [], |row| row.get(0))?)
+                })
+                .unwrap();
+            assert!(removed > 0, "{name}: no device taken out");
+        }
+    }
     let conversations = fixture["conversations"].as_array().unwrap();
     for conversation in conversations {
         let id = id(&conversation["id"]);
@@ -449,6 +464,45 @@ fn write_db() {
     server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
     refresh(&mut server, &mut a1, group);
     server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
+
+    // A's second device joins the group, and A takes it off its list: A1 takes it out, so both
+    // databases hold a device the group took out (schema 3).
+    let mut a2 = server.device(a);
+    for device in [&mut a1, &mut b1, &mut b2, &mut a2] {
+        server.introduce(device);
+    }
+    let join = json!({
+        "cmd": "join_external",
+        "conversation_id": group,
+        "generation": 0,
+        "group_info": server.group_info(group),
+    });
+    server.commit(&mut a2, group, join).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
+    let list = ok(
+        &mut a1.core,
+        json!({"cmd": "sign_device_list", "remove": [a2.id]}),
+    );
+    server.take_list(a, &list["device_list"]);
+    for device in [&mut a1, &mut b1, &mut b2] {
+        server.introduce(device);
+    }
+    // A1 looks its own user up again before it takes out a device off their list.
+    let pending = json!({"cmd": "commit_pending", "conversation_id": group});
+    let mut removal = run(&mut a1.core, &pending);
+    for _ in 0..2 {
+        if removal.get("error").is_none() {
+            break;
+        }
+        assert_eq!(removal["error"]["code"], "needs_identities", "{removal}");
+        server.introduce(&mut a1);
+        removal = run(&mut a1.core, &pending);
+    }
+    server.submit(&mut a1, group, &removal["ok"]).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
+    for device in [&mut a1, &mut b1] {
+        assert!(!devices(&device.group(group)).contains(&a2.id));
+    }
 
     // Messages both ways: one edited, one deleted, one with a file, one mentioning A.
     let hello = send(&mut server, &mut a1, dm, json!({"text": "hello"}), &[]);
