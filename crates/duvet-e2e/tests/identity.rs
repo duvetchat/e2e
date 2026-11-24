@@ -947,7 +947,10 @@ fn observe_user_pins_then_detects_change() {
     let new_bob = Contact::new(bob.user);
     let third = new_id();
     let seen = ok(&mut alice.core, new_bob.observed(1, &[third]));
-    assert_eq!(seen, json!({"state": "changed", "verified": false}));
+    assert_eq!(
+        seen,
+        json!({"state": "changed", "verified": false, "was_verified": false})
+    );
     let (identity, list) = alice
         .core
         .transaction(|tx| Ok((tx.identity_of(user)?, tx.device_list_of(user)?)))
@@ -965,11 +968,47 @@ fn observe_user_pins_then_detects_change() {
     let seen = ok(&mut alice.core, new_bob.observed(2, &[third]));
     assert_eq!(seen["state"], "same", "{seen}");
     let seen = ok(&mut alice.core, bob.observed(5, &[first]));
-    assert_eq!(seen, json!({"state": "changed", "verified": false}));
+    assert_eq!(
+        seen,
+        json!({"state": "changed", "verified": false, "was_verified": false})
+    );
     assert_eq!(
         past_identities(&mut alice.core, user),
         vec![new_bob.identity_key().to_vec()]
     );
+}
+
+/// A change says whether the person had verified the identity it replaced, which a strong warning
+/// goes by; the new one starts unverified either way. Nothing else says it.
+#[test]
+fn changed_says_the_contact_was_verified() {
+    let clock = FakeClock::now();
+    let mut alice = Person::new(new_id(), &clock);
+    let bob = Person::new(new_id(), &clock);
+    ok(&mut alice.core, bob.observed());
+    let verified = ok(
+        &mut alice.core,
+        json!({"cmd": "verify_user", "user_id": bob.user}),
+    );
+    assert_eq!(verified, json!({"verified": true}));
+
+    // Bob starts over: the identity Alice verified is replaced.
+    let new_bob = Person::new(bob.user, &clock);
+    let seen = ok(&mut alice.core, new_bob.observed());
+    assert_eq!(
+        seen,
+        json!({"state": "changed", "verified": false, "was_verified": true})
+    );
+
+    // Again, from an identity she never verified.
+    let newer_bob = Person::new(bob.user, &clock);
+    let seen = ok(&mut alice.core, newer_bob.observed());
+    assert_eq!(
+        seen,
+        json!({"state": "changed", "verified": false, "was_verified": false})
+    );
+    let seen = ok(&mut alice.core, newer_bob.observed());
+    assert_eq!(seen, json!({"state": "same", "verified": false}));
 }
 
 /// The identities `user` had before the one pinned now.
@@ -1067,7 +1106,10 @@ fn safety_number_is_symmetric() {
     // Bob starts over with a new identity: a change, and no longer verified.
     let mut new_bob = Person::new(bob.user, &clock);
     let seen = ok(&mut alice.core, new_bob.observed());
-    assert_eq!(seen, json!({"state": "changed", "verified": false}));
+    assert_eq!(
+        seen,
+        json!({"state": "changed", "verified": false, "was_verified": true})
+    );
     ok(&mut new_bob.core, alice.observed());
     let alice_sees = alice.safety_number(bob.user);
     assert_ne!(alice_sees["digits"], bob_sees["digits"]);
