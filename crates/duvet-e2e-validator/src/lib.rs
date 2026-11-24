@@ -567,6 +567,9 @@ fn rule_context(
     }
     Ok(RuleContext {
         identities,
+        // Every leaf goes by the identity the server serves now: earlier ones are a device's
+        // knowledge, for the commits it applies late.
+        earlier_identities: BTreeMap::new(),
         device_lists,
         pending_server_removals: pending,
         enforce_pending: true,

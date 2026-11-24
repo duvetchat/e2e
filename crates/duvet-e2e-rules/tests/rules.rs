@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use duvet_e2e_rules::{
     CommitAad, DeviceCertificate, DeviceList, Entry, Kind, LeaveStatement, MEMBER_LIST_EXTENSION,
-    MemberList, MembershipChange, Removed, RuleContext, RuleViolation, SUITE, check_change,
-    check_joined_state, check_state, extract_change, group_config, group_id, is_record,
-    join_config, keeps_record, leaf_capabilities, leaves,
+    MemberList, MembershipChange, Removed, RuleContext, RuleViolation, SUITE, check_applied_change,
+    check_change, check_joined_state, check_state, extract_change, group_config, group_id,
+    is_record, join_config, keeps_record, leaf_capabilities, leaves,
 };
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
@@ -382,6 +382,16 @@ impl Scene {
         commit: Commit,
         ctx: &RuleContext,
     ) -> Result<(), RuleViolation> {
+        self.change(by, commit)
+            .and_then(|change| check_change(ctx, &change))
+    }
+
+    /// A commit `by` makes, as the rules read it, which is then thrown away.
+    fn change(
+        &mut self,
+        by: (usize, usize),
+        commit: Commit,
+    ) -> Result<MembershipChange, RuleViolation> {
         let removes: Vec<LeafNodeIndex> = commit.removes.iter().map(|&d| self.leaf(d)).collect();
         let Scene { world, groups } = self;
         let device = world.device(by);
@@ -416,11 +426,11 @@ impl Scene {
             .unwrap()
             .stage_commit(&device.provider)
             .unwrap();
-        let verdict = own_change(group, &aad).and_then(|change| check_change(ctx, &change));
+        let change = own_change(group, &aad);
         group
             .clear_pending_commit(device.provider.storage())
             .unwrap();
-        verdict
+        change
     }
 
     /// The server proposes `message`, and every device in the group keeps it for the next commit.
@@ -590,6 +600,74 @@ fn leave_with_old_statement_is_rejected() {
     assert_eq!(
         s.verdict((A, 0), commit, &ctx),
         Err(RuleViolation::LeaveWithoutStatement)
+    );
+}
+
+/// A member applying another device's commit late may hold a newer list of its user than the
+/// server had then, or a new identity of theirs. A leaf, and a leave statement's signer, that only
+/// the latest list refuses pass `check_applied_change`, which the validator's `check_change`
+/// refuses; so does a leaf only an identity the user had before certified, its device off the list.
+/// A listed device's leaf goes by the pinned identity alone.
+#[test]
+fn applied_change_takes_a_certified_leaf_off_its_list() {
+    let mut s = Scene::group();
+    let b = s.id(B);
+    let identity = public(&s.world.users[B].identity);
+    let (b0, b1) = (s.world.device((B, 0)).id, s.world.device((B, 1)).id);
+    let lists = |devices: Vec<Uuid>| DeviceList::new(b, identity, 2, devices);
+
+    // B took (B, 1), which the commit brings, off its list since.
+    let mut ctx = s.world.context();
+    ctx.device_lists.insert(b, lists(vec![b0]));
+    let adding_b1 = Commit {
+        adds: vec![s.world.device((B, 1)).key_package()],
+        ..Commit::default()
+    };
+    let change = s.change((O, 0), adding_b1).unwrap();
+    assert_eq!(
+        check_change(&ctx, &change),
+        Err(RuleViolation::DeviceNotListed)
+    );
+    assert_eq!(check_applied_change(&ctx, &change), Ok(()));
+
+    // B left with (B, 0)'s statement, and took (B, 0) off its list since.
+    let mut later = s.world.context();
+    later.device_lists.insert(b, lists(vec![b1]));
+    let leaving = Commit {
+        removes: vec![(B, 0)],
+        members: Some(removing(&s.list(), b)),
+        statements: vec![s.statement((B, 0), GENERATION, s.epoch())],
+        ..Commit::default()
+    };
+    let left = s.change((A, 0), leaving).unwrap();
+    assert_eq!(
+        check_change(&later, &left),
+        Err(RuleViolation::LeaveWithoutStatement)
+    );
+    assert_eq!(check_applied_change(&later, &left), Ok(()));
+
+    // B started over: another identity, whose list names a new device alone. (B, 1)'s leaf, which
+    // B's identity before certified, passes once the checker knows that identity.
+    let other = signer();
+    let mut started_over = s.world.context();
+    started_over.identities.insert(b, public(&other));
+    started_over
+        .device_lists
+        .insert(b, DeviceList::new(b, public(&other), 1, vec![new_id()]));
+    assert_eq!(
+        check_applied_change(&started_over, &change),
+        Err(RuleViolation::LeafNotSigned)
+    );
+    started_over.earlier_identities.insert(b, vec![identity]);
+    assert_eq!(check_applied_change(&started_over, &change), Ok(()));
+
+    // But not under a name the new list holds: there the pinned identity alone vouches for a key.
+    started_over
+        .device_lists
+        .insert(b, DeviceList::new(b, public(&other), 2, vec![b1]));
+    assert_eq!(
+        check_applied_change(&started_over, &change),
+        Err(RuleViolation::LeafNotSigned)
     );
 }
 

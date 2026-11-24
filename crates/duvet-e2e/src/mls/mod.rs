@@ -18,8 +18,8 @@ use std::fmt::Display;
 use duvet_e2e_rules::{
     CommitAad, Committer, DeviceCertificate, Entry, Kind, LeaveStatement, Leaves,
     MEMBER_LIST_EXTENSION, MemberList, MembershipChange, Place, RuleContext, RuleViolation, SUITE,
-    certified, check_change, extract_change, group_id, leaves, signed_for, statement_user,
-    unlisted_candidates,
+    certified, check_applied_change, check_change, extract_change, group_id, leaves, signed_for,
+    statement_user, unlisted_candidates,
 };
 use openmls::prelude::tls_codec::{DeserializeBytes as _, Serialize as _};
 use openmls::prelude::{
@@ -716,6 +716,22 @@ pub(crate) fn check(
     ctx.expected_initial = extra.expected_initial;
     ctx.external_sender = extra.external_sender;
     Ok(check_change(&ctx, change))
+}
+
+/// Holds another device's commit, as `apply` takes it late, to the rules ([`check_applied_change`]):
+/// a leaf it brings, or a leave statement's signer, may be off its user's latest list, certified by
+/// the identity pinned for its user or, off that list, by one this device knows the user had before.
+pub(crate) fn check_applied(
+    tx: &Tx<'_>,
+    change: &MembershipChange,
+) -> Result<Result<(), RuleViolation>, Error> {
+    let users = needed_users(change);
+    let mut ctx = rule_context(tx, users.iter().copied())?;
+    for user in users {
+        ctx.earlier_identities
+            .insert(user, tx.earlier_identities_of(user)?);
+    }
+    Ok(check_applied_change(&ctx, change))
 }
 
 /// A commit this device makes, before it's built.

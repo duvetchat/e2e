@@ -19,9 +19,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    Extra, GroupRow, certify_by_pinned, certify_leaves_by_pinned, check, commit_asks_first,
-    delete_group, digest, openmls_error, own_merged, rule_context, skip_unchanged_leaves,
-    storage_error, stored_group, stored_state, welcome_asks_first,
+    Extra, GroupRow, certify_by_pinned, certify_leaves_by_pinned, check, check_applied,
+    commit_asks_first, delete_group, digest, openmls_error, own_merged, rule_context,
+    skip_unchanged_leaves, storage_error, stored_group, stored_state, welcome_asks_first,
 };
 use crate::identity::{invalid, not_found};
 use crate::protocol::b64;
@@ -275,9 +275,11 @@ impl Conversation {
 /// commit that breaks them, or that this device can't process, blocks the group, but one refused
 /// for what this device knows of some users (their leaves' certificates, their leave statements)
 /// first asks to observe them anew (`needs_identities`), until the client did and the same
-/// knowledge refuses it again. This device's own commit never blocks it: one the server answered
-/// as refused is merged when the queue brings it back, and dropped once the queue shows it never
-/// entered.
+/// knowledge refuses it again. Then a leaf, or a leave statement's signer, that only its user's
+/// latest list refuses, or that an identity the user had before certified, is let in
+/// (`check_applied_change`): the server took the commit then, and the device may have left the list
+/// since. This device's own commit never blocks it: one the server answered as refused is merged
+/// when the queue brings it back, and dropped once the queue shows it never entered.
 struct Commits;
 
 impl EntryHandler for Commits {
@@ -343,8 +345,15 @@ impl EntryHandler for Commits {
         skip_unchanged_leaves(&mut change);
         certify_by_pinned(tx, &mut change)?;
         if let Err(violation) = check(tx, &change, Extra::default())? {
-            commit_asks_first(tx, &digest(&entry.data), &change, violation)?;
-            return Ok(block(row, violation.name()));
+            let asked = digest(&entry.data);
+            commit_asks_first(tx, &asked, &change, violation)?;
+            // Observed, a leaf or a leave statement's signer that only the user's latest list
+            // refuses is let in: the server may have taken the commit while it was listed, and this
+            // device sends nothing while such a leaf is in (`ready_to_send`).
+            if let Err(violation) = check_applied(tx, &change)? {
+                commit_asks_first(tx, &asked, &change, violation)?;
+                return Ok(block(row, violation.name()));
+            }
         }
         let after =
             MemberList::from_group_context(staged.group_context()).map_err(|_| stored_state())?;

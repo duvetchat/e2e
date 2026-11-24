@@ -81,6 +81,9 @@ impl RuleViolation {
 pub struct RuleContext {
     /// Each user's pinned identity key.
     pub identities: BTreeMap<Uuid, [u8; 32]>,
+    /// The identities each user had before the pinned one, as the checker knows them: in
+    /// [`check_applied_change`] they certify a leaf whose device is off its user's latest list.
+    pub earlier_identities: BTreeMap<Uuid, Vec<[u8; 32]>>,
     /// Each user's latest device list, verified.
     pub device_lists: BTreeMap<Uuid, DeviceList>,
     /// The leaves the server proposed to remove in this epoch.
@@ -108,6 +111,33 @@ pub enum Record {
 /// Whether a commit keeps every rule. Checked in this order, so a commit breaking several gets the
 /// first; from epoch 0, the state it starts from comes first, with [`check_state`].
 pub fn check_change(ctx: &RuleContext, change: &MembershipChange) -> Result<(), RuleViolation> {
+    change_rules(ctx, change, Listing::Required)
+}
+
+/// Whether another device's commit, as a member applies it, keeps every rule: what
+/// [`check_change`] checks, but a leaf the commit brings, and the device that signed one of its
+/// leave statements, needn't be on its user's latest list. Such a leaf passes certified by its
+/// user's pinned identity for its own key, or, its device off that list, by an identity the user
+/// had before (`earlier_identities`); a listed device's leaf goes by the pinned identity alone, as
+/// an earlier one, which a lost device may hold, could vouch for its own key under a listed name.
+///
+/// The server took the commit against the lists it had then, and the validator holds every leaf to
+/// them ([`check_change`]); a member applying it later may hold a newer list, from which the device
+/// was taken since, or a new identity of its user. Refusing it then would block the group. The leaf
+/// is on its way out: no member that holds the newer list sends while it's in, and its next commit
+/// takes it out (the core's `ready_to_send` and `commit_pending`).
+pub fn check_applied_change(
+    ctx: &RuleContext,
+    change: &MembershipChange,
+) -> Result<(), RuleViolation> {
+    change_rules(ctx, change, Listing::NotRequired)
+}
+
+fn change_rules(
+    ctx: &RuleContext,
+    change: &MembershipChange,
+    listing: Listing,
+) -> Result<(), RuleViolation> {
     use RuleViolation::*;
     let (before, after) = (&change.before, &change.after);
 
@@ -136,10 +166,10 @@ pub fn check_change(ctx: &RuleContext, change: &MembershipChange) -> Result<(), 
     let added = change
         .added
         .iter()
-        .map(|leaf| certified(ctx, &leaf.credential, &leaf.signature_key))
+        .map(|leaf| brought(ctx, &leaf.credential, &leaf.signature_key, listing))
         .collect::<Result<Vec<_>, _>>()?;
     for (index, leaf) in &change.updated {
-        let certificate = certified(ctx, &leaf.credential, &leaf.signature_key)?;
+        let certificate = brought(ctx, &leaf.credential, &leaf.signature_key, listing)?;
         let old = change.leaves.get(index).ok_or(Malformed)?;
         if (certificate.user, certificate.device) != (old.user, old.device) {
             return Err(LeafNotSigned);
@@ -217,7 +247,7 @@ pub fn check_change(ctx: &RuleContext, change: &MembershipChange) -> Result<(), 
     }
 
     // A user goes with their own statement, or because the owner removes them.
-    let left = left_users(ctx, change)?;
+    let left = left_users(ctx, change, listing)?;
     for user in &removed_users {
         let removed_by_owner = before.owner == Some(committer) && before.owner != Some(*user);
         if !left.contains(user) && !removed_by_owner {
@@ -482,6 +512,47 @@ pub fn certified(
     Ok(certificate)
 }
 
+/// A leaf a commit brings, verified as `listing` holds it: [`certified`], or [`vouched_for`] when its
+/// device needn't be listed.
+fn brought(
+    ctx: &RuleContext,
+    credential: &[u8],
+    signature_key: &[u8],
+    listing: Listing,
+) -> Result<DeviceCertificate, RuleViolation> {
+    match listing {
+        Listing::Required => certified(ctx, credential, signature_key),
+        Listing::NotRequired => vouched_for(ctx, credential, signature_key),
+    }
+}
+
+/// A leaf's certificate, verified for the leaf's own signature key: signed by its user's pinned
+/// identity, or, for a device off its user's latest list, by an identity the user had before.
+fn vouched_for(
+    ctx: &RuleContext,
+    credential: &[u8],
+    signature_key: &[u8],
+) -> Result<DeviceCertificate, RuleViolation> {
+    let pinned = signed_for(ctx, credential, signature_key);
+    let Ok(claimed) = DeviceCertificate::read_unverified(credential) else {
+        return pinned;
+    };
+    let listed = ctx
+        .device_lists
+        .get(&claimed.user)
+        .is_some_and(|list| list.contains(claimed.device));
+    if pinned.is_ok() || listed {
+        return pinned;
+    }
+    ctx.earlier_identities
+        .get(&claimed.user)
+        .into_iter()
+        .flatten()
+        .filter_map(|identity| DeviceCertificate::verify(credential, identity).ok())
+        .find(|certificate| certificate.signature_key == signature_key)
+        .ok_or(RuleViolation::LeafNotSigned)
+}
+
 /// A leaf's certificate, verified: signed by its user's pinned identity, for the leaf's own
 /// signature key. What [`check_joined_state`] holds every leaf to.
 pub fn signed_for(
@@ -537,21 +608,21 @@ fn check_list(change: &MembershipChange) -> Result<(), RuleViolation> {
 fn left_users(
     ctx: &RuleContext,
     change: &MembershipChange,
+    listing: Listing,
 ) -> Result<BTreeSet<Uuid>, RuleViolation> {
-    change
-        .statements
-        .iter()
-        .map(|signed| leaving_user(ctx, change, signed).ok_or(RuleViolation::LeaveWithoutStatement))
-        .collect()
-}
-
-fn leaving_user(ctx: &RuleContext, change: &MembershipChange, signed: &[u8]) -> Option<Uuid> {
     let group = Place {
         conversation: change.conversation,
         generation: change.generation,
         epoch: change.epoch,
     };
-    statement_user(ctx, &change.before, &change.leaves, group, signed)
+    change
+        .statements
+        .iter()
+        .map(|signed| {
+            statement_holds(ctx, &change.before, &change.leaves, group, signed, listing)
+                .ok_or(RuleViolation::LeaveWithoutStatement)
+        })
+        .collect()
 }
 
 /// A group at one of its epochs: the conversation, the generation and the epoch.
@@ -574,17 +645,35 @@ pub fn statement_user(
     place: Place,
     signed: &[u8],
 ) -> Option<Uuid> {
+    statement_holds(ctx, list, leaves, place, signed, Listing::Required)
+}
+
+/// [`statement_user`], its signer's device held to its user's latest list as `listing` says: when
+/// it needn't be listed, its leaf's certificate holds as [`check_applied_change`] holds a new leaf.
+fn statement_holds(
+    ctx: &RuleContext,
+    list: &MemberList,
+    leaves: &Leaves,
+    place: Place,
+    signed: &[u8],
+    listing: Listing,
+) -> Option<Uuid> {
     let claimed = LeaveStatement::read_unverified(signed).ok()?;
     let leaf = leaves
         .values()
         .find(|leaf| leaf.user == claimed.user && leaf.device == claimed.device)?;
-    let certificate =
-        DeviceCertificate::verify(&leaf.certificate, ctx.identities.get(&claimed.user)?).ok()?;
+    let certificate = match listing {
+        Listing::Required => {
+            DeviceCertificate::verify(&leaf.certificate, ctx.identities.get(&claimed.user)?).ok()?
+        }
+        Listing::NotRequired => vouched_for(ctx, &leaf.certificate, &leaf.signature_key).ok()?,
+    };
     let statement = LeaveStatement::verify(signed, &certificate).ok()?;
-    let listed = ctx
-        .device_lists
-        .get(&statement.user)
-        .is_some_and(|list| list.contains(statement.device));
+    let listed = listing == Listing::NotRequired
+        || ctx
+            .device_lists
+            .get(&statement.user)
+            .is_some_and(|list| list.contains(statement.device));
     let entry = list.entry(statement.user)?;
     let made = (statement.generation, statement.epoch);
     let in_time =

@@ -780,9 +780,14 @@ fn server_replays_old_commit() {
 }
 
 /// The server serves a user's list from before a device left it. A device that knows the newer
-/// list refuses the older one (`older_list`), its own user's included, and keeps the newer one;
-/// with it, it refuses a commit that brings the left device back, its own external commit included
-/// (`device_not_listed`), whatever list the server serves then.
+/// list refuses the older one (`older_list`), its own user's included, and keeps the newer one.
+/// When the server lets the left device back in past its validator, a member takes the commit (its
+/// user's identity certified that leaf, and a member applying a commit late can't tell it from one
+/// the server took while the device was listed), but sends nothing while the leaf is in, and its
+/// next commit takes it out, whatever list the server serves then: the left device opens nothing
+/// the member sends after it.
+///
+/// The cost: until that commit, what the left device sends shows as its user's.
 ///
 /// `recover`'s limit: a recovering device knows no list, takes the one the server serves, and signs
 /// it with itself into the next one. Devices that know a newer list refuse what it signs, a version
@@ -845,7 +850,9 @@ fn server_serves_old_device_list() {
     }
 
     // A2, which still holds the older list, joins by external commit; the server takes it past its
-    // validator. B1 asks about A first, is served the older list again, and refuses the commit.
+    // validator. B1 asks about A first, is served the older list again, and takes the commit: A's
+    // identity certified A2's leaf. B1 sends nothing while it's in: it asks about A again, is served
+    // the older list again, and its next commit takes A2 out. A2 opens nothing B1 sends after it.
     let joined = ok(&mut a2.core, joining(&server, conversation));
     let commit = bytes(&joined["commit"]);
     assert_eq!(
@@ -859,16 +866,40 @@ fn server_serves_old_device_list() {
     );
     let seq = server.force(conversation, "commit", commit);
     let forced = entry(&server, conversation, seq);
-    let (observed, refused) =
+    let (observed, taken) =
         apply_observing(&mut b1, conversation, std::slice::from_ref(&forced), |_| {
             old.clone()
         });
     assert_eq!(observed, [json!("rejected")]);
+    assert_eq!(results(&[taken]), [json!([seq, "commit", "applied", null])]);
+    let asked = ready(&mut b1, conversation).unwrap_err();
     assert_eq!(
-        results(&[refused]),
-        [json!([seq, "commit", "rejected", "device_not_listed"])]
+        (&asked["code"], &asked["users"]),
+        (&json!("needs_identities"), &json!([a.to_string()]))
     );
+    let seen = ok(&mut b1.core, old.clone());
+    assert_eq!(
+        (&seen["state"], &seen["reason"]),
+        (&json!("rejected"), &json!("older_list"))
+    );
+    assert_eq!(
+        ready(&mut b1, conversation).unwrap_err()["code"],
+        "pending_proposals"
+    );
+    let removal = ok(&mut b1.core, command("commit_pending", conversation));
+    take_unchecked(&mut server, &mut b1, conversation, &removal);
+    assert_eq!(ready(&mut b1, conversation), Ok(()));
     assert!(!device_set(&mut b1, conversation).contains(&a2.id));
+    ok(
+        &mut a2.core,
+        json!({"cmd": "commit_result", "conversation_id": conversation, "accepted": true, "seq": seq}),
+    );
+    let (said, _) = say(&mut server, &mut b1, conversation, "sin A2");
+    run(
+        &mut a2.core,
+        &apply(conversation, &server.entries(conversation)),
+    );
+    assert_eq!(message(&mut a2, conversation, said), None);
 
     // A new device of A's recovers with A's key against the older list: it signs that list, with
     // itself and A2, into the next version. A1 and B1, which hold that version with A1 alone,
