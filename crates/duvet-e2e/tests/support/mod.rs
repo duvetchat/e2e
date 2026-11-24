@@ -851,10 +851,12 @@ impl FakeServer {
             .push(kind, data, None)
     }
 
-    /// Hands `device` the entries of each of its conversations it hasn't had yet, through `apply`:
-    /// the replies. It adds the device's own record of a conversation from before the cutover to
-    /// that conversation's welcomes, as their `expected`, which the core holds each one to.
+    /// Hands `device` the entries of each of its conversations it hasn't had yet, through `apply`,
+    /// with the API's key as a client gives it: the replies. It adds the device's own record of a
+    /// conversation from before the cutover to that conversation's welcomes, as their `expected`,
+    /// which the core holds each one to.
     pub fn deliver(&mut self, device: &mut TestDevice) -> Vec<Value> {
+        let api = self.external_sender();
         let mut replies = Vec::new();
         for (conversation, chat) in &mut self.chats {
             let Some(&next) = chat.cursors.get(&device.id) else {
@@ -878,7 +880,12 @@ impl FakeServer {
             }
             let reply = ok(
                 &mut device.core,
-                json!({"cmd": "apply", "conversation_id": conversation, "entries": entries}),
+                json!({
+                    "cmd": "apply",
+                    "conversation_id": conversation,
+                    "entries": entries,
+                    "external_sender": api,
+                }),
             );
             chat.cursors.insert(device.id, chat.queue.len() as u64 + 1);
             replies.push(reply);

@@ -1417,7 +1417,7 @@ fn group_under_another_key() -> (FakeServer, Uuid, [TestDevice; 3], Value) {
 
 #[test]
 fn a_welcome_with_another_external_sender_is_rejected() {
-    let (server, conversation, [_, mut b1, mut b2], _) = group_under_another_key();
+    let (mut server, conversation, [mut a1, mut b1, mut b2], _) = group_under_another_key();
     let welcome = entry(&server, conversation, 2);
 
     // A key that isn't one is refused, and nothing of the call stays.
@@ -1444,6 +1444,15 @@ fn a_welcome_with_another_external_sender_is_rejected() {
     );
     assert_eq!(b1.no_group(conversation)["what"], "group");
 
+    // A group made under the API's key: with the key given, B1 takes its welcome.
+    let honest = new_id();
+    server.conversation(honest, Kind::Dm, None, &[a1.user, b1.user], false);
+    start(&mut server, &mut a1, honest);
+    let mut applied = apply(honest, &[entry(&server, honest, 2)]);
+    applied["external_sender"] = json!(server.external_sender());
+    let taken = ok(&mut b1.core, applied);
+    assert_eq!(results(&[taken]), [json!([2, "welcome", "applied", null])]);
+
     // Without the key, as before: B2 joins.
     let taken = ok(&mut b2.core, apply(conversation, &[welcome]));
     assert_eq!(results(&[taken]), [json!([2, "welcome", "applied", null])]);
@@ -1451,7 +1460,7 @@ fn a_welcome_with_another_external_sender_is_rejected() {
 
 #[test]
 fn join_external_refuses_another_external_sender() {
-    let (server, conversation, [_, mut b1, _], created) = group_under_another_key();
+    let (mut server, conversation, [mut a1, mut b1, _], created) = group_under_another_key();
     let mut join = json!({
         "cmd": "join_external",
         "conversation_id": conversation,
@@ -1467,6 +1476,15 @@ fn join_external_refuses_another_external_sender() {
         (&json!("rule_violation"), &json!("external_sender_mismatch"))
     );
     assert_eq!(b1.no_group(conversation)["what"], "group");
+
+    // A group made under the API's key: with the key given, B1 joins it, and the server takes
+    // the commit.
+    let honest = new_id();
+    server.conversation(honest, Kind::Dm, None, &[a1.user, b1.user], false);
+    start(&mut server, &mut a1, honest);
+    let mut keyed = joining(&server, honest);
+    keyed["external_sender"] = json!(server.external_sender());
+    server.commit(&mut b1, honest, keyed).unwrap();
 
     // Without the key, as before: B1 joins.
     join.as_object_mut().unwrap().remove("external_sender");

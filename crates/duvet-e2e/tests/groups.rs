@@ -298,10 +298,40 @@ fn apply_says_when_a_commit_is_due() {
     assert_eq!(server.deliver(&mut a1)[0]["commit_due"], true);
     assert_eq!(server.deliver(&mut b1)[0]["commit_due"], true);
     assert_eq!(server.deliver(&mut b2)[0]["commit_due"], false);
+    assert_eq!(server.deliver(&mut b3)[0]["commit_due"], true);
+
+    // A1 commits it: until the server's answer, `apply` itself refuses.
     let pending = command("commit_pending", conversation);
-    server
-        .commit(&mut a1, conversation, pending.clone())
-        .unwrap();
+    let made = ok(&mut a1.core, pending.clone());
+    let waiting = error(&mut a1.core, apply(conversation, &[]));
+    assert_eq!(waiting["code"], "pending_commit");
+    server.submit(&mut a1, conversation, &made).unwrap();
+
+    // B1's commit of the same removal comes too late, and the server refuses it. While the queue
+    // hasn't settled it, nothing is due on B1, though the removal waits there still.
+    let late = ok(&mut b1.core, pending.clone());
+    assert_eq!(
+        server.submit(&mut b1, conversation, &late),
+        Err(Refusal::Conflict)
+    );
+    assert_eq!(commit_due(&mut b1, conversation), false);
+
+    // B3 is handed A1's commit with a byte changed, which blocks its group: nothing is due there
+    // either, though the removal waits there too.
+    let mut changed = server.entries(conversation).last().unwrap().clone();
+    let mut data = bytes(&changed["data"]);
+    *data.last_mut().unwrap() ^= 1;
+    changed["data"] = json!(b64(&data));
+    let seq = changed["seq"].clone();
+    let blocked = ok(&mut b3.core, apply(conversation, &[changed]));
+    assert_eq!(
+        results(std::slice::from_ref(&blocked)),
+        [json!([seq, "commit", "rejected", "invalid_commit"])]
+    );
+    assert_eq!(blocked["commit_due"], false);
+    assert_eq!(b3.group(conversation)["blocked"], true);
+
+    // The commit in, nothing is due on A1 or B1.
     assert_eq!(server.deliver(&mut a1)[0]["commit_due"], false);
     assert_eq!(server.deliver(&mut b1)[0]["commit_due"], false);
 
