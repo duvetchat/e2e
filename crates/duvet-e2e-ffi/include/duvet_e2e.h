@@ -53,7 +53,8 @@ void duvet_e2e_close(uint64_t handle);
  * reply: `locked` while a handle has the database open, and nothing is deleted then.
  *
  * `config_json` is what `duvet_e2e_open` takes; `db_key`'s key is the caller's to forget.
- * `<path>.key.lock` stays, empty: another open may be waiting for it.
+ * `<path>.key.lock` and `<path>.lock` stay, empty: an open may be waiting for the one, or about to
+ * lock the other.
  *
  * # Safety
  *

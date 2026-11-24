@@ -163,12 +163,15 @@ fn lock_key(path: &Path) -> Result<File, Error> {
 }
 
 /// Deletes the database at `path` and what's beside it: SQLite's journals, `<path>.key` and the
-/// file it's written to first, then its key in `entry`, then `<path>.lock`.
+/// file it's written to first, then its key in `entry`.
 ///
 /// It takes `<path>.key.lock`, as an open does, then the core's `<path>.lock`: `locked` while a
-/// core has the database open, and nothing is deleted then. `<path>.key.lock` stays, empty: an open
-/// may be waiting for it, and were it deleted, that open would go on holding the deleted file while
-/// the next open locked a new one, and the two would each choose a key.
+/// core has the database open, and nothing is deleted then. Both locks stay, empty. An open may be
+/// waiting for `<path>.key.lock`, and were it deleted, that open would go on holding the deleted
+/// file while the next open locked a new one, and the two would each choose a key. And an open
+/// that doesn't take that one (a `db_key` one, as every open on Android) could open `<path>.lock`
+/// before its deletion and lock it after, while the next open locked a new one: two cores on one
+/// database.
 fn destroy_with(path: &Path, entry: Option<Result<impl KeyStore, NoKeyring>>) -> Result<(), Error> {
     let entry = match entry {
         Some(Ok(entry)) => Some(entry),
@@ -188,8 +191,7 @@ fn destroy_with(path: &Path, entry: Option<Result<impl KeyStore, NoKeyring>>) ->
     for suffix in ["", "-journal", "-wal", "-shm", ".key", ".key.tmp"] {
         remove(&beside(path, suffix), "the database's files")?;
     }
-    delete_key(entry)?;
-    remove(&beside(path, ".lock"), "the database's lock")
+    delete_key(entry)
 }
 
 /// Deletes the key `entry` keeps, when there's an entry. One already empty is deleted already.
@@ -756,6 +758,18 @@ mod tests {
         names
     }
 
+    /// What a destroy leaves: the two locks, empty, which an open may be waiting for or racing.
+    fn only_the_locks_are_left(dir: &Path) {
+        assert_eq!(files_in(dir), ["core.db.key.lock", "core.db.lock"]);
+        for lock in ["core.db.key.lock", "core.db.lock"] {
+            assert_eq!(
+                std::fs::metadata(dir.join(lock)).unwrap().len(),
+                0,
+                "{lock}"
+            );
+        }
+    }
+
     #[test]
     fn destroy_removes_the_database_and_its_key() {
         // A database whose key the keyring keeps, beside the journal a crash left.
@@ -766,8 +780,7 @@ mod tests {
         std::fs::write(dir.path().join("core.db-journal"), b"a crash's journal").unwrap();
 
         destroy_with(&path, Some(Ok(entry_in(&store)))).unwrap();
-        // Only the key's lock stays, empty: another open may be waiting for it.
-        assert_eq!(files_in(dir.path()), ["core.db.key.lock"]);
+        only_the_locks_are_left(dir.path());
         assert!(no_entry(&store));
         // A second time, there's nothing left to delete.
         destroy_with(&path, Some(Ok(entry_in(&store)))).unwrap();
@@ -777,7 +790,7 @@ mod tests {
         let path = dir.path().join("core.db");
         Core::open(OpenConfig::new(&path, [1; 32])).unwrap().close();
         destroy_with(&path, None::<Result<Entry, NoKeyring>>).unwrap();
-        assert_eq!(files_in(dir.path()), ["core.db.key.lock"]);
+        only_the_locks_are_left(dir.path());
 
         // A database whose key is in `<path>.key`, where there's no Secret Service.
         #[cfg(secret_service)]
@@ -788,7 +801,7 @@ mod tests {
             open_with(&path, none()).unwrap().close();
             assert!(dir.path().join("core.db.key").exists());
             destroy_with(&path, Some(none())).unwrap();
-            assert_eq!(files_in(dir.path()), ["core.db.key.lock"]);
+            only_the_locks_are_left(dir.path());
         }
     }
 

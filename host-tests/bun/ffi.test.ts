@@ -132,7 +132,9 @@ describe("the C ABI", () => {
 
     const key = keyFile ? readFileSync(`${path}.key`) : null;
     expect(destroy(config)).toEqual({ ok: {} });
-    for (const file of [path, `${path}.lock`, `${path}.key`]) expect(existsSync(file)).toBe(false);
+    for (const file of [path, `${path}.key`]) expect(existsSync(file)).toBe(false);
+    // The locks stay, empty: an open may be waiting for one or racing for the other.
+    for (const lock of [`${path}.lock`, `${path}.key.lock`]) expect(statSync(lock).size).toBe(0);
 
     // What opens there now is a new database, with a key of its own.
     const fresh = open(config).ok.handle;
