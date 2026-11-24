@@ -121,7 +121,10 @@ pub extern "C" fn duvet_e2e_close(handle: u64) {
 pub unsafe extern "C" fn duvet_e2e_free(text: *mut c_char) {
     if !text.is_null() {
         // Safety: as the caller promised, it came from `CString::into_raw`.
-        drop(unsafe { CString::from_raw(text) });
+        let text = unsafe { CString::from_raw(text) };
+        // A reply may hold a secret (a recovery key, a key in an approval or a transfer): its bytes
+        // are wiped before the block goes back.
+        text.into_bytes_with_nul().zeroize();
     }
 }
 

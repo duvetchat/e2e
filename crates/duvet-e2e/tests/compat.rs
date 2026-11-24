@@ -9,8 +9,9 @@
 //! flight: in A1's, its own message encrypted and not yet `sent`, its own commit waiting for its
 //! `commit_result`, a waiting message, a member noted as without devices, backup days uploaded and
 //! due, an approval under way, and its queues half applied; in B1's, a kept proposal and a share's
-//! key not yet imported. The test checks each survives the open and, where a command completes it,
-//! completes.
+//! key not yet imported. From schema 3 on, both hold a device their group took out, and an identity
+//! it no longer takes there. The test checks each survives the open and, where a command completes
+//! it, completes.
 //!
 //! Nothing here depends on the date it runs. The core's clock is set to a minute after the fixtures
 //! were made. OpenMLS checks lifetimes against the system's clock, but only a key package's (as a
@@ -254,6 +255,25 @@ fn opens(name: &str, fixture: &Value) {
         assert_eq!(status["device_id"], json!(device), "{name}");
         assert_eq!(status["has_identity"], true, "{name}");
     }
+    // From schema 3 on, each database holds a device its group took out, and an identity it no
+    // longer takes there, for the migrations after it to carry.
+    let schema: u32 = name.trim_start_matches("db-v").parse().unwrap();
+    if schema >= 3 {
+        for core in [&mut a1, &mut b1] {
+            for table in ["removed_devices", "removed_identities"] {
+                let rows: i64 = core
+                    .transaction(|tx| {
+                        Ok(tx.conn().query_row(
+                            &format!("SELECT count(*) FROM {table}"),
+                            [],
+                            |row| row.get(0),
+                        )?)
+                    })
+                    .unwrap();
+                assert!(rows > 0, "{name}: no row in {table}");
+            }
+        }
+    }
     let conversations = fixture["conversations"].as_array().unwrap();
     for conversation in conversations {
         let id = id(&conversation["id"]);
@@ -433,22 +453,72 @@ fn write_db() {
     refresh(&mut server, &mut a1, dm);
     server.deliver_all(&mut [&mut a1, &mut b1]);
 
-    // B's second device, in the group alone, which B takes off its list later.
+    // B's second device, in the group alone, which B takes off its list later; and E, a third
+    // member of the group, which loses its second device there.
     let mut b2 = server.device(b);
     server.publish(&mut b2);
+    let e = new_id();
+    let (mut e1, mut e2) = (server.device(e), server.device(e));
+    server.publish(&mut e1);
+    server.publish(&mut e2);
+    for device in [&mut a1, &mut b1, &mut b2, &mut e1, &mut e2] {
+        server.introduce(device);
+    }
+    server.conversation(group, Kind::Group, Some(a), &[a, b, e], false);
+    let create = server.create_group(group);
+    server.commit(&mut a1, group, create).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2, &mut e1]);
+    refresh(&mut server, &mut b2, group);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2, &mut e1]);
+    refresh(&mut server, &mut b1, group);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2, &mut e1]);
+    refresh(&mut server, &mut a1, group);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2, &mut e1]);
+
+    // A's second device joins the group, and A takes it off its list: A1 takes it out, so both
+    // databases hold a device the group took out (schema 3).
+    let mut a2 = server.device(a);
+    for device in [&mut a1, &mut b1, &mut b2, &mut e1, &mut a2] {
+        server.introduce(device);
+    }
+    let join = json!({
+        "cmd": "join_external",
+        "conversation_id": group,
+        "generation": 0,
+        "group_info": server.group_info(group),
+    });
+    server.commit(&mut a2, group, join).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2, &mut e1]);
+    let list = ok(
+        &mut a1.core,
+        json!({"cmd": "sign_device_list", "remove": [a2.id]}),
+    );
+    server.take_list(a, &list["device_list"]);
+    for device in [&mut a1, &mut b1, &mut b2, &mut e1] {
+        server.introduce(device);
+    }
+    take_out_pending(&mut server, &mut a1, group);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2, &mut e1]);
+    for device in [&mut a1, &mut b1] {
+        assert!(!devices(&device.group(group)).contains(&a2.id));
+    }
+
+    // E changes its keys without E2, which it lost, and E1 takes E2 out once A1 and B1 see E's new
+    // identity: both note the identity that certified E2's leaf, which they take there no more.
+    let rotated = ok(
+        &mut e1.core,
+        json!({"cmd": "rotate_keys", "remove": [e2.id]}),
+    );
+    server.take_identity(e, &rotated);
+    ok(&mut e1.core, json!({"cmd": "identity_uploaded"}));
     for device in [&mut a1, &mut b1, &mut b2] {
         server.introduce(device);
     }
-    server.conversation(group, Kind::Group, Some(a), &[a, b], false);
-    let create = server.create_group(group);
-    server.commit(&mut a1, group, create).unwrap();
+    take_out_pending(&mut server, &mut e1, group);
     server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
-    refresh(&mut server, &mut b2, group);
-    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
-    refresh(&mut server, &mut b1, group);
-    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
-    refresh(&mut server, &mut a1, group);
-    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
+    for device in [&mut a1, &mut b1] {
+        assert!(!devices(&device.group(group)).contains(&e2.id));
+    }
 
     // Messages both ways: one edited, one deleted, one with a file, one mentioning A.
     let hello = send(&mut server, &mut a1, dm, json!({"text": "hello"}), &[]);
@@ -659,6 +729,22 @@ fn write_db() {
     );
     let json = serde_json::to_string_pretty(&fixture).unwrap() + "\n";
     write(format!("db-v{version}.json"), json.as_bytes());
+}
+
+/// `device` takes out what's pending in `conversation` (`commit_pending`), looking its users up
+/// again when it asks to first, and the server takes the commit.
+fn take_out_pending(server: &mut FakeServer, device: &mut TestDevice, conversation: Uuid) {
+    let pending = json!({"cmd": "commit_pending", "conversation_id": conversation});
+    let mut removal = run(&mut device.core, &pending);
+    for _ in 0..2 {
+        if removal.get("error").is_none() {
+            break;
+        }
+        assert_eq!(removal["error"]["code"], "needs_identities", "{removal}");
+        server.introduce(device);
+        removal = run(&mut device.core, &pending);
+    }
+    server.submit(device, conversation, &removal["ok"]).unwrap();
 }
 
 fn refresh(server: &mut FakeServer, device: &mut TestDevice, conversation: Uuid) {

@@ -18,8 +18,8 @@ use std::fmt::Display;
 use duvet_e2e_rules::{
     CommitAad, Committer, DeviceCertificate, Entry, Kind, LeaveStatement, Leaves,
     MEMBER_LIST_EXTENSION, MemberList, MembershipChange, Place, RuleContext, RuleViolation, SUITE,
-    certified, check_change, extract_change, group_id, leaves, signed_for, statement_user,
-    unlisted_candidates,
+    certified, check_applied_change, check_change, extract_change, group_id, leaves, signed_for,
+    statement_user, unlisted_candidates,
 };
 use openmls::prelude::tls_codec::{DeserializeBytes as _, Serialize as _};
 use openmls::prelude::{
@@ -363,6 +363,132 @@ pub(crate) fn own_merged(tx: &Tx<'_>, row: &mut GroupRow, group: &MlsGroup) -> R
     row.statements.clear();
     row.leaf_updated_at = renewed_at(tx, group)?;
     Ok(())
+}
+
+/// Merges this device's waiting commit in `group`: what it took out is noted ([`note_removed`]),
+/// and the row follows ([`own_merged`]).
+pub(crate) fn merge_own(
+    tx: &Tx<'_>,
+    row: &mut GroupRow,
+    group: &mut MlsGroup,
+) -> Result<(), Error> {
+    let before = leaves(group.members()).map_err(|_| stored_state())?;
+    group
+        .merge_pending_commit(tx.provider())
+        .map_err(openmls_error)?;
+    note_removed(tx, row.conversation, &before, group)?;
+    own_merged(tx, row, group)
+}
+
+/// Notes the devices of `before`'s leaves that `group` no longer holds: a commit this device
+/// applied or made took them out of `conversation`'s group, or a reset left them out of its next
+/// generation. They stay out ([`brings_back_removed`]). So does the identity that certified such a
+/// leaf, when it isn't the one this device pins for its user now: one the user had before, which
+/// certifies nothing more in the conversation ([`check_applied`]). A device whose user the same
+/// commit takes off the member list left with them, not as a device, and isn't noted.
+pub(crate) fn note_removed(
+    tx: &Tx<'_>,
+    conversation: Uuid,
+    before: &Leaves,
+    group: &MlsGroup,
+) -> Result<(), Error> {
+    // By user and ID: another user's device with that ID isn't this one.
+    let staying: BTreeSet<(Uuid, Uuid)> = leaves(group.members())
+        .map_err(|_| stored_state())?
+        .values()
+        .map(|leaf| (leaf.user, leaf.device))
+        .collect();
+    let listed = MemberList::from_group_context(group.public_group().group_context())
+        .map_err(|_| stored_state())?;
+    for leaf in before.values() {
+        if staying.contains(&(leaf.user, leaf.device)) || !listed.contains(leaf.user) {
+            continue;
+        }
+        tx.conn().execute(
+            "INSERT OR IGNORE INTO removed_devices (conversation_id, user_id, device_id) \
+             VALUES (?1, ?2, ?3)",
+            params![
+                conversation.as_bytes().as_slice(),
+                leaf.user.as_bytes().as_slice(),
+                leaf.device.as_bytes().as_slice()
+            ],
+        )?;
+        let pinned = tx
+            .identity_of(leaf.user)?
+            .is_some_and(|key| DeviceCertificate::verify(&leaf.certificate, &key).is_ok());
+        if pinned {
+            continue;
+        }
+        let earlier = tx
+            .earlier_identities_of(leaf.user)?
+            .into_iter()
+            .find(|key| DeviceCertificate::verify(&leaf.certificate, key).is_ok());
+        if let Some(key) = earlier {
+            tx.conn().execute(
+                "INSERT OR IGNORE INTO removed_identities (conversation_id, user_id, identity_key) \
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    conversation.as_bytes().as_slice(),
+                    leaf.user.as_bytes().as_slice(),
+                    key.as_slice()
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The identities `user` had before that certified a leaf the group of `conversation` took out
+/// ([`note_removed`]): they certify nothing more there.
+fn removed_identities(tx: &Tx<'_>, conversation: Uuid, user: Uuid) -> Result<Vec<Vec<u8>>, Error> {
+    let mut statement = tx.conn().prepare(
+        "SELECT identity_key FROM removed_identities WHERE conversation_id = ?1 AND user_id = ?2",
+    )?;
+    let keys = statement.query_map(
+        params![
+            conversation.as_bytes().as_slice(),
+            user.as_bytes().as_slice()
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(keys.collect::<Result<_, _>>()?)
+}
+
+/// Whether another device's commit brings back a device this device saw leave the conversation's
+/// group ([`note_removed`]), its device off its user's latest list as this device holds it. Such a
+/// commit is refused as [`check`] refuses it, whatever identity certified the leaf: a device the
+/// group took out (lost, then left out of a rotation or a list) doesn't come back by the server's
+/// leave. The record knows that device alone, by its user and its ID: a new device ID its holder
+/// makes under the identity from before a rotation is refused by what [`check_applied`] hands the
+/// rules. The cost: a device added again after its removal, and taken off its list since, blocks a
+/// member that applies its return late, as any such leaf did before `check_applied`.
+pub(crate) fn brings_back_removed(tx: &Tx<'_>, change: &MembershipChange) -> Result<bool, Error> {
+    let brought = change
+        .added
+        .iter()
+        .chain(change.updated.iter().map(|(_, leaf)| leaf));
+    for leaf in brought {
+        let Ok(claimed) = DeviceCertificate::read_unverified(&leaf.credential) else {
+            continue;
+        };
+        let listed = tx
+            .device_list_of(claimed.user)?
+            .is_some_and(|list| list.contains(claimed.device));
+        let removed: bool = tx.conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM removed_devices WHERE conversation_id = ?1 \
+             AND user_id = ?2 AND device_id = ?3)",
+            params![
+                change.conversation.as_bytes().as_slice(),
+                claimed.user.as_bytes().as_slice(),
+                claimed.device.as_bytes().as_slice()
+            ],
+            |row| row.get(0),
+        )?;
+        if removed && !listed {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The group stored for `conversation` at `generation`, while this device is in it.
@@ -716,6 +842,49 @@ pub(crate) fn check(
     ctx.expected_initial = extra.expected_initial;
     ctx.external_sender = extra.external_sender;
     Ok(check_change(&ctx, change))
+}
+
+/// Holds another device's commit, as `apply` takes it late, to the rules ([`check_applied_change`]):
+/// a leaf it brings, or a leave statement's signer, may be off its user's latest list, certified by
+/// the identity pinned for its user or, off that list, by one this device knows the user had before
+/// while the group still lives in it: that identity certifies a leaf of theirs there, none of theirs
+/// carries the pinned identity's certificate, and no removal this device applied or made noted it
+/// ([`note_removed`]: a leaf it certified, taken out once this device pinned another). `apply`
+/// asks it only of a commit that brings back no device the group took out
+/// ([`brings_back_removed`]).
+pub(crate) fn check_applied(
+    tx: &Tx<'_>,
+    change: &MembershipChange,
+) -> Result<Result<(), RuleViolation>, Error> {
+    let users = needed_users(change);
+    let mut ctx = rule_context(tx, users.iter().copied())?;
+    for user in users {
+        // An identity the user had before certifies a leaf only while the group still lives in
+        // it: it certifies a leaf of theirs there, and none carries the pinned one's certificate.
+        let theirs: Vec<_> = change
+            .leaves
+            .values()
+            .filter(|leaf| leaf.user == user)
+            .collect();
+        let certifies = |identity: &[u8; 32]| {
+            theirs
+                .iter()
+                .any(|leaf| DeviceCertificate::verify(&leaf.certificate, identity).is_ok())
+        };
+        if !ctx.identities.get(&user).is_some_and(certifies) {
+            // Nor one that certified a leaf the group took out: the group moved past it.
+            let removed = removed_identities(tx, change.conversation, user)?;
+            let shown = tx
+                .earlier_identities_of(user)?
+                .into_iter()
+                .filter(|identity| {
+                    certifies(identity) && !removed.iter().any(|key| key.as_slice() == identity)
+                })
+                .collect();
+            ctx.earlier_identities.insert(user, shown);
+        }
+    }
+    Ok(check_applied_change(&ctx, change))
 }
 
 /// A commit this device makes, before it's built.

@@ -17,8 +17,9 @@ use super::apply::Expected;
 use super::members::Committed;
 use super::{
     ConversationId, Extra, GroupRow, Pending, REFRESH_AFTER_MS, can_commit,
-    certify_leaves_by_pinned, delete_group, digest, draft, load_group, openmls_error, own_merged,
-    rule_context, stage, storage_error, stored_state, tls, unlisted_leaves, violation,
+    certify_leaves_by_pinned, delete_group, digest, draft, load_group, note_removed, openmls_error,
+    own_merged, rule_context, stage, storage_error, stored_group, stored_state, tls,
+    unlisted_leaves, violation,
 };
 use crate::identity::{invalid, not_found, stored_uuid};
 use crate::protocol::b64;
@@ -99,7 +100,9 @@ struct Device {
 /// server may have taken it after all (a lost answer, then a retry's 409), so `apply` settles
 /// it from the queue. It merges it when the queue brings it back, and drops it when another
 /// commit takes its epoch, or a server proposal at its epoch shows it can't have entered. Until
-/// then this device makes no other commit (`pending_commit`).
+/// then this device makes no other commit (`pending_commit`). A commit left so is dropped by a
+/// later word that the validator refused it (`invalid`), which a client that knows it never sent
+/// the commit gives too: its bytes are lost, and only another member's commit would settle it.
 pub(crate) fn commit_result(tx: &Tx<'_>, request: CommitResult) -> Result<Epoch, Error> {
     let conversation = request.conversation_id;
     match request.seq {
@@ -112,7 +115,12 @@ pub(crate) fn commit_result(tx: &Tx<'_>, request: CommitResult) -> Result<Epoch,
         _ => {}
     }
     let mut row = GroupRow::read(tx, conversation)?.ok_or_else(|| not_found("group"))?;
-    let pending = row.pending.take().ok_or_else(|| not_found("commit"))?;
+    let Some(pending) = row.pending.take() else {
+        if !request.accepted && request.invalid {
+            return drop_staged(tx, row);
+        }
+        return Err(not_found("commit"));
+    };
     let generation = match pending {
         Pending::Reset => row
             .generation
@@ -149,10 +157,22 @@ pub(crate) fn commit_result(tx: &Tx<'_>, request: CommitResult) -> Result<Epoch,
         return Ok(Epoch { epoch: None });
     }
 
+    // The leaves before: the devices a commit takes out, or a reset leaves out of the generation
+    // before, are noted.
+    let before = match pending {
+        Pending::Commit => Some(leaves(group.members()).map_err(|_| stored_state())?),
+        Pending::Reset => stored_group(tx, conversation, row.generation)?
+            .map(|old| leaves(old.members()).map_err(|_| stored_state()))
+            .transpose()?,
+        Pending::Create | Pending::External => None,
+    };
     if pending != Pending::External {
         group
             .merge_pending_commit(provider)
             .map_err(openmls_error)?;
+    }
+    if let Some(before) = before {
+        note_removed(tx, conversation, &before, &group)?;
     }
     if pending == Pending::Reset {
         delete_group(tx, conversation, row.generation)?;
@@ -169,6 +189,23 @@ pub(crate) fn commit_result(tx: &Tx<'_>, request: CommitResult) -> Result<Epoch,
         let at = (pending == Pending::Create).then(|| tx.now());
         crate::backup::entered(tx, conversation, at)?;
     }
+    row.write(tx)?;
+    Ok(Epoch {
+        epoch: Some(group.epoch().as_u64()),
+    })
+}
+
+/// Drops this device's commit left staged after the server's word on it, which never entered.
+fn drop_staged(tx: &Tx<'_>, mut row: GroupRow) -> Result<Epoch, Error> {
+    let staged = stored_group(tx, row.conversation, row.generation)?
+        .filter(|group| group.pending_commit().is_some());
+    let Some(mut group) = staged else {
+        return Err(not_found("commit"));
+    };
+    group
+        .clear_pending_commit(tx.provider().storage())
+        .map_err(storage_error)?;
+    row.echo = None;
     row.write(tx)?;
     Ok(Epoch {
         epoch: Some(group.epoch().as_u64()),

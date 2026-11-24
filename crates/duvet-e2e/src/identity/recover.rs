@@ -18,7 +18,7 @@ use super::{
 use crate::protocol::b64;
 use crate::{Error, Tx};
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub(crate) struct Recover {
     /// As the person typed it.
     #[serde(deserialize_with = "secret_text")]
@@ -37,6 +37,13 @@ pub(crate) struct Recover {
     /// opens the backup's segments those keys encrypted.
     #[serde(default, with = "b64::option")]
     wrapped_previous_backup_keys: Option<Vec<u8>>,
+}
+
+/// Its `Debug` shows nothing of it, the recovery key among it.
+impl fmt::Debug for Recover {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Recover").finish_non_exhaustive()
+    }
 }
 
 #[derive(Serialize)]
@@ -155,7 +162,9 @@ pub(super) fn thirty_two(bytes: &[u8]) -> Result<[u8; 32], Error> {
 }
 
 /// A secret the command holds as text, read into memory that's wiped as it drops.
-fn secret_text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Zeroizing<String>, D::Error> {
+pub(super) fn secret_text<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Zeroizing<String>, D::Error> {
     struct Text;
 
     impl Visitor<'_> for Text {

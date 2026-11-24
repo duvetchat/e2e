@@ -132,17 +132,23 @@ func (v *validator) run(ctx context.Context, request []byte) (answer, error) {
 	if err != nil {
 		return answer{}, fmt.Errorf("validate: %w", err)
 	}
-	out, outLen := uint32(results[0]>>32), uint32(results[0])
+	if _, err := v.dealloc.Call(ctx, uint64(in), uint64(len(request))); err != nil {
+		return answer{}, fmt.Errorf("dealloc: %w", err)
+	}
+	return v.read(ctx, results[0])
+}
+
+// read reads the response `validate` answered with, at (ptr << 32) | len, and frees it.
+func (v *validator) read(ctx context.Context, result uint64) (answer, error) {
+	out, outLen := uint32(result>>32), uint32(result)
 	view, ok := v.module.Memory().Read(out, outLen)
 	if !ok {
 		return answer{}, errors.New("the response is outside the module's memory")
 	}
 	// A view of the module's memory, which the next call may reuse.
 	response := append([]byte(nil), view...)
-	for _, buffer := range [][2]uint32{{out, outLen}, {in, uint32(len(request))}} {
-		if _, err := v.dealloc.Call(ctx, uint64(buffer[0]), uint64(buffer[1])); err != nil {
-			return answer{}, fmt.Errorf("dealloc: %w", err)
-		}
+	if _, err := v.dealloc.Call(ctx, uint64(out), uint64(outLen)); err != nil {
+		return answer{}, fmt.Errorf("dealloc: %w", err)
 	}
 
 	value, rest, err := decodeCBOR(response)
@@ -215,6 +221,34 @@ func TestValidatorUnderWazero(t *testing.T) {
 			want := answer{ok: request.OK, epoch: request.Epoch, code: request.Code}
 			if got := v.answer(t, ctx, request); got != want {
 				t.Errorf("%s: got %+v, want %+v", request.Name, got, want)
+			}
+		}
+	})
+
+	t.Run("a request at address 0, or past the cap, is a refusal", func(t *testing.T) {
+		v := instantiate(t, ctx, runtime, compiled, apis)
+		// The validator's MAX_REQUEST (crates/duvet-e2e-validator/src/lib.rs): alloc makes no room
+		// past it, and validate refuses it unread.
+		const maxRequest = 8 << 20
+		if results, err := v.alloc.Call(ctx, maxRequest+1); err != nil || results[0] != 0 {
+			t.Errorf("alloc past the cap: %v, %v", results, err)
+		}
+		for _, call := range []struct {
+			name     string
+			ptr, len uint64
+			code     string
+		}{
+			{"a request at address 0", 0, 16, "bad_request"},
+			{"a request past the cap", 1, maxRequest + 1, "too_large"},
+		} {
+			results, err := v.validate.Call(ctx, call.ptr, call.len)
+			if err != nil {
+				t.Errorf("%s: %v", call.name, err)
+				continue
+			}
+			got, err := v.read(ctx, results[0])
+			if err != nil || got != (answer{code: call.code}) {
+				t.Errorf("%s: got %+v, %v, want %s", call.name, got, err, call.code)
 			}
 		}
 	})

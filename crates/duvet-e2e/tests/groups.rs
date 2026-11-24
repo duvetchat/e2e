@@ -1219,22 +1219,24 @@ fn stale_knowledge_asks_to_observe_before_blocking() {
     let taken = ok(&mut a1.core, apply(conversation, &entries[1..]));
     assert_eq!(results(&[taken]), [json!([3, "commit", "applied", null])]);
 
-    // C1 is asked the same, but observes B's old list again: the same knowledge refuses the commit
-    // a second time, and C1 blocks.
+    // C1 is asked the same, but observes B's old list again. B's identity certified B2's leaf, which
+    // the list C1 holds doesn't name: C1 takes the commit without blocking (B2 may have left B's
+    // list since the server took it), and sends nothing until it has looked at B's list again.
     let asked = error(&mut c1.core, apply(conversation, &entries[2..]));
     assert_eq!((asked["code"].clone(), asked["users"].clone()), asked_for_b);
     assert_eq!(ok(&mut c1.core, old_list)["state"], "same");
-    let refused = ok(&mut c1.core, apply(conversation, &entries[2..]));
-    assert_eq!(
-        results(&[refused]),
-        [json!([3, "commit", "rejected", "device_not_listed"])]
-    );
-    assert_eq!(c1.group(conversation)["blocked"], true);
+    let taken = ok(&mut c1.core, apply(conversation, &entries[2..]));
+    assert_eq!(results(&[taken]), [json!([3, "commit", "applied", null])]);
+    assert_eq!(c1.group(conversation)["blocked"], false);
+    let asked = ready(&mut c1, conversation).unwrap_err();
+    assert_eq!((asked["code"].clone(), asked["users"].clone()), asked_for_b);
+    ok(&mut c1.core, server.observed(b));
+    assert_eq!(ready(&mut c1, conversation), Ok(()));
 
     // B1, once it knows its user's new list, takes it too.
     server.introduce(&mut b1);
     server.deliver(&mut b1);
-    let state = same_group(&mut [&mut a1, &mut b1, &mut b2], conversation);
+    let state = same_group(&mut [&mut a1, &mut b1, &mut b2, &mut c1], conversation);
     assert_eq!(state["epoch"], 2);
 }
 
@@ -2026,4 +2028,372 @@ fn a_device_that_joined_by_welcome_asks_before_taking_a_leaf_out() {
     assert_eq!(ok(&mut c1.core, server.observed(b))["state"], "same");
     assert_eq!(ready(&mut c1, conversation), Ok(()));
     assert!(device_set(&c1.group(conversation)).contains(&b2.id));
+}
+
+/// `device` takes `conversation`'s whole queue in one `apply`, as a client does: whenever its core
+/// asks to observe users first, it observes them as the server has them now, then applies again.
+/// What each `observe_user` answered, and the last `apply`'s reply.
+fn take_queue(
+    server: &FakeServer,
+    device: &mut TestDevice,
+    conversation: Uuid,
+) -> (Vec<Value>, Value) {
+    let mut observed = Vec::new();
+    loop {
+        let reply = run(
+            &mut device.core,
+            &apply(conversation, &server.entries(conversation)),
+        );
+        let Some(asked) = reply.get("error") else {
+            return (observed, reply["ok"].clone());
+        };
+        assert_eq!(asked["code"], "needs_identities", "{reply}");
+        assert!(observed.len() < 3, "asked again and again: {observed:?}");
+        for user in asked["users"].as_array().unwrap() {
+            let user: Uuid = user.as_str().unwrap().parse().unwrap();
+            observed.push(ok(&mut device.core, server.observed(user))["state"].clone());
+        }
+    }
+}
+
+/// While C1 is away, B2, B's new device, joins by external commit; then B takes B2 off its list,
+/// and A1 commits the API's proposal of B2's removal. Back, C1 is asked about B and sees B's newest
+/// list, which no longer names B2: B2's join applies all the same, as the server took it while B2
+/// was listed, and C1 ends where the others are, without blocking.
+#[test]
+fn a_device_taken_off_its_list_while_a_member_was_away_applies_late() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1, mut b1, mut c1] = new_devices(&mut server, [a, b, c]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b, c], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1]);
+
+    let mut b2 = server.device(b);
+    for device in [&mut a1, &mut b1, &mut b2] {
+        server.introduce(device);
+    }
+    server
+        .commit(&mut b2, conversation, joining(&server, conversation))
+        .unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
+    let list = ok(
+        &mut b1.core,
+        json!({"cmd": "sign_device_list", "remove": [b2.id]}),
+    );
+    server.take_list(b, &list["device_list"]);
+    server.introduce(&mut a1);
+    server.remove_device(conversation, b2.id);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    server
+        .commit(
+            &mut a1,
+            conversation,
+            command("commit_pending", conversation),
+        )
+        .unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    let (observed, taken) = take_queue(&server, &mut c1, conversation);
+    assert_eq!(observed, [json!("same"), json!("same")]);
+    assert_eq!(
+        results(&[taken]),
+        [
+            json!([3, "commit", "applied", null]),
+            json!([4, "proposal", "applied", null]),
+            json!([5, "commit", "applied", null]),
+        ]
+    );
+    assert_eq!(c1.group(conversation)["blocked"], false);
+    let state = same_group(&mut [&mut a1, &mut b1, &mut c1], conversation);
+    assert_eq!(state["epoch"], 3);
+    assert!(!device_set(&state).contains(&b2.id));
+}
+
+/// B takes a device off its list and A1 takes it out of A's group, which C1 applies. While C1 is
+/// away, a device of D's with the same ID joins by external commit, and then D takes it off its
+/// list. Back, C1 sees D's newest list: D's device isn't the one the group took out, which was B's,
+/// so its join applies, as any device's that left its list after the server took it.
+#[test]
+fn a_device_with_the_id_of_another_user_s_removed_one_applies_late() {
+    let mut server = FakeServer::new();
+    let (a, b, c, d) = (new_id(), new_id(), new_id(), new_id());
+    let [mut a1, mut b1, mut c1, mut d1] = new_devices(&mut server, [a, b, c, d]);
+    let shared = new_id();
+    let mut bx = server.device_with_id(b, shared);
+    server.publish(&mut bx);
+    for device in [&mut a1, &mut b1, &mut c1, &mut d1, &mut bx] {
+        server.introduce(device);
+    }
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b, c, d], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1, &mut d1, &mut bx]);
+    assert!(device_set(&c1.group(conversation)).contains(&shared));
+
+    let list = ok(
+        &mut b1.core,
+        json!({"cmd": "sign_device_list", "remove": [shared]}),
+    );
+    server.take_list(b, &list["device_list"]);
+    server.introduce(&mut a1);
+    server.remove_device(conversation, shared);
+    server.deliver(&mut a1);
+    server
+        .commit(
+            &mut a1,
+            conversation,
+            command("commit_pending", conversation),
+        )
+        .unwrap();
+    take_queue(&server, &mut c1, conversation);
+    assert!(!device_set(&c1.group(conversation)).contains(&shared));
+
+    let mut dx = server.device_with_id(d, shared);
+    server.introduce(&mut dx);
+    let joined = server
+        .commit(&mut dx, conversation, joining(&server, conversation))
+        .unwrap();
+    assert!(joined.get("commit").is_some());
+    server.introduce(&mut d1);
+    let list = ok(
+        &mut d1.core,
+        json!({"cmd": "sign_device_list", "remove": [shared]}),
+    );
+    server.take_list(d, &list["device_list"]);
+
+    let (_, taken) = take_queue(&server, &mut c1, conversation);
+    let taken = results(&[taken]);
+    assert_eq!(taken.last().unwrap()[2], "applied", "{taken:?}");
+    assert_eq!(c1.group(conversation)["blocked"], false);
+    assert!(device_set(&c1.group(conversation)).contains(&shared));
+}
+
+/// A removes B, which C1 applies, and adds B back while C1 is away; then B takes B2 off its list,
+/// which C1 sees before it's back (from another conversation, say). B2 left the group with its
+/// user, not as a device, so the record of the devices the group took out doesn't hold it, and B's
+/// return applies late, as any device's that left its list after the server took it.
+#[test]
+fn a_device_whose_user_left_and_came_back_applies_late() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1, mut b1, mut b2, mut c1] = new_devices(&mut server, [a, b, b, c]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b, c], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2, &mut c1]);
+
+    let remove = json!({"cmd": "remove_members", "conversation_id": conversation, "users": [b]});
+    server.commit(&mut a1, conversation, remove).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
+    take_queue(&server, &mut c1, conversation);
+    assert!(!device_set(&c1.group(conversation)).contains(&b2.id));
+
+    let add = adding(&mut server, conversation, b);
+    server.commit(&mut a1, conversation, add).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
+    let list = ok(
+        &mut b1.core,
+        json!({"cmd": "sign_device_list", "remove": [b2.id]}),
+    );
+    server.take_list(b, &list["device_list"]);
+    ok(&mut c1.core, server.observed(b));
+
+    let (_, taken) = take_queue(&server, &mut c1, conversation);
+    let taken = results(&[taken]);
+    let commit = taken.iter().find(|result| result[1] == "commit").unwrap();
+    assert_eq!(commit[2], "applied", "{taken:?}");
+    assert_eq!(c1.group(conversation)["blocked"], false);
+    assert!(device_set(&c1.group(conversation)).contains(&b2.id));
+}
+
+/// While C1 is away, B leaves from B2, and A1's commit takes B out with B2's statement; then B takes
+/// B2 off its list, which C1 sees. The statement holds for C1 all the same: B's identity certified
+/// B2's leaf, and the server took the commit while B2 was listed.
+#[test]
+fn a_leave_signed_by_a_device_taken_off_its_list_later_applies_late() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1, mut b1, mut b2, mut c1] = new_devices(&mut server, [a, b, b, c]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b, c], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2, &mut c1]);
+
+    server.leave(&mut b2, conversation);
+    server.deliver(&mut a1);
+    server
+        .commit(
+            &mut a1,
+            conversation,
+            command("commit_pending", conversation),
+        )
+        .unwrap();
+    server.deliver(&mut a1);
+    let list = ok(
+        &mut b1.core,
+        json!({"cmd": "sign_device_list", "remove": [b2.id]}),
+    );
+    server.take_list(b, &list["device_list"]);
+    server.introduce(&mut c1);
+
+    let (observed, taken) = take_queue(&server, &mut c1, conversation);
+    assert_eq!(observed, [json!("same")]);
+    assert_eq!(
+        results(&[taken]),
+        [
+            json!([3, "proposal", "applied", null]),
+            json!([4, "proposal", "applied", null]),
+            json!([5, "commit", "applied", null]),
+        ]
+    );
+    assert_eq!(c1.group(conversation)["blocked"], false);
+    let state = same_group(&mut [&mut a1, &mut c1], conversation);
+    assert_eq!(members(&state), [a, c]);
+}
+
+/// While C1 is away, B2 joins by external commit; then B starts over on B3, with a new identity
+/// whose list has B3 alone, and A1 takes B's old devices out. C1, which has seen B's new identity,
+/// takes B2's join under the identity it knows B had before, B2 being off B's new list.
+#[test]
+fn a_leaf_from_before_its_user_started_over_applies_late() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1, mut b1, mut c1] = new_devices(&mut server, [a, b, c]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b, c], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1]);
+
+    let mut b2 = server.device(b);
+    for device in [&mut a1, &mut b1, &mut b2] {
+        server.introduce(device);
+    }
+    server
+        .commit(&mut b2, conversation, joining(&server, conversation))
+        .unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
+    let mut b3 = server.bare_device(b);
+    let reset = ok(&mut b3.core, json!({"cmd": "reset_identity"}));
+    server.take_identity(b, &reset);
+    server.introduce(&mut a1);
+    let asked = ready(&mut a1, conversation).unwrap_err();
+    assert_eq!(asked["code"], "needs_identities");
+    ok(&mut a1.core, server.observed(b));
+    server
+        .commit(
+            &mut a1,
+            conversation,
+            command("commit_pending", conversation),
+        )
+        .unwrap();
+    server.deliver(&mut a1);
+    server.introduce(&mut c1);
+
+    let (observed, taken) = take_queue(&server, &mut c1, conversation);
+    assert_eq!(observed, [json!("same")]);
+    assert_eq!(
+        results(&[taken]),
+        [
+            json!([3, "commit", "applied", null]),
+            json!([4, "commit", "applied", null]),
+        ]
+    );
+    assert_eq!(c1.group(conversation)["blocked"], false);
+    let state = same_group(&mut [&mut a1, &mut c1], conversation);
+    assert_eq!(state["epoch"], 3);
+    assert_eq!(device_set(&state), BTreeSet::from([a1.id, c1.id]));
+}
+
+/// A1 adds C with a key package that lasts seconds, which the server's validator takes, while B1 is
+/// away. B1 applies the commit once that key package has expired: the validator checked its
+/// lifetime when it took the commit, and B1 takes it without blocking.
+#[test]
+fn a_commit_applied_after_its_key_package_expired_applies() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let mut a1 = server.device(a);
+    let mut b1 = server.device(b);
+    let _c1 = server.device(c);
+    // C's device whose key package ends in seconds: OpenMLS reads the system's clock, which the test
+    // can't move.
+    let short_lived = server.virtual_device(c);
+    for device in [&mut a1, &mut b1] {
+        server.publish(device);
+    }
+    for device in [&mut a1, &mut b1] {
+        server.introduce(device);
+    }
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    let key_package = server.virtual_key_package(short_lived, 5);
+    let ends = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 5;
+    let add = json!({
+        "cmd": "add_members",
+        "conversation_id": conversation,
+        "users": [{"user_id": c, "key_packages": [key_package]}],
+    });
+    server.commit(&mut a1, conversation, add).unwrap();
+    server.deliver(&mut a1);
+    while SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        <= ends
+    {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let taken = server.deliver(&mut b1);
+    assert_eq!(
+        results(&taken),
+        [
+            json!([3, "commit", "applied", null]),
+            json!([4, "welcome", "ignored", null]),
+        ]
+    );
+    assert_eq!(b1.group(conversation)["blocked"], false);
+    let state = same_group(&mut [&mut a1, &mut b1], conversation);
+    assert_eq!(state["epoch"], 2);
+    assert!(device_set(&state).contains(&short_lived));
+}
+
+/// A1 renews its leaf, and the client loses the commit before sending it. Told then that the commit
+/// wasn't taken, A1 keeps it staged for the queue to settle, and sends nothing meanwhile. Knowing it
+/// never sent it, the client reports it refused by the validator: A1 drops it, and writes again.
+#[test]
+fn a_commit_never_sent_is_dropped_after_its_answer() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut b1] = new_devices(&mut server, [a, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Dm, None, &[a, b], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    ok(&mut a1.core, command("refresh", conversation));
+    let refused =
+        json!({"cmd": "commit_result", "conversation_id": conversation, "accepted": false});
+    ok(&mut a1.core, refused.clone());
+    assert_eq!(
+        ready(&mut a1, conversation).unwrap_err()["code"],
+        "pending_commit"
+    );
+
+    let mut never_sent = refused;
+    never_sent["invalid"] = json!(true);
+    let dropped = ok(&mut a1.core, never_sent);
+    assert_eq!(dropped["epoch"], 1);
+    assert_eq!(ready(&mut a1, conversation), Ok(()));
+    server
+        .commit(&mut a1, conversation, command("refresh", conversation))
+        .unwrap();
 }

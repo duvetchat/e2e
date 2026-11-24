@@ -8,12 +8,18 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    DEVICE_LIST, from_cbor, invalid, keep_certificates, meta_put, not_found, stored_key, to_cbor,
+    DEVICE_LIST, from_cbor, invalid, keep_certificates, meta_get, meta_put, not_found, stored_key,
+    to_cbor,
 };
+use crate::messages::Empty;
 use crate::protocol::b64;
 use crate::{Error, Tx};
 
 const SAFETY_NUMBER_LABEL: &[u8] = b"duvet safety number v1";
+
+/// `meta`'s row for this device's own user's list as the server is known to hold it: the client
+/// confirmed its upload (`device_list_uploaded`), or the server served it.
+const LIST_ON_SERVER: &str = "device_list_on_server";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -149,11 +155,19 @@ pub(crate) fn observe_user(
         if list.version < pinned.list.version {
             return rejected("older_list");
         }
-        if !list.accepts_after(Some(&pinned.list)) {
+        // This device's own list, of a version the server holds another of, which the identity
+        // signed: the server's compare-and-set chose that one, and this one's upload never landed.
+        // Once the server is known to hold this device's list (the client confirmed its upload, or
+        // the server served it), another of that version is a conflict.
+        let lost = own
+            && list.version == pinned.list.version
+            && !on_server(tx, &identity_key, &pinned.list)?;
+        if !list.accepts_after(Some(&pinned.list)) && !lost {
             return rejected("conflicting_list");
         }
         if own {
             meta_put(tx, DEVICE_LIST, device_list)?;
+            meta_put(tx, LIST_ON_SERVER, device_list)?;
         } else {
             tx.conn().execute(
                 "UPDATE contacts SET device_list = ?2, list_version = ?3, updated_at = ?4 \
@@ -204,6 +218,31 @@ pub(crate) fn observe_user(
         verified: false,
         reason: None,
     })
+}
+
+/// Whether the server is known to hold `list`, this device's own user's list, under
+/// `identity_key`.
+fn on_server(tx: &Tx<'_>, identity_key: &[u8; 32], list: &DeviceList) -> Result<bool, Error> {
+    Ok(meta_get(tx, LIST_ON_SERVER)?
+        .and_then(|held| DeviceList::verify(&held, identity_key).ok())
+        .is_some_and(|held| held == *list))
+}
+
+/// The client's word that the server took its upload of the list this device holds for its own
+/// user, of `version` (as `sign_device_list`, `recover` or an approval made it): from then on, no
+/// other list of that version replaces it. `not_found` `upload` when the list this device holds is
+/// of another version (a newer one replaced it since).
+pub(crate) fn device_list_uploaded(tx: &mut Tx<'_>, version: u64) -> Result<Empty, Error> {
+    let user = tx.own_user()?.ok_or_else(|| not_found("device"))?;
+    let held = tx
+        .device_list_of(user)?
+        .ok_or_else(|| not_found("identity"))?;
+    if held.version != version {
+        return Err(not_found("upload"));
+    }
+    let bytes = meta_get(tx, DEVICE_LIST)?.ok_or_else(|| not_found("identity"))?;
+    meta_put(tx, LIST_ON_SERVER, &bytes)?;
+    Ok(Empty {})
 }
 
 fn pinned(tx: &Tx<'_>, user: Uuid) -> Result<Option<Pinned>, Error> {

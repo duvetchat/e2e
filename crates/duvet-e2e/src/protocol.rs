@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::{Error, KeyStorage, PROTOCOL, Tx, direct, identity, messages, mls, parts};
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub(crate) enum Command {
     Status,
@@ -39,6 +39,13 @@ pub(crate) enum Command {
         qr: Option<Vec<u8>>,
     },
     KeyPackages,
+
+    /// The server took what the last identity command made: its kept copy goes.
+    IdentityUploaded,
+    /// The server took this device's upload of its own user's list of `version`.
+    DeviceListUploaded {
+        version: u64,
+    },
 
     // Starting over and changing the keys.
     ResetIdentity,
@@ -105,6 +112,13 @@ pub(crate) enum Command {
     CatchUpDelivered(crate::history::CatchUpDelivered),
 }
 
+/// A command carries keys, a recovery key and plaintext: its `Debug` shows none of it.
+impl std::fmt::Debug for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Command").finish_non_exhaustive()
+    }
+}
+
 pub(crate) fn parse(command: &str) -> Result<Command, Error> {
     serde_json::from_str(command).map_err(Error::bad_command)
 }
@@ -135,6 +149,10 @@ pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error
             reply(identity::verify_user(tx, user_id, qr.as_deref())?)
         }
         Command::KeyPackages => reply(identity::key_packages(tx)?),
+        Command::IdentityUploaded => reply(identity::identity_uploaded(tx)?),
+        Command::DeviceListUploaded { version } => {
+            reply(identity::device_list_uploaded(tx, version)?)
+        }
 
         Command::ResetIdentity => reply(identity::reset_identity(tx)?),
         Command::RotateKeys {
@@ -208,6 +226,16 @@ struct Status {
     device_id: Option<Uuid>,
     #[serde(with = "b64::option", skip_serializing_if = "Option::is_none")]
     identity_key: Option<Vec<u8>>,
+    /// This device's certificate and its user's latest list, as the identity commands answered
+    /// them: a client whose reply was lost before its upload has them again here.
+    #[serde(with = "b64::option", skip_serializing_if = "Option::is_none")]
+    certificate: Option<Vec<u8>>,
+    #[serde(with = "b64::option", skip_serializing_if = "Option::is_none")]
+    device_list: Option<Vec<u8>>,
+    /// The identity command whose reply waits for `identity_uploaded`: run again, it hands that
+    /// reply out again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waiting_upload: Option<&'static str>,
     has_identity: bool,
     key_storage: KeyStorage,
 }
@@ -219,14 +247,22 @@ fn cmd_status(tx: &mut Tx<'_>) -> Result<Status, Error> {
             Ok((row.get(0)?, row.get(1)?))
         })
         .optional()?;
-    let identity_key: Option<Vec<u8>> = tx
+    let certificate: Option<Vec<u8>> = tx
         .conn()
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'identity_key'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
+        .query_row("SELECT certificate FROM device", [], |row| row.get(0))
+        .optional()?
+        .flatten();
+    let meta = |key: &str| -> Result<Option<Vec<u8>>, Error> {
+        Ok(tx
+            .conn()
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    };
+    let identity_key = meta("identity_key")?;
+    let device_list = meta("device_list")?;
+    let waiting_upload = identity::waiting_upload(tx)?;
     let uuid =
         |bytes: &[u8]| Uuid::from_slice(bytes).map_err(|error| Error::Internal(error.to_string()));
     Ok(Status {
@@ -237,6 +273,9 @@ fn cmd_status(tx: &mut Tx<'_>) -> Result<Status, Error> {
             .as_ref()
             .map(|(_, device)| uuid(device))
             .transpose()?,
+        certificate,
+        device_list,
+        waiting_upload,
         has_identity: identity_key.is_some(),
         identity_key,
         key_storage: tx.key_storage(),
@@ -365,6 +404,50 @@ mod tests {
         key: Vec<u8>,
         #[serde(default, with = "b64::option", skip_serializing_if = "Option::is_none")]
         note: Option<Vec<u8>>,
+    }
+
+    /// A command's `Debug` shows no secret: not a recovery key, nor an attachment's key, nor a
+    /// message's text.
+    #[test]
+    fn debug_leaves_secrets_out() {
+        let recovery_key = "DONTPRINTDONTPRINTDONTPRINTDONTPRINTDONTPRINTDONT";
+        let recover = serde_json::json!({
+            "cmd": "recover",
+            "recovery_key": recovery_key,
+            "wrapped_backup_key": "",
+            "encrypted_identity": "",
+            "device_list": "",
+        });
+        let command = super::parse(&recover.to_string()).unwrap();
+        assert!(!format!("{command:?}").contains("DONTPRINT"));
+        let request: crate::identity::Recover = serde_json::from_value(recover).unwrap();
+        assert!(!format!("{request:?}").contains("DONTPRINT"));
+
+        let key = "RE9OVFBSSU5URE9OVFBSSU5URE9OVFBSSU5URE9OVA==";
+        let encrypt = serde_json::json!({
+            "cmd": "attachment_encrypt",
+            "key": key,
+            "attachment_id": "01930000-0000-7000-0000-000000000001",
+            "index": 0,
+            "last": true,
+            "data": "",
+        });
+        let command = super::parse(&encrypt.to_string()).unwrap();
+        let shown = format!("{command:?}");
+        assert!(
+            !shown.contains("68, 79, 78, 84") && !shown.contains(key),
+            "{shown}"
+        );
+
+        let message = serde_json::json!({
+            "cmd": "encrypt",
+            "conversation_id": "01930000-0000-7000-0000-000000000001",
+            "nonce": "n",
+            "envelope": {"text": "DONTPRINT the message"},
+        });
+        let command = super::parse(&message.to_string()).unwrap();
+        let shown = format!("{command:?}");
+        assert!(!shown.contains("DONTPRINT"), "{shown}");
     }
 
     #[test]

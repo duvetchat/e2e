@@ -19,9 +19,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    Extra, GroupRow, certify_by_pinned, certify_leaves_by_pinned, check, commit_asks_first,
-    delete_group, digest, openmls_error, own_merged, rule_context, skip_unchanged_leaves,
-    storage_error, stored_group, stored_state, welcome_asks_first,
+    Extra, GroupRow, brings_back_removed, certify_by_pinned, certify_leaves_by_pinned, check,
+    check_applied, commit_asks_first, delete_group, digest, merge_own, note_removed, openmls_error,
+    rule_context, skip_unchanged_leaves, storage_error, stored_group, stored_state,
+    welcome_asks_first,
 };
 use crate::identity::{invalid, not_found};
 use crate::protocol::b64;
@@ -275,9 +276,13 @@ impl Conversation {
 /// commit that breaks them, or that this device can't process, blocks the group, but one refused
 /// for what this device knows of some users (their leaves' certificates, their leave statements)
 /// first asks to observe them anew (`needs_identities`), until the client did and the same
-/// knowledge refuses it again. This device's own commit never blocks it: one the server answered
-/// as refused is merged when the queue brings it back, and dropped once the queue shows it never
-/// entered.
+/// knowledge refuses it again. Then a leaf, or a leave statement's signer, that only its user's
+/// latest list refuses, or that an identity the user had before certified, is let in
+/// (`check_applied_change`): the server took the commit then, and the device may have left the list
+/// since. But not a device this device saw the group take out (`brings_back_removed`), nor one an
+/// identity from before certified where the group has moved past it (`check_applied`): those are
+/// refused, and block. This device's own commit never blocks it: one the server answered as refused
+/// is merged when the queue brings it back, and dropped once the queue shows it never entered.
 struct Commits;
 
 impl EntryHandler for Commits {
@@ -299,10 +304,7 @@ impl EntryHandler for Commits {
                 && group.pending_commit().is_some()
                 && message.epoch() == group.epoch()
             {
-                group
-                    .merge_pending_commit(provider)
-                    .map_err(openmls_error)?;
-                own_merged(tx, row, group)?;
+                merge_own(tx, row, group)?;
             }
             return Ok(Applied::Own);
         }
@@ -328,10 +330,7 @@ impl EntryHandler for Commits {
             // This device's waiting commit, in bytes other than those it made.
             ProcessedMessageContent::OwnPendingCommit => {
                 row.echo = None;
-                group
-                    .merge_pending_commit(provider)
-                    .map_err(openmls_error)?;
-                own_merged(tx, row, group)?;
+                merge_own(tx, row, group)?;
                 return Ok(Applied::Own);
             }
             _ => return Ok(rejected("invalid_commit")),
@@ -343,8 +342,19 @@ impl EntryHandler for Commits {
         skip_unchanged_leaves(&mut change);
         certify_by_pinned(tx, &mut change)?;
         if let Err(violation) = check(tx, &change, Extra::default())? {
-            commit_asks_first(tx, &digest(&entry.data), &change, violation)?;
-            return Ok(block(row, violation.name()));
+            let asked = digest(&entry.data);
+            commit_asks_first(tx, &asked, &change, violation)?;
+            // A device this group took out, back off its user's list, stays out.
+            if brings_back_removed(tx, &change)? {
+                return Ok(block(row, violation.name()));
+            }
+            // Observed, a leaf or a leave statement's signer that only the user's latest list
+            // refuses is let in: the server may have taken the commit while it was listed, and this
+            // device sends nothing while such a leaf is in (`ready_to_send`).
+            if let Err(violation) = check_applied(tx, &change)? {
+                commit_asks_first(tx, &asked, &change, violation)?;
+                return Ok(block(row, violation.name()));
+            }
         }
         let after =
             MemberList::from_group_context(staged.group_context()).map_err(|_| stored_state())?;
@@ -352,6 +362,7 @@ impl EntryHandler for Commits {
         group
             .merge_staged_commit(provider, *staged)
             .map_err(openmls_error)?;
+        note_removed(tx, at.id, &leaves, group)?;
         // A member without a device whose device it brings is due a catch-up.
         crate::messages::entered(tx, at.id, &change.added)?;
         row.echo = None;
@@ -471,14 +482,23 @@ impl EntryHandler for Welcomes {
             return Ok(rejected(RuleViolation::MembersChangedByNonOwner.name()));
         }
 
-        // In: the group of the generation before goes.
-        if let Some(mut old) = at.group.take() {
-            old.delete(provider.storage()).map_err(storage_error)?;
-        }
+        // In: the group of the generation before goes. What a reset doesn't bring from it, it left
+        // out, as a commit takes a device out.
+        let before = match at.group.take() {
+            Some(mut old) => {
+                let before = duvet_e2e_rules::leaves(old.members()).map_err(|_| stored_state())?;
+                old.delete(provider.storage()).map_err(storage_error)?;
+                Some(before)
+            }
+            None => None,
+        };
         let group = staged.into_group(provider).map_err(|error| match error {
             WelcomeError::StorageError(error) => storage_error(error),
             error => openmls_error(error),
         })?;
+        if let Some(before) = before {
+            note_removed(tx, at.id, &before, &group)?;
+        }
         // The leaf this device joined with is its key package's, as new as that.
         let made: Option<i64> = match &key_package {
             Some(reference) => tx

@@ -11,7 +11,7 @@
 mod state;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Display;
+use std::fmt::{self, Display};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use duvet_e2e_rules::{
@@ -45,6 +45,7 @@ const NEEDS_IDENTITIES: &str = "needs_identities";
 const GROUP_INFO_MISMATCH: &str = "group_info_mismatch";
 const ALREADY_PROPOSED: &str = "already_proposed";
 const INTERNAL: &str = "internal";
+const TOO_LARGE: &str = "too_large";
 
 /// What the API asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,7 +60,7 @@ pub enum Op {
 }
 
 /// A request, in CBOR. Each operation reads the fields it names, and nothing else.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
     pub v: u32,
     pub op: Op,
@@ -177,6 +178,28 @@ pub struct DeviceLeaf {
     pub leaf: u32,
 }
 
+/// Every field but the API's private key, `signer_key`.
+impl fmt::Debug for Request {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Request")
+            .field("v", &self.v)
+            .field("op", &self.op)
+            .field("conversation", &self.conversation)
+            .field("generation", &self.generation)
+            .field("state", &self.state)
+            .field("group_info", &self.group_info)
+            .field("message", &self.message)
+            .field("new_group_info", &self.new_group_info)
+            .field("members", &self.members)
+            .field("identities", &self.identities)
+            .field("device_lists", &self.device_lists)
+            .field("leaf_index", &self.leaf_index)
+            .field("external_sender", &self.external_sender)
+            .field("legacy", &self.legacy)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Why a request was refused: a code the API decides by, and a message for people.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Failure {
@@ -187,8 +210,22 @@ pub struct Failure {
     pub users: Vec<Uuid>,
 }
 
-/// Answers a CBOR request with a CBOR response, a refusal included: nothing fails through it.
+/// The largest request the validator reads, in bytes: 8 MiB. The largest group step 3 allows, 20
+/// people with 20 devices each, takes a commit request of up to 5.3 MiB: its state 4 MiB at most,
+/// the group info 1 MiB and the commit 256 KiB, with each user's identity and list. A group of 20
+/// people with 10 devices each starts with a request of about 190 KB, and a commit in it takes one
+/// of about 450 KB, its state about 340 KB. The API sizes the module's memory by it.
+pub const MAX_REQUEST: usize = 8 << 20;
+
+/// What a request over [`MAX_REQUEST`] is refused with.
+const OVER_CAP: &str = "the request is over 8 MiB";
+
+/// Answers a CBOR request with a CBOR response, a refusal included: nothing fails through it. A
+/// request over [`MAX_REQUEST`] is refused before it's read.
 pub fn validate_bytes(input: &[u8]) -> Vec<u8> {
+    if input.len() > MAX_REQUEST {
+        return refused(TOO_LARGE, OVER_CAP);
+    }
     // A panic is caught natively; the module aborts on one, as wasm32 can't unwind.
     let response = match catch_unwind(AssertUnwindSafe(|| handle(input))) {
         Ok(Ok(response)) => response,
@@ -567,6 +604,9 @@ fn rule_context(
     }
     Ok(RuleContext {
         identities,
+        // Every leaf goes by the identity the server serves now: earlier ones are a device's
+        // knowledge, for the commits it applies late.
+        earlier_identities: BTreeMap::new(),
         device_lists,
         pending_server_removals: pending,
         enforce_pending: true,
@@ -782,6 +822,11 @@ fn decode<T: DeserializeOwned>(mut bytes: &[u8]) -> Option<T> {
     bytes.is_empty().then_some(value)
 }
 
+/// A refusal, as `validate_bytes` answers one.
+fn refused(code: &'static str, message: &str) -> Vec<u8> {
+    encode(&Refusal::new(code, message).into_response()).unwrap_or_default()
+}
+
 fn encode(value: &impl Serialize) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     ciborium::into_writer(value, &mut out).ok()?;
@@ -794,12 +839,15 @@ mod exports {
     use std::alloc::{Layout, alloc as allocate, dealloc as deallocate};
 
     /// Allocates `len` bytes for the host to write a request into: their address, or 0 when
-    /// there's no room.
+    /// there's no room, as for a request over `MAX_REQUEST`, which `validate` would refuse.
     #[unsafe(no_mangle)]
     pub extern "C" fn alloc(len: u32) -> u32 {
         if len == 0 {
             // An empty buffer takes no memory, only an address that isn't 0.
             return 1;
+        }
+        if len as usize > super::MAX_REQUEST {
+            return 0;
         }
         match Layout::array::<u8>(len as usize) {
             // SAFETY: the layout isn't empty.
@@ -832,13 +880,21 @@ mod exports {
     /// `ptr` and `len` are a buffer from `alloc` holding the request.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn validate(ptr: u32, len: u32) -> u64 {
-        let request: &[u8] = if len == 0 {
-            &[]
+        let response = if len as usize > super::MAX_REQUEST {
+            // Refused unread, as `validate_bytes` refuses it.
+            super::refused(super::TOO_LARGE, super::OVER_CAP)
+        } else if len == 0 {
+            super::validate_bytes(&[])
+        } else if ptr == 0 {
+            // No buffer is at address 0: a slice from it would be undefined behaviour.
+            super::refused(super::BAD_REQUEST, "the request is at address 0")
         } else {
-            // SAFETY: the caller hands a buffer of `len` bytes at `ptr`.
-            unsafe { std::slice::from_raw_parts(ptr as usize as *const u8, len as usize) }
-        };
-        let response = super::validate_bytes(request).into_boxed_slice();
+            // SAFETY: the caller hands a buffer of `len` bytes at `ptr`, which isn't 0.
+            let request =
+                unsafe { std::slice::from_raw_parts(ptr as usize as *const u8, len as usize) };
+            super::validate_bytes(request)
+        }
+        .into_boxed_slice();
         let len = response.len() as u64;
         let ptr = Box::into_raw(response) as *mut u8 as usize as u64;
         (ptr << 32) | len

@@ -28,7 +28,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use super::identity::{CreatedIdentity, create_identity, new_identity};
+use super::identity::{
+    CreatedIdentity, Kept, KeptRotation, create_identity, drop_kept, keep, kept, new_identity,
+};
 use super::{
     BACKUP_KEY, DEVICE_LIST, IDENTITY_KEY, IDENTITY_SECRET, Identity, OwnDevice, from_cbor,
     invalid, keep_certificates, keep_earlier_identity, meta_get, meta_put, not_found, random,
@@ -169,6 +171,9 @@ pub(crate) fn reset_identity(tx: &mut Tx<'_>) -> Result<CreatedIdentity, Error> 
 /// which the identity this device holds must have signed), and gets the new identity, sealed to
 /// it: `transfers`. A device that stays with no certificate there, or whose certificates disagree
 /// on its keys, is `bad_command` (`certificates`).
+///
+/// The reply is kept until the client confirms its upload (`identity_uploaded`): run again until
+/// then, it's the same rotation ([`rotate_again`]).
 pub(crate) fn rotate_keys(
     tx: &mut Tx<'_>,
     remove: &[Uuid],
@@ -181,6 +186,16 @@ pub(crate) fn rotate_keys(
     let current = tx
         .device_list_of(own.user)?
         .ok_or_else(|| Error::Internal("the identity has no device list".into()))?;
+    // A device off its own list is on its way out: the identity it would hold certifies nothing
+    // anyone takes.
+    if !current.contains(own.device) {
+        return Err(rule("device_not_listed"));
+    }
+    if let Some(waiting) = kept(tx)?
+        && waiting.rotation.is_some()
+    {
+        return rotate_again(tx, &own, &held, remove, certificates, waiting);
+    }
     if remove.iter().any(|device| !current.contains(*device)) {
         return Err(not_found("device"));
     }
@@ -190,18 +205,13 @@ pub(crate) fn rotate_keys(
             "the device that changes the keys stays on the list",
         ));
     }
-    // A device off its own list is on its way out: the identity it would hold certifies nothing
-    // anyone takes.
-    if !current.contains(own.device) {
-        return Err(rule("device_not_listed"));
-    }
     let staying: Vec<Uuid> = current
         .devices
         .iter()
         .copied()
         .filter(|device| !remove.contains(device))
         .collect();
-    let keys = staying_keys(&own, &held, &staying, certificates)?;
+    let keys = staying_keys(&own, &[held], &staying, certificates)?;
     let sender = own
         .certificate
         .clone()
@@ -220,17 +230,21 @@ pub(crate) fn rotate_keys(
         backup_keys: &kept,
     };
     let transfers = hand_over(tx, &own, &keys, &backup_key, &before)?;
-    // The new identity's certificates of the user's devices, this one's and those that stay.
-    let certified = tx
-        .own_device()?
-        .certificate
-        .ok_or_else(|| Error::Internal("the new identity isn't stored".into()))?;
-    let staying = transfers.iter().map(|handed| handed.certificate.as_slice());
-    keep_certificates(
+    keep_handed_certificates(tx, own.user, &transfers)?;
+    let mut removed = remove.to_vec();
+    removed.sort_unstable();
+    removed.dedup();
+    keep(
         tx,
-        own.user,
-        iter::once(certified.as_slice()).chain(staying),
-        true,
+        &Kept {
+            created: created.clone(),
+            wrapped_previous_backup_keys: wrapped_previous_backup_keys.clone(),
+            rotation: Some(KeptRotation {
+                removed,
+                sender,
+                previous_list,
+            }),
+        },
     )?;
     all_groups_due(tx)?;
     Ok(Rotated {
@@ -238,6 +252,86 @@ pub(crate) fn rotate_keys(
         wrapped_previous_backup_keys,
         transfers,
     })
+}
+
+/// `rotate_keys` run again before the client confirmed its upload: the same new identity, recovery
+/// key and blobs, and the transfers sealed again to the devices that stay, for their keys as the
+/// certificates the server serves have them, signed by the identity this device holds or, the
+/// upload never having landed, by one it kept from before. Run with other devices to remove, it's
+/// `bad_command` (`remove`): the rotation made is the one that waits.
+fn rotate_again(
+    tx: &Tx<'_>,
+    own: &OwnDevice,
+    held: &[u8; 32],
+    remove: &[Uuid],
+    certificates: &[Vec<u8>],
+    waiting: Kept,
+) -> Result<Rotated, Error> {
+    let rotation = waiting
+        .rotation
+        .as_ref()
+        .ok_or_else(|| Error::Internal("the kept identity isn't a rotation's".into()))?;
+    let mut asked = remove.to_vec();
+    asked.sort_unstable();
+    asked.dedup();
+    if asked != rotation.removed {
+        return Err(invalid(
+            "remove",
+            "a rotation waits for its upload: run it again as it was, or confirm its upload first",
+        ));
+    }
+    let staying = DeviceList::verify(&waiting.created.device_list, held)
+        .map_err(|_| Error::Internal("the kept rotation's list doesn't verify".into()))?
+        .devices;
+    let mut signers = vec![*held];
+    signers.extend(tx.earlier_identities_of(own.user)?);
+    let keys = staying_keys(own, &signers, &staying, certificates)?;
+    // The keys the first run certified, which it keeps: no other keys get the identity.
+    for staying in &keys {
+        let first = tx
+            .certificate_of(own.user, staying.device)?
+            .and_then(|signed| DeviceCertificate::verify(&signed, held).ok());
+        let other = first.is_some_and(|first| {
+            first.signature_key != staying.signature_key || first.hpke_key != staying.hpke_key
+        });
+        if other {
+            return Err(invalid(
+                "certificates",
+                "a device's certificate gives it other keys than the rotation certified",
+            ));
+        }
+    }
+    let backup_key = backup_key(tx)?
+        .ok_or_else(|| Error::Internal("the new identity has no backup key".into()))?;
+    let earlier = tx.earlier_backup_keys()?;
+    let before = Before {
+        sender: &rotation.sender,
+        list: &rotation.previous_list,
+        backup_keys: &earlier,
+    };
+    let transfers = hand_over(tx, own, &keys, &*backup_key, &before)?;
+    keep_handed_certificates(tx, own.user, &transfers)?;
+    Ok(Rotated {
+        created: waiting.created,
+        wrapped_previous_backup_keys: waiting.wrapped_previous_backup_keys,
+        transfers,
+    })
+}
+
+/// The new identity's certificates of the user's devices: this one's, and those of the devices that
+/// stay, which `transfers` hand out.
+fn keep_handed_certificates(tx: &Tx<'_>, user: Uuid, transfers: &[Handed]) -> Result<(), Error> {
+    let certified = tx
+        .own_device()?
+        .certificate
+        .ok_or_else(|| Error::Internal("the new identity isn't stored".into()))?;
+    let staying = transfers.iter().map(|handed| handed.certificate.as_slice());
+    keep_certificates(
+        tx,
+        user,
+        iter::once(certified.as_slice()).chain(staying),
+        true,
+    )
 }
 
 /// A device that stays but the rotating one, with its keys as its certificate has them.
@@ -249,11 +343,12 @@ struct Staying {
 }
 
 /// Each device of `staying` but this one, with its keys from its certificate among
-/// `certificates`, which `held`, the identity this device holds, must have signed. One that doesn't
-/// verify is `invalid_signature`; the certificates of other devices aren't read.
+/// `certificates`, which one of `identities` must have signed (the identity this device holds, and,
+/// for a rotation run again, those it kept from before). One that doesn't verify is
+/// `invalid_signature`; the certificates of other devices aren't read.
 fn staying_keys(
     own: &OwnDevice,
-    held: &[u8; 32],
+    identities: &[[u8; 32]],
     staying: &[Uuid],
     certificates: &[Vec<u8>],
 ) -> Result<Vec<Staying>, Error> {
@@ -265,8 +360,10 @@ fn staying_keys(
         if claimed.device == own.device || !staying.contains(&claimed.device) {
             continue;
         }
-        let certificate =
-            DeviceCertificate::verify(signed, held).map_err(|_| signature("certificate"))?;
+        let certificate = identities
+            .iter()
+            .find_map(|identity| DeviceCertificate::verify(signed, identity).ok())
+            .ok_or_else(|| signature("certificate"))?;
         if certificate.user != own.user {
             return Err(rule("wrong_user"));
         }
@@ -381,8 +478,9 @@ fn hand_over(
 ///   of this device's own keys.
 ///
 /// Then this device has the new identity, its certificate, the list and the backup key, keeps its
-/// own backup keys from before with the transfer's, and every group of it is due for `refresh`. A
-/// transfer it took already is `exists`.
+/// own backup keys from before with the transfer's, and every group of it is due for `refresh`.
+/// What an identity command of its own kept for its upload goes: it was made for the identity
+/// replaced. A transfer it took already is `exists`.
 pub(crate) fn receive_rotation(
     tx: &Tx<'_>,
     message: &[u8],
@@ -504,6 +602,9 @@ pub(crate) fn receive_rotation(
     meta_put(tx, IDENTITY_SECRET, &*transfer.identity)?;
     meta_put(tx, DEVICE_LIST, &transfer.device_list)?;
     meta_put(tx, BACKUP_KEY, &*transfer.backup_key)?;
+    // What an identity command of this device kept for its upload was made for the identity
+    // replaced now: run again, it would hand that one out.
+    drop_kept(tx)?;
     keep_previous(tx, own.user, &*transfer.backup_key, &kept)?;
     keep_earlier_identity(tx, own.user, &held)?;
     keep_certificates(

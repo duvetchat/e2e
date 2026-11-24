@@ -5,12 +5,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use duvet_e2e_rules::{
     CommitAad, DeviceCertificate, DeviceList, Entry, Kind, LeaveStatement, MEMBER_LIST_EXTENSION,
-    MemberList, MembershipChange, Removed, RuleContext, RuleViolation, SUITE, check_change,
-    check_joined_state, check_state, extract_change, group_config, group_id, is_record,
-    join_config, keeps_record, leaf_capabilities, leaves,
+    MemberList, MembershipChange, Removed, RuleContext, RuleViolation, SUITE, check_applied_change,
+    check_change, check_joined_state, check_state, extract_change, group_config, group_id,
+    is_record, join_config, keeps_record, leaf_capabilities, leaves,
 };
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
+use openmls::schedule::PreSharedKeyId;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use uuid::Uuid;
@@ -298,6 +299,8 @@ struct Commit {
     /// The context's extensions after the commit, whole.
     extensions: Option<Extensions<GroupContext>>,
     statements: Vec<Vec<u8>>,
+    /// Proposals besides those, by value.
+    proposals: Vec<Proposal>,
     /// Leaves out the proposals the server made.
     leave_out_pending: bool,
 }
@@ -382,6 +385,16 @@ impl Scene {
         commit: Commit,
         ctx: &RuleContext,
     ) -> Result<(), RuleViolation> {
+        self.change(by, commit)
+            .and_then(|change| check_change(ctx, &change))
+    }
+
+    /// A commit `by` makes, as the rules read it, which is then thrown away.
+    fn change(
+        &mut self,
+        by: (usize, usize),
+        commit: Commit,
+    ) -> Result<MembershipChange, RuleViolation> {
         let removes: Vec<LeafNodeIndex> = commit.removes.iter().map(|&d| self.leaf(d)).collect();
         let Scene { world, groups } = self;
         let device = world.device(by);
@@ -397,7 +410,8 @@ impl Scene {
         let mut builder = group
             .commit_builder()
             .propose_adds(commit.adds)
-            .propose_removals(removes);
+            .propose_removals(removes)
+            .add_proposals(commit.proposals);
         if let Some(extensions) = extensions {
             builder = builder
                 .propose_group_context_extensions(extensions)
@@ -416,17 +430,40 @@ impl Scene {
             .unwrap()
             .stage_commit(&device.provider)
             .unwrap();
-        let verdict = own_change(group, &aad).and_then(|change| check_change(ctx, &change));
+        let change = own_change(group, &aad);
         group
             .clear_pending_commit(device.provider.storage())
             .unwrap();
-        verdict
+        change
     }
 
     /// The server proposes `message`, and every device in the group keeps it for the next commit.
     fn server_proposes(&mut self, message: MlsMessageOut) {
         let Scene { world, groups } = self;
         for (&device, group) in groups.iter_mut() {
+            let provider = &world.device(device).provider;
+            let message = incoming(&message).try_into_protocol_message().unwrap();
+            let processed = group.process_message(provider, message).unwrap();
+            let ProcessedMessageContent::ProposalMessage(proposal) = processed.into_content()
+            else {
+                panic!("not a proposal");
+            };
+            group
+                .store_pending_proposal(provider.storage(), *proposal)
+                .unwrap();
+        }
+    }
+
+    /// `by` proposes what `make` makes of its group, and every other device keeps it for the next
+    /// commit.
+    fn member_proposes(
+        &mut self,
+        by: (usize, usize),
+        make: impl FnOnce(&mut MlsGroup, &Device) -> MlsMessageOut,
+    ) {
+        let Scene { world, groups } = self;
+        let message = make(groups.get_mut(&by).unwrap(), world.device(by));
+        for (&device, group) in groups.iter_mut().filter(|(device, _)| **device != by) {
             let provider = &world.device(device).provider;
             let message = incoming(&message).try_into_protocol_message().unwrap();
             let processed = group.process_message(provider, message).unwrap();
@@ -590,6 +627,239 @@ fn leave_with_old_statement_is_rejected() {
     assert_eq!(
         s.verdict((A, 0), commit, &ctx),
         Err(RuleViolation::LeaveWithoutStatement)
+    );
+}
+
+/// A member applying another device's commit late may hold a newer list of its user than the
+/// server had then, or a new identity of theirs. A leaf, and a leave statement's signer, that only
+/// the latest list refuses pass `check_applied_change`, which the validator's `check_change`
+/// refuses; so does a leaf only an identity the user had before certified, its device off the list.
+/// A listed device's leaf goes by the pinned identity alone.
+#[test]
+fn applied_change_takes_a_certified_leaf_off_its_list() {
+    let mut s = Scene::group();
+    let b = s.id(B);
+    let identity = public(&s.world.users[B].identity);
+    let (b0, b1) = (s.world.device((B, 0)).id, s.world.device((B, 1)).id);
+    let lists = |devices: Vec<Uuid>| DeviceList::new(b, identity, 2, devices);
+
+    // B took (B, 1), which the commit brings, off its list since.
+    let mut ctx = s.world.context();
+    ctx.device_lists.insert(b, lists(vec![b0]));
+    let adding_b1 = Commit {
+        adds: vec![s.world.device((B, 1)).key_package()],
+        ..Commit::default()
+    };
+    let change = s.change((O, 0), adding_b1).unwrap();
+    assert_eq!(
+        check_change(&ctx, &change),
+        Err(RuleViolation::DeviceNotListed)
+    );
+    assert_eq!(check_applied_change(&ctx, &change), Ok(()));
+
+    // B left with (B, 0)'s statement, and took (B, 0) off its list since.
+    let mut later = s.world.context();
+    later.device_lists.insert(b, lists(vec![b1]));
+    let leaving = Commit {
+        removes: vec![(B, 0)],
+        members: Some(removing(&s.list(), b)),
+        statements: vec![s.statement((B, 0), GENERATION, s.epoch())],
+        ..Commit::default()
+    };
+    let left = s.change((A, 0), leaving).unwrap();
+    assert_eq!(
+        check_change(&later, &left),
+        Err(RuleViolation::LeaveWithoutStatement)
+    );
+    assert_eq!(check_applied_change(&later, &left), Ok(()));
+
+    // B started over: another identity, whose list names a new device alone. (B, 1)'s leaf, which
+    // B's identity before certified, passes once the checker knows that identity.
+    let other = signer();
+    let mut started_over = s.world.context();
+    started_over.identities.insert(b, public(&other));
+    started_over
+        .device_lists
+        .insert(b, DeviceList::new(b, public(&other), 1, vec![new_id()]));
+    assert_eq!(
+        check_applied_change(&started_over, &change),
+        Err(RuleViolation::LeafNotSigned)
+    );
+    started_over.earlier_identities.insert(b, vec![identity]);
+    assert_eq!(check_applied_change(&started_over, &change), Ok(()));
+
+    // But not under a name the new list holds: there the pinned identity alone vouches for a key.
+    started_over
+        .device_lists
+        .insert(b, DeviceList::new(b, public(&other), 2, vec![b1]));
+    assert_eq!(
+        check_applied_change(&started_over, &change),
+        Err(RuleViolation::LeafNotSigned)
+    );
+}
+
+/// A member's Update proposal brings its leaf as a commit's path does: under its own device's
+/// certificate for its own key. Posing as another device of its user, by that device's certificate
+/// or by one its identity signed for this key under the other device's name, it's refused; as
+/// itself, it passes.
+#[test]
+fn an_update_proposal_keeps_its_device() {
+    // A's device proposes an update under the credential `make` makes from the scene, and the
+    // owner commits it: the rules' verdict.
+    let updating = |make: fn(&Scene) -> Option<CredentialWithKey>| {
+        let mut s = Scene::group();
+        let ctx = s.world.context();
+        let credential = make(&s);
+        s.member_proposes((A, 0), |group, device| {
+            let mut leaf = LeafNodeParameters::builder();
+            if let Some(credential) = credential {
+                leaf = leaf.with_credential_with_key(credential);
+            }
+            group
+                .propose_self_update(&device.provider, &device.signer, leaf.build())
+                .unwrap()
+                .0
+        });
+        s.verdict((O, 0), Commit::default(), &ctx)
+    };
+    fn on_own_key(certificate: Vec<u8>, s: &Scene) -> Option<CredentialWithKey> {
+        Some(CredentialWithKey {
+            credential: BasicCredential::new(certificate).into(),
+            signature_key: s.world.device((A, 0)).signer.public().into(),
+        })
+    }
+    assert_eq!(
+        updating(|s| on_own_key(s.world.device((A, 1)).certificate.clone(), s)),
+        Err(RuleViolation::LeafNotSigned)
+    );
+    assert_eq!(
+        updating(|s| {
+            let key = public(&s.world.device((A, 0)).signer);
+            let certificate =
+                DeviceCertificate::new(s.id(A), s.world.device((A, 1)).id, key, [7; 32], 1)
+                    .sign(&s.world.users[A].identity)
+                    .unwrap();
+            on_own_key(certificate, s)
+        }),
+        Err(RuleViolation::LeafNotSigned)
+    );
+    assert_eq!(updating(|_| None), Ok(()));
+}
+
+/// A SelfRemove counts as its sender's removal: with its user staying a member, nothing explains
+/// it (`leaf_removed_without_reason`). OpenMLS commits one only where every leaf supports it, which
+/// no Duvet leaf does: the rule holds if one ever did.
+#[test]
+fn a_self_remove_is_a_removal() {
+    let world = World::new(&[1, 1, 1]);
+    let members = MemberList::new(
+        Kind::Group,
+        Some(world.id(O)),
+        vec![world.entry(O, 0), world.entry(A, 0), world.entry(B, 0)],
+    );
+    let capabilities = Capabilities::builder()
+        .ciphersuites(vec![SUITE])
+        .extensions(vec![
+            ExtensionType::Unknown(MEMBER_LIST_EXTENSION),
+            ExtensionType::LastResort,
+        ])
+        .proposals(vec![ProposalType::SelfRemove])
+        .build();
+    let required = RequiredCapabilitiesExtension::new(
+        &[ExtensionType::Unknown(MEMBER_LIST_EXTENSION)],
+        &[],
+        &[],
+    );
+    let extensions = vec![
+        members.to_extension(),
+        Extension::RequiredCapabilities(required),
+        Extension::ExternalSenders(vec![world.external_sender()]),
+    ];
+    let config = config_with(SUITE, extensions, capabilities.clone());
+    let owner = world.device((O, 0));
+    let mut group = world.create((O, 0), owner.credential(), &config, GENERATION);
+    let joining = [(A, 0), (B, 0)].map(|joiner| {
+        let device = world.device(joiner);
+        KeyPackage::builder()
+            .leaf_node_capabilities(capabilities.clone())
+            .build(SUITE, &device.provider, &device.signer, device.credential())
+            .unwrap()
+            .key_package()
+            .clone()
+    });
+    let bundle = group
+        .commit_builder()
+        .propose_adds(joining)
+        .load_psks(owner.provider.storage())
+        .unwrap()
+        .build(
+            owner.provider.rand(),
+            owner.provider.crypto(),
+            &owner.signer,
+            |_| true,
+        )
+        .unwrap()
+        .stage_commit(&owner.provider)
+        .unwrap();
+    group.merge_pending_commit(&owner.provider).unwrap();
+    let leaving = world.device((B, 0));
+    let mut b = world
+        .welcomed((B, 0), &bundle)
+        .into_group(&leaving.provider)
+        .unwrap();
+    let message = b
+        .leave_group_via_self_remove(&leaving.provider, &leaving.signer)
+        .unwrap();
+    let message = incoming(&message).try_into_protocol_message().unwrap();
+    let processed = group.process_message(&owner.provider, message).unwrap();
+    let ProcessedMessageContent::ProposalMessage(proposal) = processed.into_content() else {
+        panic!("not a proposal");
+    };
+    group
+        .store_pending_proposal(owner.provider.storage(), *proposal)
+        .unwrap();
+
+    let aad = CommitAad::new(Vec::new()).encode();
+    group.set_aad(aad.clone());
+    group
+        .commit_builder()
+        .load_psks(owner.provider.storage())
+        .unwrap()
+        .build(
+            owner.provider.rand(),
+            owner.provider.crypto(),
+            &owner.signer,
+            |_| true,
+        )
+        .unwrap()
+        .stage_commit(&owner.provider)
+        .unwrap();
+    let change = own_change(&group, &aad).unwrap();
+    assert_eq!(change.removed.len(), 1);
+    assert_eq!(
+        check_change(&world.context(), &change),
+        Err(RuleViolation::LeafRemovedWithoutReason)
+    );
+}
+
+/// A proposal besides an add, an update, a removal, the context's extensions and an external join's
+/// own changes the group beyond its members: a pre-shared key, here.
+#[test]
+fn an_unexpected_proposal_changes_the_context() {
+    let mut s = Scene::group();
+    let ctx = s.world.context();
+    let psk = PreSharedKeyId::external(b"duvet".to_vec(), vec![0; 32]);
+    psk.store(&s.world.device((O, 0)).provider, &[7; 32])
+        .unwrap();
+    let commit = Commit {
+        proposals: vec![Proposal::PreSharedKey(Box::new(PreSharedKeyProposal::new(
+            psk,
+        )))],
+        ..Commit::default()
+    };
+    assert_eq!(
+        s.verdict((O, 0), commit, &ctx),
+        Err(RuleViolation::ContextChanged)
     );
 }
 

@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::Error;
 
 /// The schema this core writes. It opens every earlier one and refuses a later one.
-pub(crate) const VERSION: i64 = 2;
+pub(crate) const VERSION: i64 = 3;
 
 pub(crate) fn run(conn: &mut Connection) -> Result<(), Error> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -26,8 +26,35 @@ pub(crate) fn run(conn: &mut Connection) -> Result<(), Error> {
         txn.pragma_update(None, "user_version", 2)?;
         txn.commit()?;
     }
+    if version < 3 {
+        let txn = conn.transaction()?;
+        txn.execute_batch(V3)?;
+        txn.pragma_update(None, "user_version", 3)?;
+        txn.commit()?;
+    }
     Ok(())
 }
+
+/// Schema 3: the devices each conversation's group took out as this device saw it, at any of its
+/// generations: a commit it applied or made removed their leaves, or a reset left them out of the
+/// next generation. A later commit that brings one of them back off its user's latest list is
+/// refused (`mls::brings_back_removed`). With them, the identities that certified their leaves when
+/// those weren't the ones this device pinned for their users then (identities the users had
+/// before): they certify nothing more in that conversation (`mls::check_applied`).
+const V3: &str = r#"
+CREATE TABLE removed_devices (
+    conversation_id BLOB NOT NULL,
+    user_id BLOB NOT NULL,
+    device_id BLOB NOT NULL,
+    PRIMARY KEY (conversation_id, user_id, device_id)
+);
+CREATE TABLE removed_identities (
+    conversation_id BLOB NOT NULL,
+    user_id BLOB NOT NULL,
+    identity_key BLOB NOT NULL,
+    PRIMARY KEY (conversation_id, user_id, identity_key)
+);
+"#;
 
 /// Schema 2: where a message row's content came from. `imported` is 1 for what an import brought
 /// (a backup copy, a history share, a catch-up), which the API's `deleted` erases, and 0 for what

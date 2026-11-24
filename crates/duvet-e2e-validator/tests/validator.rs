@@ -11,7 +11,9 @@ use duvet_e2e_rules::{
     CommitAad, DeviceCertificate, DeviceList, Entry, Kind, MemberList, SUITE, group_config,
     group_id, join_config, leaf_capabilities,
 };
-use duvet_e2e_validator::{Change, DeviceLeaf, Members, Op, Request, Response, validate_bytes};
+use duvet_e2e_validator::{
+    Change, DeviceLeaf, MAX_REQUEST, Members, Op, Request, Response, validate_bytes,
+};
 use ed25519_dalek::SigningKey;
 use openmls::messages::group_info::GroupInfo;
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
@@ -898,6 +900,87 @@ fn stale_never_updated_leaf_does_not_block() {
     assert_eq!(renewed.epoch, Some(3), "{:?}", renewed.error);
 }
 
+/// The workspace's OpenMLS lets a member apply a commit whose added key package expired after the
+/// validator took it (vendor/README.md). The validator, which checks each commit as it comes, still
+/// holds that key package to its lifetime, and so does a member making such a commit.
+#[test]
+fn an_added_key_package_expires_for_the_validator_not_for_a_member_applying_late() {
+    let mut chat = Chat::group();
+    let not_after = now() + 5;
+    let short = chat
+        .world
+        .device((C, 0))
+        .key_package_with(Lifetime::init(now() - 60, not_after));
+    let members = adding(&chat.list(), chat.id(C), chat.epoch + 1);
+    let Chat { world, groups, .. } = &mut chat;
+    let owner = world.device((O, 0));
+    let group = groups.get_mut(&(O, 0)).unwrap();
+    let mut extensions = group.public_group().group_context().extensions().clone();
+    extensions.add_or_replace(members.to_extension()).unwrap();
+    group.set_aad(CommitAad::new(Vec::new()).encode());
+    let bundle = group
+        .commit_builder()
+        .propose_adds([short.clone()])
+        .force_self_update(true)
+        .propose_group_context_extensions(extensions)
+        .unwrap()
+        .load_psks(owner.provider.storage())
+        .unwrap()
+        .build(
+            owner.provider.rand(),
+            owner.provider.crypto(),
+            &owner.signer,
+            |_| true,
+        )
+        .unwrap()
+        .stage_commit(&owner.provider)
+        .unwrap();
+    let staged = Staged {
+        by: (O, 0),
+        bundle,
+        joined: vec![(C, 0)],
+        joiner: None,
+    };
+    assert!(run(&chat.request(&staged)).ok, "taken while it holds");
+    while now() <= not_after {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    assert_eq!(code(&run(&chat.request(&staged))), "invalid_commit");
+    let Chat { world, groups, .. } = &mut chat;
+    let member = world.device((A, 0));
+    let commit = incoming(&tls(staged.bundle.commit()))
+        .try_into_protocol_message()
+        .unwrap();
+    let applied = groups
+        .get_mut(&(A, 0))
+        .unwrap()
+        .process_message(&member.provider, commit)
+        .expect("a member applying it late takes it");
+    assert!(matches!(
+        applied.into_content(),
+        ProcessedMessageContent::StagedCommitMessage(_)
+    ));
+
+    chat.discard(staged);
+    let Chat { world, groups, .. } = &mut chat;
+    let owner = world.device((O, 0));
+    let made = groups
+        .get_mut(&(O, 0))
+        .unwrap()
+        .commit_builder()
+        .propose_adds([short])
+        .load_psks(owner.provider.storage())
+        .unwrap()
+        .build(
+            owner.provider.rand(),
+            owner.provider.crypto(),
+            &owner.signer,
+            |_| true,
+        );
+    assert!(made.is_err(), "no member makes it now");
+}
+
 #[test]
 fn create_holds_epoch_zero_to_the_conversations_members() {
     let world = World::new(&[1, 1, 1]);
@@ -1425,4 +1508,71 @@ fn a_state_the_validator_didnt_make_is_answered() {
     let response: Response = ciborium::from_reader(response.as_slice()).unwrap();
     assert!(!response.ok);
     assert_eq!(response.error.unwrap().code, "internal");
+}
+
+/// The requests of a group of 20 people with 10 devices each, its start and a commit (about 190 KB
+/// and 450 KB, its state about 340 KB), fit in `MAX_REQUEST` many times over; one past it is
+/// refused before it's read.
+#[test]
+fn requests_hold_to_the_size_cap() {
+    let world = World::new(&[10; 20]);
+    let everyone: Vec<usize> = (0..20).collect();
+    let members = world.list(Kind::Group, Some(O), &everyone);
+    let joined: Vec<(usize, usize)> = (0..20)
+        .flat_map(|user| (0..10).map(move |device| (user, device)))
+        .filter(|&device| device != (O, 0))
+        .collect();
+    let first = world.first_commit((O, 0), &members, &joined);
+    let create = world.create_request(&first, &members);
+    assert!(encode(&create).len() * 8 < MAX_REQUEST);
+    let created = run(&create);
+    let mut chat = Chat::created(world, first, &created);
+    let staged = chat.stage((A, 0), Commit::default());
+    let commit = chat.request(&staged);
+    assert!(encode(&commit).len() * 8 < MAX_REQUEST);
+    assert!(run(&commit).ok);
+
+    let over = validate_bytes(&vec![0; MAX_REQUEST + 1]);
+    let refused: Response = ciborium::from_reader(over.as_slice()).unwrap();
+    assert_eq!(code(&refused), "too_large");
+}
+
+/// The largest commit request step 3 allows: a group of 20 people with 20 devices each, whose state
+/// takes 4 MiB at most, its group info 1 MiB and the commit 256 KiB, with each user's identity and
+/// list. It's under `MAX_REQUEST`, and read: refused for what it holds (its state is no state), not
+/// for its size.
+#[test]
+fn the_largest_group_s_commit_fits_under_the_cap() {
+    let mut request = Request::new(Op::Commit, CONVERSATION, 0);
+    request.state = Some(ByteBuf::from(vec![0; 4 << 20]));
+    request.new_group_info = Some(ByteBuf::from(vec![0; 1 << 20]));
+    request.message = Some(ByteBuf::from(vec![0; 256 << 10]));
+    for _ in 0..20 {
+        let user = new_id();
+        request.identities.insert(user, ByteBuf::from(vec![0; 32]));
+        // A list of 20 devices, signed, is under 1 KiB.
+        request
+            .device_lists
+            .insert(user, ByteBuf::from(vec![0; 1024]));
+    }
+    let bytes = encode(&request);
+    assert!(bytes.len() <= MAX_REQUEST, "{} bytes", bytes.len());
+    let response: Response = ciborium::from_reader(validate_bytes(&bytes).as_slice()).unwrap();
+    assert_ne!(code(&response), "too_large");
+}
+
+/// A request's `Debug` shows no `signer_key`: the API's private key, the groups' external sender.
+#[test]
+fn debug_leaves_the_api_key_out() {
+    let request = Request {
+        signer_key: Some(ByteBuf::from(vec![0xEE; 32])),
+        leaf_index: Some(1),
+        ..Request::new(Op::ProposeRemove, CONVERSATION, GENERATION)
+    };
+    let shown = format!("{request:?}");
+    assert!(
+        !shown.contains("signer_key") && !shown.contains("238"),
+        "{shown}"
+    );
+    assert!(shown.contains("leaf_index"), "{shown}");
 }
