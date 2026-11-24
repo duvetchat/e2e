@@ -1,10 +1,10 @@
 //! The core's WebAssembly build, run under Node by `wasm-pack test --node` on SQLite's in-memory VFS
-//! (OPFS exists only in a browser's dedicated worker).
+//! (OPFS exists only in a browser's dedicated worker), which `memory-vfs` lets `WasmCore` open.
 
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
 use duvet_e2e::{Core, OpenConfig};
-use duvet_e2e_wasm::WasmCore;
+use duvet_e2e_wasm::{WasmCore, use_memory_vfs};
 use serde_json::Value;
 use sqlite_wasm_rs::vfs::memvfs::MemVfsUtil;
 use sqlite_wasm_rs::vfs::transfer::DbTransfer;
@@ -50,6 +50,7 @@ fn holds(bytes: &[u8], text: &str) -> bool {
 
 #[wasm_bindgen_test]
 fn status_through_wasm() {
+    use_memory_vfs();
     let mut core = WasmCore::open(r#"{"path":"status.db"}"#, &[1; 32]).unwrap();
 
     let status = ok(&mut core, r#"{"cmd":"status"}"#);
@@ -115,6 +116,7 @@ fn sqlcipher_encrypts_in_wasm() {
     assert!(!bytes.starts_with(b"SQLite format 3\0"));
     assert!(!holds(&bytes, WITNESS), "the witness is in the file");
 
+    use_memory_vfs();
     let wrong = WasmCore::open(r#"{"path":"cipher.db"}"#, &[2; 32]).err();
     assert_eq!(wrong.map(code).as_deref(), Some("bad_key"));
 

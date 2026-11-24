@@ -166,9 +166,10 @@ jobs:
           curl -sSfL -o /tmp/wasm-bindgen.tar.gz https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.130/wasm-bindgen-0.2.130-x86_64-unknown-linux-musl.tar.gz
           echo "9687f3bb551b9f66f37ed32a40d7913a00f7962db653054e56857bc306c3227f  /tmp/wasm-bindgen.tar.gz" | sha256sum -c -
           tar -xzf /tmp/wasm-bindgen.tar.gz -C /tmp && install /tmp/wasm-bindgen-0.2.130-x86_64-unknown-linux-musl/wasm-bindgen* /usr/local/bin/
-      # On SQLite's in-memory VFS: OPFS exists only in a browser's dedicated worker. What follows the
-      # path goes to `cargo test` (after a `--` it would go to the tests).
-      - run: wasm-pack test --node crates/duvet-e2e-wasm --locked
+      # On SQLite's in-memory VFS, which `memory-vfs` lets the binding open: OPFS exists only in a
+      # browser's dedicated worker. What follows the path goes to `cargo test` (after a `--` it would
+      # go to the tests).
+      - run: wasm-pack test --node crates/duvet-e2e-wasm --locked --features memory-vfs
 
   # The Flutter plugin: its tests on the core built for this host, then the example's APK, whose
   # Android libraries cargokit builds. On the runner itself, for its Android SDK (and NDK 28).

@@ -8,7 +8,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use duvet_e2e_rules::DeviceList;
 use duvet_e2e_validator::{Response, validate_bytes};
-use duvet_e2e_wasm::WasmCore;
+use duvet_e2e_wasm::{WasmCore, use_memory_vfs};
 use serde_json::{Value, json};
 use wasm_bindgen_test::wasm_bindgen_test;
 
@@ -24,6 +24,8 @@ fn nestings() -> [(&'static str, Vec<u8>); 3] {
 
 #[wasm_bindgen_test]
 fn nesting_is_refused_without_a_trap() {
+    // Node has no OPFS: SQLite's in-memory VFS.
+    use_memory_vfs();
     let mut core = WasmCore::open(r#"{"path":"hostile.db"}"#, &[1; 32]).unwrap();
     for (shape, cbor) in nestings() {
         // The core's: a direct message's header, read before anything checks it.
