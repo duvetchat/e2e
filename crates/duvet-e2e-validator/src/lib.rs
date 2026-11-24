@@ -11,7 +11,7 @@
 mod state;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Display;
+use std::fmt::{self, Display};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use duvet_e2e_rules::{
@@ -60,7 +60,7 @@ pub enum Op {
 }
 
 /// A request, in CBOR. Each operation reads the fields it names, and nothing else.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
     pub v: u32,
     pub op: Op,
@@ -176,6 +176,28 @@ pub struct DeviceLeaf {
     pub user: Uuid,
     pub device: Uuid,
     pub leaf: u32,
+}
+
+/// Every field but the API's private key, `signer_key`.
+impl fmt::Debug for Request {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Request")
+            .field("v", &self.v)
+            .field("op", &self.op)
+            .field("conversation", &self.conversation)
+            .field("generation", &self.generation)
+            .field("state", &self.state)
+            .field("group_info", &self.group_info)
+            .field("message", &self.message)
+            .field("new_group_info", &self.new_group_info)
+            .field("members", &self.members)
+            .field("identities", &self.identities)
+            .field("device_lists", &self.device_lists)
+            .field("leaf_index", &self.leaf_index)
+            .field("external_sender", &self.external_sender)
+            .field("legacy", &self.legacy)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Why a request was refused: a code the API decides by, and a message for people.

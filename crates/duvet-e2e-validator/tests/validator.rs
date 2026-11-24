@@ -1536,3 +1536,19 @@ fn requests_hold_to_the_size_cap() {
     let refused: Response = ciborium::from_reader(over.as_slice()).unwrap();
     assert_eq!(code(&refused), "too_large");
 }
+
+/// A request's `Debug` shows no `signer_key`: the API's private key, the groups' external sender.
+#[test]
+fn debug_leaves_the_api_key_out() {
+    let request = Request {
+        signer_key: Some(ByteBuf::from(vec![0xEE; 32])),
+        leaf_index: Some(1),
+        ..Request::new(Op::ProposeRemove, CONVERSATION, GENERATION)
+    };
+    let shown = format!("{request:?}");
+    assert!(
+        !shown.contains("signer_key") && !shown.contains("238"),
+        "{shown}"
+    );
+    assert!(shown.contains("leaf_index"), "{shown}");
+}

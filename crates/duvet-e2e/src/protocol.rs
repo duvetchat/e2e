@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::{Error, KeyStorage, PROTOCOL, Tx, direct, identity, messages, mls, parts};
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub(crate) enum Command {
     Status,
@@ -106,6 +106,13 @@ pub(crate) enum Command {
     HistoryImport(crate::history::HistoryImport),
     CatchUp(crate::history::CatchUp),
     CatchUpDelivered(crate::history::CatchUpDelivered),
+}
+
+/// A command carries keys, a recovery key and plaintext: its `Debug` shows none of it.
+impl std::fmt::Debug for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Command").finish_non_exhaustive()
+    }
 }
 
 pub(crate) fn parse(command: &str) -> Result<Command, Error> {
@@ -384,6 +391,50 @@ mod tests {
         key: Vec<u8>,
         #[serde(default, with = "b64::option", skip_serializing_if = "Option::is_none")]
         note: Option<Vec<u8>>,
+    }
+
+    /// A command's `Debug` shows no secret: not a recovery key, nor an attachment's key, nor a
+    /// message's text.
+    #[test]
+    fn debug_leaves_secrets_out() {
+        let recovery_key = "DONTPRINTDONTPRINTDONTPRINTDONTPRINTDONTPRINTDONT";
+        let recover = serde_json::json!({
+            "cmd": "recover",
+            "recovery_key": recovery_key,
+            "wrapped_backup_key": "",
+            "encrypted_identity": "",
+            "device_list": "",
+        });
+        let command = super::parse(&recover.to_string()).unwrap();
+        assert!(!format!("{command:?}").contains("DONTPRINT"));
+        let request: crate::identity::Recover = serde_json::from_value(recover).unwrap();
+        assert!(!format!("{request:?}").contains("DONTPRINT"));
+
+        let key = "RE9OVFBSSU5URE9OVFBSSU5URE9OVFBSSU5URE9OVA==";
+        let encrypt = serde_json::json!({
+            "cmd": "attachment_encrypt",
+            "key": key,
+            "attachment_id": "01930000-0000-7000-0000-000000000001",
+            "index": 0,
+            "last": true,
+            "data": "",
+        });
+        let command = super::parse(&encrypt.to_string()).unwrap();
+        let shown = format!("{command:?}");
+        assert!(
+            !shown.contains("68, 79, 78, 84") && !shown.contains(key),
+            "{shown}"
+        );
+
+        let message = serde_json::json!({
+            "cmd": "encrypt",
+            "conversation_id": "01930000-0000-7000-0000-000000000001",
+            "nonce": "n",
+            "envelope": {"text": "DONTPRINT the message"},
+        });
+        let command = super::parse(&message.to_string()).unwrap();
+        let shown = format!("{command:?}");
+        assert!(!shown.contains("DONTPRINT"), "{shown}");
     }
 
     #[test]
