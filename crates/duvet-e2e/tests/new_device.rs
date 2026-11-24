@@ -1579,3 +1579,48 @@ fn new_device_joins_its_groups() {
         }
     }
 }
+
+/// A1 signs version 3 of A's list, and its upload never lands: the server took another device's
+/// version 3, with a new device on it. Observing its own user, A1 takes the server's version 3,
+/// which its identity signed and the server's compare-and-set chose, and its next list builds on
+/// it. Once the server has served A1 its own list, another of that version is a conflict again.
+#[test]
+fn own_list_that_lost_to_another_of_its_version_is_replaced() {
+    let mut server = FakeServer::new();
+    let a = new_id();
+    let (mut a1, identity) = server.first_device(a);
+    let mut a2 = server.device(a);
+    server.introduce(&mut a1);
+    ok(
+        &mut a1.core,
+        json!({"cmd": "sign_device_list", "remove": [a2.id]}),
+    );
+    let a3 = server.device(a);
+
+    let seen = ok(&mut a1.core, server.observed(a));
+    assert_eq!(seen["state"], "same", "{seen}");
+    let identity_key = key32(&bytes(&identity["identity_key"]));
+    let held = a1.rolled_back(|tx| tx.device_list_of(a)).unwrap();
+    assert_eq!((held.version, held.contains(a3.id)), (3, true));
+
+    let other = ok(
+        &mut a2.core,
+        json!({"cmd": "sign_device_list", "remove": []}),
+    );
+    let mut served = server.observed(a);
+    served["device_list"] = other["device_list"].clone();
+    served["certificates"] = json!([]);
+    let refused = ok(&mut a1.core, served);
+    assert_eq!(
+        (&refused["state"], &refused["reason"]),
+        (&json!("rejected"), &json!("conflicting_list"))
+    );
+
+    let next = ok(
+        &mut a1.core,
+        json!({"cmd": "sign_device_list", "remove": []}),
+    );
+    let next = DeviceList::verify(&bytes(&next["device_list"]), &identity_key).unwrap();
+    assert_eq!(next.version, 4);
+    assert!(next.contains(a2.id) && next.contains(a3.id));
+}

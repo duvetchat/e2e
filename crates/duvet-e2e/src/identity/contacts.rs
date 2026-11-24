@@ -8,12 +8,16 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    DEVICE_LIST, from_cbor, invalid, keep_certificates, meta_put, not_found, stored_key, to_cbor,
+    DEVICE_LIST, from_cbor, invalid, keep_certificates, meta_get, meta_put, not_found, stored_key,
+    to_cbor,
 };
 use crate::protocol::b64;
 use crate::{Error, Tx};
 
 const SAFETY_NUMBER_LABEL: &[u8] = b"duvet safety number v1";
+
+/// `meta`'s row for this device's own user's list as the server last served it.
+const SERVED_DEVICE_LIST: &str = "served_device_list";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -149,11 +153,18 @@ pub(crate) fn observe_user(
         if list.version < pinned.list.version {
             return rejected("older_list");
         }
-        if !list.accepts_after(Some(&pinned.list)) {
+        // This device's own list, of a version the server holds another of, which the identity
+        // signed: the server's compare-and-set chose that one, and this one's upload never landed.
+        // Once the server has served this device its list, another of that version is a conflict.
+        let lost = own
+            && list.version == pinned.list.version
+            && !served_own(tx, &identity_key, &pinned.list)?;
+        if !list.accepts_after(Some(&pinned.list)) && !lost {
             return rejected("conflicting_list");
         }
         if own {
             meta_put(tx, DEVICE_LIST, device_list)?;
+            meta_put(tx, SERVED_DEVICE_LIST, device_list)?;
         } else {
             tx.conn().execute(
                 "UPDATE contacts SET device_list = ?2, list_version = ?3, updated_at = ?4 \
@@ -204,6 +215,13 @@ pub(crate) fn observe_user(
         verified: false,
         reason: None,
     })
+}
+
+/// Whether the server has served this device `list`, its own user's list, under `identity_key`.
+fn served_own(tx: &Tx<'_>, identity_key: &[u8; 32], list: &DeviceList) -> Result<bool, Error> {
+    Ok(meta_get(tx, SERVED_DEVICE_LIST)?
+        .and_then(|served| DeviceList::verify(&served, identity_key).ok())
+        .is_some_and(|served| served == *list))
 }
 
 fn pinned(tx: &Tx<'_>, user: Uuid) -> Result<Option<Pinned>, Error> {
