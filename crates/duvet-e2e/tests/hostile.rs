@@ -2,7 +2,8 @@
 //! nested 10 000 levels deep, or declaring 4 GiB it doesn't hold, in each format a device reads from
 //! the server or a member; a ciphertext over 32 KiB; a history package that inflates to 1 GiB; and
 //! a package's parts beyond what a package holds. Each is refused, or for the ciphertext kept unread,
-//! in less than a second and holding less than 64 MiB while it's read.
+//! in less than a second (ten for a command of more than a MiB) and holding less than 64 MiB while
+//! it's read.
 //!
 //! A binary of its own, its tests one at a time: the counting allocator measures the whole binary.
 
@@ -52,10 +53,15 @@ fn hostile_cbor() -> Vec<(&'static str, Vec<u8>)> {
 /// What `read` returns. It must end in less than a second, holding less than 64 MiB beyond what was
 /// held as it began, SQLite's included.
 fn bounded<T>(what: &str, read: impl FnOnce() -> T) -> T {
+    bounded_within(what, Duration::from_secs(1), read)
+}
+
+/// `bounded`, ending within `limit`.
+fn bounded_within<T>(what: &str, limit: Duration, read: impl FnOnce() -> T) -> T {
     let started = Instant::now();
     let (out, held, sqlite) = peak_during(read);
     let took = started.elapsed();
-    assert!(took < Duration::from_secs(1), "{what} took {took:?}");
+    assert!(took < limit, "{what} took {took:?}");
     assert!(
         held + sqlite < 64 * MIB,
         "{what} held {} MiB",
@@ -64,9 +70,13 @@ fn bounded<T>(what: &str, read: impl FnOnce() -> T) -> T {
     out
 }
 
-/// The error of `command` on `core`, within the bounds, whose code must be `code`.
+/// The error of `command` on `core`, within the bounds, whose code must be `code`. A command of more
+/// than a MiB has ten seconds: a debug build decrypts and decodes its megabytes before it refuses
+/// them, which took 1.5 s on a shared runner (#42). The memory bound is what keeps a bomb out; the
+/// time catches a hang.
 fn refused(core: &mut Core, what: &str, command: &str, code: &str) -> Value {
-    let reply = bounded(what, || core.handle(command));
+    let limit = Duration::from_secs(if command.len() > MIB { 10 } else { 1 });
+    let reply = bounded_within(what, limit, || core.handle(command));
     let reply: Value = serde_json::from_str(&reply).unwrap();
     assert_eq!(reply["error"]["code"], code, "{what}: {reply}");
     reply["error"].clone()
