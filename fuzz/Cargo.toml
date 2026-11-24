@@ -23,6 +23,10 @@ uuid = { version = "1", default-features = false, features = ["std"] }
 # build it.
 [workspace]
 
+# The workspace's vendored OpenMLS (vendor/README.md), as the core is built with it.
+[patch.crates-io]
+openmls = { path = "../vendor/openmls" }
+
 [[bin]]
 name = "envelope"
 path = "fuzz_targets/envelope.rs"

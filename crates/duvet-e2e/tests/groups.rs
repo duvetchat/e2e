@@ -2208,3 +2208,63 @@ fn a_leaf_from_before_its_user_started_over_applies_late() {
     assert_eq!(state["epoch"], 3);
     assert_eq!(device_set(&state), BTreeSet::from([a1.id, c1.id]));
 }
+
+/// A1 adds C with a key package that lasts seconds, which the server's validator takes, while B1 is
+/// away. B1 applies the commit once that key package has expired: the validator checked its
+/// lifetime when it took the commit, and B1 takes it without blocking.
+#[test]
+fn a_commit_applied_after_its_key_package_expired_applies() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let mut a1 = server.device(a);
+    let mut b1 = server.device(b);
+    let _c1 = server.device(c);
+    // C's device whose key package ends in seconds: OpenMLS reads the system's clock, which the test
+    // can't move.
+    let short_lived = server.virtual_device(c);
+    for device in [&mut a1, &mut b1] {
+        server.publish(device);
+    }
+    for device in [&mut a1, &mut b1] {
+        server.introduce(device);
+    }
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    let key_package = server.virtual_key_package(short_lived, 5);
+    let ends = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 5;
+    let add = json!({
+        "cmd": "add_members",
+        "conversation_id": conversation,
+        "users": [{"user_id": c, "key_packages": [key_package]}],
+    });
+    server.commit(&mut a1, conversation, add).unwrap();
+    server.deliver(&mut a1);
+    while SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        <= ends
+    {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let taken = server.deliver(&mut b1);
+    assert_eq!(
+        results(&taken),
+        [
+            json!([3, "commit", "applied", null]),
+            json!([4, "welcome", "ignored", null]),
+        ]
+    );
+    assert_eq!(b1.group(conversation)["blocked"], false);
+    let state = same_group(&mut [&mut a1, &mut b1], conversation);
+    assert_eq!(state["epoch"], 2);
+    assert!(device_set(&state).contains(&short_lived));
+}

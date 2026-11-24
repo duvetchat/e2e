@@ -1,0 +1,172 @@
+diff -ruN a/src/group/mls_group/commit_builder.rs b/src/group/mls_group/commit_builder.rs
+--- a/src/group/mls_group/commit_builder.rs
++++ b/src/group/mls_group/commit_builder.rs
+@@ -754,7 +754,10 @@
+             .public_group
+             .validate_key_uniqueness(&proposal_queue, None)?;
+         // ValSem105
+-        group.public_group.validate_add_proposals(&proposal_queue)?;
++        group.public_group.validate_add_proposals(
++            &proposal_queue,
++            super::creation::LeafNodeLifetimePolicy::Verify,
++        )?;
+         // ValSem106
+         // ValSem109
+         group.public_group.validate_capabilities(&proposal_queue)?;
+diff -ruN a/src/group/mls_group/staged_commit.rs b/src/group/mls_group/staged_commit.rs
+--- a/src/group/mls_group/staged_commit.rs
++++ b/src/group/mls_group/staged_commit.rs
+@@ -229,7 +229,11 @@
+     ) -> Result<StagedCommit, StageCommitError> {
+         let (commit, proposal_queue, sender_index) = self
+             .public_group
+-            .validate_commit(mls_content, provider.crypto())?;
++            .validate_commit(
++                mls_content,
++                provider.crypto(),
++                super::creation::LeafNodeLifetimePolicy::Skip,
++            )?;
+ 
+         // Create the provisional public group state (including the tree and
+         // group context) and apply proposals.
+@@ -275,7 +279,11 @@
+     ) -> Result<StagedCommit, StageCommitError> {
+         let (commit, proposal_queue, sender_index) = self
+             .public_group
+-            .validate_commit(mls_content, provider.crypto())?;
++            .validate_commit(
++                mls_content,
++                provider.crypto(),
++                super::creation::LeafNodeLifetimePolicy::Skip,
++            )?;
+ 
+         // Create the provisional public group state (including the tree and
+         // group context) and apply proposals.
+diff -ruN a/src/group/public_group/staged_commit.rs b/src/group/public_group/staged_commit.rs
+--- a/src/group/public_group/staged_commit.rs
++++ b/src/group/public_group/staged_commit.rs
+@@ -2,7 +2,9 @@
+ use crate::{
+     framing::{mls_auth_content::AuthenticatedContent, mls_content::FramedContentBody, Sender},
+     group::{
+-        mls_group::staged_commit::StagedCommitState, proposal_store::ProposalQueue, StagedCommit,
++        mls_group::{creation::LeafNodeLifetimePolicy, staged_commit::StagedCommitState},
++        proposal_store::ProposalQueue,
++        StagedCommit,
+     },
+     messages::{
+         proposals::{ProposalOrRef, ProposalType},
+@@ -50,6 +52,7 @@
+         &self,
+         mls_content: &'a AuthenticatedContent,
+         crypto: &impl OpenMlsCrypto,
++        validate_lifetimes: LeafNodeLifetimePolicy,
+     ) -> Result<(&'a Commit, ProposalQueue, LeafNodeIndex), StageCommitError> {
+         let ciphersuite = self.ciphersuite();
+ 
+@@ -173,7 +176,7 @@
+         // ValSem104
+         self.validate_key_uniqueness(&proposal_queue, Some(commit))?;
+         // ValSem105
+-        self.validate_add_proposals(&proposal_queue)?;
++        self.validate_add_proposals(&proposal_queue, validate_lifetimes)?;
+         // ValSem106
+         // ValSem109
+         self.validate_capabilities(&proposal_queue)?;
+@@ -291,7 +294,8 @@
+         mls_content: &AuthenticatedContent,
+         crypto: &impl OpenMlsCrypto,
+     ) -> Result<StagedCommit, StageCommitError> {
+-        let (commit, proposal_queue, sender_index) = self.validate_commit(mls_content, crypto)?;
++        let (commit, proposal_queue, sender_index) =
++            self.validate_commit(mls_content, crypto, LeafNodeLifetimePolicy::Verify)?;
+ 
+         let staged_diff = self.stage_diff(mls_content, &proposal_queue, sender_index, crypto)?;
+         let staged_state = PublicStagedCommitState {
+@@ -316,7 +320,8 @@
+         crypto: &impl OpenMlsCrypto,
+         app_data_dict_updates: Option<AppDataUpdates>,
+     ) -> Result<StagedCommit, StageCommitError> {
+-        let (commit, proposal_queue, sender_index) = self.validate_commit(mls_content, crypto)?;
++        let (commit, proposal_queue, sender_index) =
++            self.validate_commit(mls_content, crypto, LeafNodeLifetimePolicy::Verify)?;
+ 
+         let staged_diff = self.stage_diff_with_app_data_updates(
+             mls_content,
+diff -ruN a/src/group/public_group/validation.rs b/src/group/public_group/validation.rs
+--- a/src/group/public_group/validation.rs
++++ b/src/group/public_group/validation.rs
+@@ -372,6 +372,7 @@
+     pub(crate) fn validate_add_proposals(
+         &self,
+         proposal_queue: &ProposalQueue,
++        validate_lifetimes: LeafNodeLifetimePolicy,
+     ) -> Result<(), ProposalValidationError> {
+         let add_proposals = proposal_queue.add_proposals();
+ 
+@@ -402,7 +403,10 @@
+             }
+ 
+             // https://validation.openmls.tech/#valn0202
+-            self.validate_leaf_node(add_proposal.add_proposal().key_package().leaf_node())?;
++            self.validate_leaf_node_inner(
++                add_proposal.add_proposal().key_package().leaf_node(),
++                validate_lifetimes,
++            )?;
+         }
+         Ok(())
+     }
+diff -ruN a/src/key_packages/key_package_in.rs b/src/key_packages/key_package_in.rs
+--- a/src/key_packages/key_package_in.rs
++++ b/src/key_packages/key_package_in.rs
+@@ -138,6 +138,21 @@
+         crypto: &impl OpenMlsCrypto,
+         protocol_version: ProtocolVersion,
+     ) -> Result<KeyPackage, KeyPackageVerifyError> {
++        self.validate_with_lifetime(
++            crypto,
++            protocol_version,
++            crate::group::LeafNodeLifetimePolicy::Verify,
++        )
++    }
++
++    /// [`KeyPackageIn::validate`], its lifetime checked as `validate_lifetimes` says: a key package
++    /// without one is refused either way.
++    pub(crate) fn validate_with_lifetime(
++        self,
++        crypto: &impl OpenMlsCrypto,
++        protocol_version: ProtocolVersion,
++        validate_lifetimes: crate::group::LeafNodeLifetimePolicy,
++    ) -> Result<KeyPackage, KeyPackageVerifyError> {
+         // We first need to verify the LeafNode inside the KeyPackage
+         let leaf_node = self.payload.leaf_node.clone().into_verifiable_leaf_node();
+ 
+@@ -193,7 +208,9 @@
+ 
+         // Ensure validity of the life time extension in the leaf node.
+         if let Some(life_time) = key_package.payload.leaf_node.life_time() {
+-            life_time.validate()?;
++            if validate_lifetimes == crate::group::LeafNodeLifetimePolicy::Verify {
++                life_time.validate()?;
++            }
+         } else {
+             // This assumes that we only verify key packages with leaf nodes
+             // that were created for the key package.
+diff -ruN a/src/messages/proposals_in.rs b/src/messages/proposals_in.rs
+--- a/src/messages/proposals_in.rs
++++ b/src/messages/proposals_in.rs
+@@ -174,7 +174,13 @@
+         protocol_version: ProtocolVersion,
+         ciphersuite: Ciphersuite,
+     ) -> Result<AddProposal, ValidationError> {
+-        let key_package = self.key_package.validate(crypto, protocol_version)?;
++        // Its lifetime is checked as the proposal is staged (`validate_add_proposals`), which a
++        // member processing a received commit skips.
++        let key_package = self.key_package.validate_with_lifetime(
++            crypto,
++            protocol_version,
++            crate::group::LeafNodeLifetimePolicy::Skip,
++        )?;
+         // Verify that the ciphersuite is valid
+         if key_package.ciphersuite() != ciphersuite {
+             return Err(ValidationError::InvalidAddProposalCiphersuite);

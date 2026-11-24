@@ -898,6 +898,87 @@ fn stale_never_updated_leaf_does_not_block() {
     assert_eq!(renewed.epoch, Some(3), "{:?}", renewed.error);
 }
 
+/// The workspace's OpenMLS lets a member apply a commit whose added key package expired after the
+/// validator took it (vendor/README.md). The validator, which checks each commit as it comes, still
+/// holds that key package to its lifetime, and so does a member making such a commit.
+#[test]
+fn an_added_key_package_expires_for_the_validator_not_for_a_member_applying_late() {
+    let mut chat = Chat::group();
+    let not_after = now() + 5;
+    let short = chat
+        .world
+        .device((C, 0))
+        .key_package_with(Lifetime::init(now() - 60, not_after));
+    let members = adding(&chat.list(), chat.id(C), chat.epoch + 1);
+    let Chat { world, groups, .. } = &mut chat;
+    let owner = world.device((O, 0));
+    let group = groups.get_mut(&(O, 0)).unwrap();
+    let mut extensions = group.public_group().group_context().extensions().clone();
+    extensions.add_or_replace(members.to_extension()).unwrap();
+    group.set_aad(CommitAad::new(Vec::new()).encode());
+    let bundle = group
+        .commit_builder()
+        .propose_adds([short.clone()])
+        .force_self_update(true)
+        .propose_group_context_extensions(extensions)
+        .unwrap()
+        .load_psks(owner.provider.storage())
+        .unwrap()
+        .build(
+            owner.provider.rand(),
+            owner.provider.crypto(),
+            &owner.signer,
+            |_| true,
+        )
+        .unwrap()
+        .stage_commit(&owner.provider)
+        .unwrap();
+    let staged = Staged {
+        by: (O, 0),
+        bundle,
+        joined: vec![(C, 0)],
+        joiner: None,
+    };
+    assert!(run(&chat.request(&staged)).ok, "taken while it holds");
+    while now() <= not_after {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    assert_eq!(code(&run(&chat.request(&staged))), "invalid_commit");
+    let Chat { world, groups, .. } = &mut chat;
+    let member = world.device((A, 0));
+    let commit = incoming(&tls(staged.bundle.commit()))
+        .try_into_protocol_message()
+        .unwrap();
+    let applied = groups
+        .get_mut(&(A, 0))
+        .unwrap()
+        .process_message(&member.provider, commit)
+        .expect("a member applying it late takes it");
+    assert!(matches!(
+        applied.into_content(),
+        ProcessedMessageContent::StagedCommitMessage(_)
+    ));
+
+    chat.discard(staged);
+    let Chat { world, groups, .. } = &mut chat;
+    let owner = world.device((O, 0));
+    let made = groups
+        .get_mut(&(O, 0))
+        .unwrap()
+        .commit_builder()
+        .propose_adds([short])
+        .load_psks(owner.provider.storage())
+        .unwrap()
+        .build(
+            owner.provider.rand(),
+            owner.provider.crypto(),
+            &owner.signer,
+            |_| true,
+        );
+    assert!(made.is_err(), "no member makes it now");
+}
+
 #[test]
 fn create_holds_epoch_zero_to_the_conversations_members() {
     let world = World::new(&[1, 1, 1]);
