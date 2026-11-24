@@ -107,6 +107,19 @@ pub(crate) fn identity_uploaded(tx: &mut Tx<'_>) -> Result<Empty, Error> {
     Ok(Empty {})
 }
 
+/// The identity command whose reply waits for `identity_uploaded`, if one does, which run again
+/// hands that reply out again: `rotate_keys` for a rotation's, `create_identity` for any other
+/// (`reset_identity` is the same command there).
+pub(crate) fn waiting_upload(tx: &Tx<'_>) -> Result<Option<&'static str>, Error> {
+    Ok(kept(tx)?.map(|kept| {
+        if kept.rotation.is_some() {
+            "rotate_keys"
+        } else {
+            "create_identity"
+        }
+    }))
+}
+
 /// Drops what the last identity command kept for its upload, if anything: whether it did.
 pub(super) fn drop_kept(tx: &Tx<'_>) -> Result<bool, Error> {
     let deleted = tx

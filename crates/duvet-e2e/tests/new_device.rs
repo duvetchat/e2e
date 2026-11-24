@@ -1687,6 +1687,24 @@ fn own_list_confirmed_as_uploaded_gives_way_to_none_of_its_version() {
     );
 }
 
+/// `status` names the identity command whose reply waits for `identity_uploaded`, which run again
+/// hands it out again: a client that restarted knows it without asking the server. Once confirmed,
+/// none waits.
+#[test]
+fn status_names_the_reply_that_waits_for_its_upload() {
+    let mut server = FakeServer::new();
+    let a = new_id();
+    let (mut a1, _) = server.first_device(a);
+    assert_eq!(status(&mut a1)["waiting_upload"], "create_identity");
+    ok(&mut a1.core, json!({"cmd": "identity_uploaded"}));
+    assert_eq!(status(&mut a1).get("waiting_upload"), None);
+
+    ok(&mut a1.core, json!({"cmd": "rotate_keys", "remove": []}));
+    assert_eq!(status(&mut a1)["waiting_upload"], "rotate_keys");
+    ok(&mut a1.core, json!({"cmd": "identity_uploaded"}));
+    assert_eq!(status(&mut a1).get("waiting_upload"), None);
+}
+
 /// What an identity command made, its reply lost before the upload, can be had again: a recovered
 /// device's certificate and its user's list from `status`; `create_identity`'s and
 /// `reset_identity`'s recovery key and blobs from the same command run again, until the client

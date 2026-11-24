@@ -232,6 +232,10 @@ struct Status {
     certificate: Option<Vec<u8>>,
     #[serde(with = "b64::option", skip_serializing_if = "Option::is_none")]
     device_list: Option<Vec<u8>>,
+    /// The identity command whose reply waits for `identity_uploaded`: run again, it hands that
+    /// reply out again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waiting_upload: Option<&'static str>,
     has_identity: bool,
     key_storage: KeyStorage,
 }
@@ -258,6 +262,7 @@ fn cmd_status(tx: &mut Tx<'_>) -> Result<Status, Error> {
     };
     let identity_key = meta("identity_key")?;
     let device_list = meta("device_list")?;
+    let waiting_upload = identity::waiting_upload(tx)?;
     let uuid =
         |bytes: &[u8]| Uuid::from_slice(bytes).map_err(|error| Error::Internal(error.to_string()));
     Ok(Status {
@@ -270,6 +275,7 @@ fn cmd_status(tx: &mut Tx<'_>) -> Result<Status, Error> {
             .transpose()?,
         certificate,
         device_list,
+        waiting_upload,
         has_identity: identity_key.is_some(),
         identity_key,
         key_storage: tx.key_storage(),
