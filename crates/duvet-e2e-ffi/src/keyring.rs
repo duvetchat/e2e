@@ -838,6 +838,105 @@ mod tests {
         assert!(!dir.path().join("gone").exists());
     }
 
+    /// A mock entry whose deletion pauses once it says so: a destroy holding its locks meanwhile.
+    struct DeletePauses<'a> {
+        entry: Entry,
+        deleting: &'a AtomicBool,
+    }
+
+    impl KeyStore for DeletePauses<'_> {
+        fn get(&self) -> keyring_core::Result<Vec<u8>> {
+            self.entry.get_secret()
+        }
+
+        fn set(&self, key: &[u8]) -> keyring_core::Result<()> {
+            self.entry.set_secret(key)
+        }
+
+        fn delete(&self) -> keyring_core::Result<()> {
+            self.deleting.store(true, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(500));
+            self.entry.delete_credential()
+        }
+    }
+
+    #[test]
+    fn destroy_keeps_its_locks_while_an_open_runs() {
+        let store = mock_store();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.db");
+        let first = AtomicBool::new(true);
+        thread::scope(|scope| {
+            // A first open, paused while it chooses its key under `<path>.key.lock`.
+            let opening = scope.spawn(|| {
+                open_with(
+                    &path,
+                    Ok(FirstReadPauses {
+                        entry: entry_in(&store),
+                        first: &first,
+                    }),
+                )
+            });
+            while first.load(Ordering::SeqCst) {
+                thread::yield_now();
+            }
+            // Destroy waits for that open to end, and finds its core holding the database.
+            let error = destroy_with(&path, Some(Ok(entry_in(&store)))).unwrap_err();
+            assert_eq!(error.code(), "locked");
+            opening.join().unwrap().unwrap().close();
+        });
+        // Nothing went: the key the open chose opens its database.
+        let chosen = entry_in(&store).get_secret().unwrap();
+        Core::open(OpenConfig::new(&path, key_from(&chosen).unwrap()))
+            .expect("the key opens the database")
+            .close();
+
+        let deleting = AtomicBool::new(false);
+        thread::scope(|scope| {
+            // A destroy, paused as it deletes the key, with both locks held.
+            let destroying = scope.spawn(|| {
+                destroy_with(
+                    &path,
+                    Some(Ok(DeletePauses {
+                        entry: entry_in(&store),
+                        deleting: &deleting,
+                    })),
+                )
+            });
+            while !deleting.load(Ordering::SeqCst) {
+                thread::yield_now();
+            }
+            // An open with `db_key` takes no `<path>.key.lock`: locked.
+            let refused = Core::open(OpenConfig::new(&path, [1; 32])).err();
+            assert_eq!(refused.expect("locked").code(), "locked");
+            // One through the keyring waits for the destroy, then makes a new database.
+            open_with(&path, Ok(entry_in(&store)))
+                .expect("an open after the destroy")
+                .close();
+            destroying.join().unwrap().unwrap();
+        });
+        assert_ne!(entry_in(&store).get_secret().unwrap(), chosen);
+    }
+
+    #[test]
+    fn a_destroy_whose_keyring_cant_be_reached_deletes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.db");
+        Core::open(OpenConfig::new(&path, [1; 32])).unwrap().close();
+        let before = files_in(dir.path());
+
+        let unreachable: Result<Entry, NoKeyring> = Err(NoKeyring::Failed(
+            keyring_core::Error::PlatformFailure("no keyring answers".into()),
+        ));
+        let destroyed = destroy_with(&path, Some(unreachable));
+        // The database and its files are as they were: its key may be the keyring's.
+        assert_eq!(files_in(dir.path()), before);
+        assert_eq!(
+            destroyed.unwrap_err().to_string(),
+            "storage: the system keyring failed"
+        );
+    }
+
     #[cfg(secret_service)]
     #[test]
     fn file_key_is_private_and_read_back() {
