@@ -403,19 +403,30 @@ impl Chat {
 
     /// The group once the validator took `first`.
     fn created(world: World, first: First, created: &Response) -> Chat {
+        let joined = first.joined.clone();
+        Chat::created_for(world, first, created, &joined)
+    }
+
+    /// As [`Chat::created`], with only `taking` of the devices `first` added taking their welcome:
+    /// in a large group, the devices a test makes commits with.
+    fn created_for(
+        world: World,
+        first: First,
+        created: &Response,
+        taking: &[(usize, usize)],
+    ) -> Chat {
         assert!(created.ok, "create refused: {:?}", created.error);
         let First {
             creator,
             mut group,
             bundle,
-            joined,
             ..
         } = first;
         group
             .merge_pending_commit(&world.device(creator).provider)
             .unwrap();
         let mut groups = BTreeMap::from([(creator, group)]);
-        for joiner in joined {
+        for &joiner in taking {
             let welcome = bundle.welcome().expect("a welcome");
             groups.insert(joiner, welcomed(world.device(joiner), welcome));
         }
@@ -1054,6 +1065,50 @@ fn create_holds_epoch_zero_to_the_conversations_members() {
     );
 }
 
+/// A conversation from before the cutover keeps its people past 20 (ruling 38): the validator takes
+/// its epoch 0 with all 22 when the API says it's from before the cutover, then its members'
+/// commits, but not one that brings someone in while it's past 20. As a new group it's refused.
+#[test]
+fn a_legacy_group_past_20_keeps_its_members() {
+    // O, A with a second device outside, B, and C outside; 19 people with no device yet.
+    let mut devices = vec![1, 2, 1, 1];
+    devices.extend([0; 19]);
+    let world = World::new(&devices);
+    let everyone: Vec<usize> = (0..devices.len()).filter(|&user| user != C).collect();
+    let members = world.list(Kind::Group, Some(O), &everyone);
+    let first = world.first_commit((A, 0), &members, &[(O, 0), (B, 0)]);
+    let mut create = world.create_request(&first, &members);
+    assert_eq!(code(&run(&create)), "too_many_members");
+    create.legacy = true;
+    let created = run(&create);
+    let mut chat = Chat::created(world, first, &created);
+
+    // A renews its leaf, A's second device joins, and O takes B out: 21 stay...
+    let renewed = chat.submit((A, 0), Commit::default());
+    assert!(renewed.ok, "{:?}", renewed.error);
+    let staged = chat.join_external((A, 1));
+    let joined = run(&chat.request(&staged));
+    chat.accept(staged, &joined);
+    let mut without_b = chat.list();
+    without_b.users.retain(|entry| entry.user != chat.id(B));
+    let removal = Commit {
+        removes: vec![(B, 0)],
+        members: Some(without_b),
+        ..Commit::default()
+    };
+    let removed = chat.submit((O, 0), removal);
+    assert!(removed.ok, "{:?}", removed.error);
+    assert_eq!(chat.list().users.len(), 21);
+
+    // ...and no one comes in while the group is past 20.
+    let adds_c = Commit {
+        adds: vec![(C, 0)],
+        members: Some(adding(&chat.list(), chat.id(C), chat.epoch + 1)),
+        ..Commit::default()
+    };
+    assert_eq!(code(&chat.submit((O, 0), adds_c)), "too_many_members");
+}
+
 #[test]
 fn create_names_its_conversation_and_generation() {
     let world = World::new(&[1, 1]);
@@ -1559,6 +1614,81 @@ fn the_largest_group_s_commit_fits_under_the_cap() {
     assert!(bytes.len() <= MAX_REQUEST, "{} bytes", bytes.len());
     let response: Response = ciborium::from_reader(validate_bytes(&bytes).as_slice()).unwrap();
     assert_ne!(code(&response), "too_large");
+}
+
+/// What groups from before the cutover past 20 people send the validator (ruling 38), for step 6 to
+/// count production's groups by: the request of their start, with the welcome the API keeps beside
+/// it, and those of the widest commits, made right after it, while no parent node of the tree is
+/// filled yet: an update by a member who didn't make the start (its path is encrypted to every
+/// other leaf), a member's new device joining by external commit, and the owner taking one person
+/// out. Each request's size against `MAX_REQUEST`, with its parts the API caps on their own (the
+/// state, the group info and the commit) and the validator's verdict.
+#[test]
+#[ignore = "measures legacy groups' requests: run it with --ignored --nocapture"]
+fn legacy_groups_requests_against_the_cap() {
+    let parts = |what: &str, request: &Request, response: &Response| {
+        let size = |bytes: &Option<ByteBuf>| bytes.as_ref().map_or(0, |bytes| bytes.len());
+        let verdict = match &response.error {
+            None => "taken",
+            Some(error) => error.code.as_str(),
+        };
+        println!(
+            "  {what}: request {} B ({verdict}): state {} B, group info {} B, commit {} B; state after {} B",
+            encode(request).len(),
+            size(&request.state),
+            size(&request.new_group_info),
+            size(&request.message),
+            size(&response.state),
+        );
+        encode(request).len()
+    };
+    for (people, devices) in [(25, 3), (40, 3), (60, 3), (25, 20), (40, 20), (60, 20)] {
+        println!(
+            "{people} people x {devices} devices ({} leaves)",
+            people * devices
+        );
+        // A has one device more, outside the group, to join by external commit.
+        let mut counts = vec![devices; people];
+        counts[A] += 1;
+        let world = World::new(&counts);
+        let everyone: Vec<usize> = (0..people).collect();
+        let members = world.list(Kind::Group, Some(O), &everyone);
+        let joined: Vec<(usize, usize)> = (0..people)
+            .flat_map(|user| (0..devices).map(move |device| (user, device)))
+            .filter(|&device| device != (O, 0))
+            .collect();
+        let first = world.first_commit((O, 0), &members, &joined);
+        let welcome = tls(&first.bundle.to_welcome_msg().unwrap());
+        println!("  start's welcome: {} B", welcome.len());
+        let mut create = world.create_request(&first, &members);
+        create.legacy = true;
+        let created = run(&create);
+        let mut largest = parts("start", &create, &created);
+        let mut chat = Chat::created_for(world, first, &created, &[(A, 0)]);
+
+        let staged = chat.stage((A, 0), Commit::default());
+        let update = chat.request(&staged);
+        largest = largest.max(parts("update", &update, &run(&update)));
+        chat.discard(staged);
+        let staged = chat.join_external((A, devices));
+        let join = chat.request(&staged);
+        largest = largest.max(parts("external join", &join, &run(&join)));
+        let last = people - 1;
+        let mut without = chat.list();
+        without.users.retain(|entry| entry.user != chat.id(last));
+        let removal = Commit {
+            removes: (0..devices).map(|device| (last, device)).collect(),
+            members: Some(without),
+            ..Commit::default()
+        };
+        let staged = chat.stage((O, 0), removal);
+        let removal = chat.request(&staged);
+        largest = largest.max(parts("removal", &removal, &run(&removal)));
+        println!(
+            "  largest request {largest} B, {:.1}% of MAX_REQUEST",
+            largest as f64 * 100.0 / MAX_REQUEST as f64
+        );
+    }
 }
 
 /// A request's `Debug` shows no `signer_key`: the API's private key, the groups' external sender.
