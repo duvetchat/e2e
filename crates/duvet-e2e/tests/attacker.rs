@@ -1389,14 +1389,6 @@ fn server_drops_pending_removal() {
     );
 }
 
-/// The server changes bytes of what it hands out: a message's ciphertext at every seventh byte and
-/// at its last, a commit's and a welcome's. A message changed anywhere opens to nothing, and waits
-/// as one that can't be read, never showing other text; the message as it was sent then fills it.
-/// A changed commit is refused, and its group waits for a reset, as a server that withholds the
-/// queue makes it wait; a changed welcome is refused, and the welcome as it was made then brings
-/// its device in.
-/// Every other format holds the same against changes: `formats.rs` (envelopes, attachments' parts,
-/// messages between devices), `backup.rs` (segments) and `history.rs` (packages).
 /// A DM of A and B whose group A1 made under a key the server made, in place of the API's, which
 /// the server took past its validator: a server that hands out groups whose external sender is
 /// its own key, which proposes removals there. Its welcome is entry 2, and the creation's reply
@@ -1492,6 +1484,14 @@ fn join_external_refuses_another_external_sender() {
     assert!(joined["commit"].is_string());
 }
 
+/// The server changes bytes of what it hands out: a message's ciphertext at every seventh byte and
+/// at its last, a commit's and a welcome's. A message changed anywhere opens to nothing, and waits
+/// as one that can't be read, never showing other text; the message as it was sent then fills it.
+/// A changed commit is refused, and its group waits for a reset, as a server that withholds the
+/// queue makes it wait; a changed welcome is refused, and the welcome as it was made then brings
+/// its device in.
+/// Every other format holds the same against changes: `formats.rs` (envelopes, attachments' parts,
+/// messages between devices), `backup.rs` (segments) and `history.rs` (packages).
 #[test]
 fn server_changes_ciphertext() {
     let mut server = FakeServer::new();

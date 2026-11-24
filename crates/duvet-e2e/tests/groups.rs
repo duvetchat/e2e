@@ -271,8 +271,6 @@ fn own_commit_answered_refused_settles_from_the_queue() {
     server.commit(&mut b1, conversation, refresh).unwrap();
 }
 
-/// A conversation of A, with A1 and A2, and of B, with B1, every device in the group; then the API
-/// proposes A2's removal, which no device has applied yet.
 /// `apply`'s `commit_due` with no entries, as a client reads it after observing a user.
 fn commit_due(device: &mut TestDevice, conversation: Uuid) -> Value {
     ok(&mut device.core, apply(conversation, &[]))["commit_due"].clone()
@@ -353,6 +351,8 @@ fn apply_says_when_a_commit_is_due() {
     assert!(!device_set(&a1.group(conversation)).contains(&b3.id));
 }
 
+/// A conversation of A, with A1 and A2, and of B, with B1, every device in the group; then the API
+/// proposes A2's removal, which no device has applied yet.
 fn removal_on_its_way(server: &mut FakeServer) -> (Uuid, Uuid, [TestDevice; 3]) {
     let (a, b) = (new_id(), new_id());
     let [mut a1, mut a2, mut b1] = new_devices(server, [a, a, b]);
