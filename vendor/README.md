@@ -6,7 +6,9 @@ The crate as crates.io publishes it (checksum `ce4173f914cbc2dd28d9499f19e92f3e1
 upstream commit `8a8f83b4b61fc45f28facec25e914992b3465de6`, as its `.cargo_vcs_info.json` says), plus
 `openmls-received-commit-lifetimes.patch` and a `LICENSE` file (the published crate ships none; OpenMLS is
 MIT, © 2020 OpenMLS Authors). `Cargo.toml` and `fuzz/Cargo.toml` put it in place of the registry's with
-`[patch.crates-io]`, and the workspace excludes it, so its own tests and lints aren't the workspace's.
+`[patch.crates-io]`, and the workspace excludes it, so its own tests and lints aren't the workspace's. CI's
+`deny` job holds it to that: it fetches the crate from crates.io by that checksum, applies the patch, and
+fails on any other difference but `LICENSE`.
 
 ### What changed
 
@@ -42,6 +44,7 @@ OpenMLS has no switch for it on `process_message`: its welcomes and external com
    `an_added_key_package_expires_for_the_validator_not_for_a_member_applying_late`
    (`crates/duvet-e2e-validator/tests/validator.rs`): the first fails without the change, the second if the
    validator or the commit builder lose the check.
-4. Refresh the patch (`diff -ruN` of the published crate against this copy) and both lock files.
+4. Refresh the patch (`diff -ruN` of the published crate against this copy), both lock files, and the
+   version and checksum in CI's step (`vendor/openmls is the published crate plus its patch`).
 
 Drop the copy once OpenMLS offers the switch on processing a message.
