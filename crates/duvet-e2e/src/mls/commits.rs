@@ -18,8 +18,8 @@ use super::members::Committed;
 use super::{
     ConversationId, EXTERNAL_SENDER_MISMATCH, Extra, GroupRow, Pending, REFRESH_AFTER_MS, api_key,
     can_commit, certify_leaves_by_pinned, delete_group, digest, draft, load_group, note_removed,
-    openmls_error, own_merged, rule_context, stage, storage_error, stored_group, stored_state, tls,
-    unlisted_leaves, violation,
+    openmls_error, own_merged, removals_waiting, rule_context, stage, storage_error, stored_group,
+    stored_state, tls, violation,
 };
 use crate::identity::{invalid, not_found, stored_uuid};
 use crate::protocol::b64;
@@ -223,7 +223,7 @@ fn drop_staged(tx: &Tx<'_>, mut row: GroupRow) -> Result<Epoch, Error> {
 pub(crate) fn commit_pending(tx: &Tx<'_>, request: ConversationId) -> Result<Committed, Error> {
     let (group, row) = load_group(tx, request.conversation_id)?;
     can_commit(&group, &row)?;
-    if !group.has_pending_proposals() && unlisted_leaves(tx, &group)?.is_empty() {
+    if !removals_waiting(tx, &group)? {
         return Err(not_found("proposals"));
     }
     own_commit(tx, group, row)

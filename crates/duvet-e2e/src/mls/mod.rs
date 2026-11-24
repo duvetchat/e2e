@@ -338,6 +338,13 @@ fn unlisted_leaves(tx: &Tx<'_>, group: &MlsGroup) -> Result<Vec<(LeafNodeIndex, 
     Ok(unlisted)
 }
 
+/// Whether `commit_pending` has something to take out of `group`: a removal the server proposed, or
+/// a member's leaf whose device is off its user's latest list as this device knows it. Worked out
+/// from what this device knows, without asking to observe anyone, as `commit_pending` then does.
+pub(crate) fn removals_waiting(tx: &Tx<'_>, group: &MlsGroup) -> Result<bool, Error> {
+    Ok(group.has_pending_proposals() || !unlisted_leaves(tx, group)?.is_empty())
+}
+
 /// Whether this device can commit in its group now: not while its own commit waits for
 /// `commit_result`, or for the queue once the server answered it as refused (`pending_commit`), nor
 /// in a blocked group (`rule_violation`, `group_blocked`), nor once the server proposed removing

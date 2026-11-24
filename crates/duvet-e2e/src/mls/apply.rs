@@ -19,10 +19,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    EXTERNAL_SENDER_MISMATCH, Extra, GroupRow, api_key, brings_back_removed, certify_by_pinned,
-    certify_leaves_by_pinned, check, check_applied, commit_asks_first, delete_group, digest,
-    merge_own, note_removed, openmls_error, rule_context, skip_unchanged_leaves, storage_error,
-    stored_group, stored_state, welcome_asks_first,
+    EXTERNAL_SENDER_MISMATCH, Extra, GroupRow, api_key, brings_back_removed, can_commit,
+    certify_by_pinned, certify_leaves_by_pinned, check, check_applied, commit_asks_first,
+    delete_group, digest, merge_own, note_removed, openmls_error, removals_waiting, rule_context,
+    skip_unchanged_leaves, storage_error, stored_group, stored_state, welcome_asks_first,
 };
 use crate::identity::{invalid, not_found};
 use crate::protocol::b64;
@@ -171,6 +171,10 @@ pub(crate) struct ApplyReply {
     /// What each entry this call applied did; those applied before aren't in it.
     results: Vec<EntryResult>,
     catch_up_due: Vec<Uuid>,
+    /// Whether this device would commit in the group now to take leaves out (`commit_pending`):
+    /// a removal the server proposed, or a member's leaf whose device is off its user's latest
+    /// list as this device knows it. So a member that only reads takes them out too.
+    commit_due: bool,
 }
 
 /// A conversation as `apply` walks its queue: its row, and the group this device holds of it,
@@ -271,10 +275,15 @@ pub(crate) fn apply(tx: &Tx<'_>, request: ApplyRequest) -> Result<ApplyReply, Er
     if let Some(row) = &at.row {
         row.write(tx)?;
     }
+    let commit_due = match (&at.group, &at.row) {
+        (Some(group), Some(row)) => can_commit(group, row).is_ok() && removals_waiting(tx, group)?,
+        _ => false,
+    };
     Ok(ApplyReply {
         applied_through: at.last_seq(),
         results,
         catch_up_due: crate::messages::catch_up_due(tx, at.id, at.row.as_ref())?,
+        commit_due,
     })
 }
 

@@ -273,6 +273,56 @@ fn own_commit_answered_refused_settles_from_the_queue() {
 
 /// A conversation of A, with A1 and A2, and of B, with B1, every device in the group; then the API
 /// proposes A2's removal, which no device has applied yet.
+/// `apply`'s `commit_due` with no entries, as a client reads it after observing a user.
+fn commit_due(device: &mut TestDevice, conversation: Uuid) -> Value {
+    ok(&mut device.core, apply(conversation, &[]))["commit_due"].clone()
+}
+
+/// `apply` says when this device would take leaves out with `commit_pending`: a removal the server
+/// proposed, or a leaf whose device is off its user's latest list as this device knows it, which a
+/// member that only reads would otherwise keep until it sends. Not on the device a removal takes
+/// out, and no more once the commit that takes them out is in.
+#[test]
+fn apply_says_when_a_commit_is_due() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut b1, mut b2, mut b3] = new_devices(&mut server, [a, b, b, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2, &mut b3]);
+    assert_eq!(commit_due(&mut a1, conversation), false);
+
+    // The API proposes B2's removal: every member but B2 would commit it.
+    server.remove_device(conversation, b2.id);
+    assert_eq!(server.deliver(&mut a1)[0]["commit_due"], true);
+    assert_eq!(server.deliver(&mut b1)[0]["commit_due"], true);
+    assert_eq!(server.deliver(&mut b2)[0]["commit_due"], false);
+    let pending = command("commit_pending", conversation);
+    server
+        .commit(&mut a1, conversation, pending.clone())
+        .unwrap();
+    assert_eq!(server.deliver(&mut a1)[0]["commit_due"], false);
+    assert_eq!(server.deliver(&mut b1)[0]["commit_due"], false);
+
+    // B takes B3 off its list. Once A1, which only reads, sees the new list, its next apply says
+    // so without asking to observe B; the commit asks first, then takes B3 out.
+    let list = ok(
+        &mut b1.core,
+        json!({"cmd": "sign_device_list", "remove": [b3.id]}),
+    );
+    server.take_list(b, &list["device_list"]);
+    assert_eq!(commit_due(&mut a1, conversation), false);
+    ok(&mut a1.core, server.observed(b));
+    assert_eq!(commit_due(&mut a1, conversation), true);
+    let asked = error(&mut a1.core, pending.clone());
+    assert_eq!(asked["code"], "needs_identities");
+    ok(&mut a1.core, server.observed(b));
+    server.commit(&mut a1, conversation, pending).unwrap();
+    assert_eq!(server.deliver(&mut a1)[0]["commit_due"], false);
+    assert!(!device_set(&a1.group(conversation)).contains(&b3.id));
+}
+
 fn removal_on_its_way(server: &mut FakeServer) -> (Uuid, Uuid, [TestDevice; 3]) {
     let (a, b) = (new_id(), new_id());
     let [mut a1, mut a2, mut b1] = new_devices(server, [a, a, b]);
