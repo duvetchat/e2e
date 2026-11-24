@@ -11,7 +11,9 @@ use duvet_e2e_rules::{
     CommitAad, DeviceCertificate, DeviceList, Entry, Kind, MemberList, SUITE, group_config,
     group_id, join_config, leaf_capabilities,
 };
-use duvet_e2e_validator::{Change, DeviceLeaf, Members, Op, Request, Response, validate_bytes};
+use duvet_e2e_validator::{
+    Change, DeviceLeaf, MAX_REQUEST, Members, Op, Request, Response, validate_bytes,
+};
 use ed25519_dalek::SigningKey;
 use openmls::messages::group_info::GroupInfo;
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
@@ -1506,4 +1508,31 @@ fn a_state_the_validator_didnt_make_is_answered() {
     let response: Response = ciborium::from_reader(response.as_slice()).unwrap();
     assert!(!response.ok);
     assert_eq!(response.error.unwrap().code, "internal");
+}
+
+/// The requests of a group of 20 people with 10 devices each, its start and a commit (about 190 KB
+/// and 450 KB, its state about 340 KB), fit in `MAX_REQUEST` many times over; one past it is
+/// refused before it's read.
+#[test]
+fn requests_hold_to_the_size_cap() {
+    let world = World::new(&[10; 20]);
+    let everyone: Vec<usize> = (0..20).collect();
+    let members = world.list(Kind::Group, Some(O), &everyone);
+    let joined: Vec<(usize, usize)> = (0..20)
+        .flat_map(|user| (0..10).map(move |device| (user, device)))
+        .filter(|&device| device != (O, 0))
+        .collect();
+    let first = world.first_commit((O, 0), &members, &joined);
+    let create = world.create_request(&first, &members);
+    assert!(encode(&create).len() * 8 < MAX_REQUEST);
+    let created = run(&create);
+    let mut chat = Chat::created(world, first, &created);
+    let staged = chat.stage((A, 0), Commit::default());
+    let commit = chat.request(&staged);
+    assert!(encode(&commit).len() * 8 < MAX_REQUEST);
+    assert!(run(&commit).ok);
+
+    let over = validate_bytes(&vec![0; MAX_REQUEST + 1]);
+    let refused: Response = ciborium::from_reader(over.as_slice()).unwrap();
+    assert_eq!(code(&refused), "too_large");
 }
