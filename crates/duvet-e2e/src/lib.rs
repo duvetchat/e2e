@@ -109,6 +109,13 @@ impl Clock for FakeClock {
     }
 }
 
+/// Takes the lock a core holds on the database at `path` while it's open, `<path>.lock`, without
+/// waiting: `locked` while one has the database open. Deleting a database takes it first.
+#[cfg(not(target_family = "wasm"))]
+pub fn lock_database(path: &std::path::Path) -> Result<std::fs::File, Error> {
+    store::lock(path)
+}
+
 /// How to open the core.
 pub struct OpenConfig {
     /// The database's file. On the web, its name in the VFS.

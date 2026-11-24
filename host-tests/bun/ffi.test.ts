@@ -2,8 +2,8 @@
 // DUVET_E2E_FFI names the built library (`cargo build -p duvet-e2e-ffi --release`).
 import { describe, expect, test } from "bun:test";
 import { CString, dlopen, FFIType, suffix } from "bun:ffi";
-import { randomBytes } from "node:crypto";
-import { mkdtempSync, readFileSync, statSync } from "node:fs";
+import { randomBytes, randomUUID } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,6 +15,7 @@ const { symbols: lib } = dlopen(library, {
   duvet_e2e_open: { args: [FFIType.ptr], returns: FFIType.ptr },
   duvet_e2e_handle: { args: [FFIType.u64, FFIType.ptr], returns: FFIType.ptr },
   duvet_e2e_close: { args: [FFIType.u64], returns: FFIType.void },
+  duvet_e2e_destroy: { args: [FFIType.ptr], returns: FFIType.ptr },
   duvet_e2e_free: { args: [FFIType.ptr], returns: FFIType.void },
   duvet_e2e_version: { args: [], returns: FFIType.cstring },
 });
@@ -35,10 +36,22 @@ const open = (config: object | string) =>
 const handle = (core: number, command: string | Buffer) =>
   take(lib.duvet_e2e_handle(BigInt(core), typeof command === "string" ? cstring(command) : command));
 const close = (core: number) => lib.duvet_e2e_close(BigInt(core));
+const destroy = (config: object) => take(lib.duvet_e2e_destroy(cstring(JSON.stringify(config))));
 
 const database = () => join(mkdtempSync(join(tmpdir(), "duvet-e2e-")), "core.db");
 const dbKey = () => randomBytes(32).toString("base64");
 const status = '{"cmd":"status"}';
+const createDevice = (device: string) =>
+  JSON.stringify({ cmd: "create_device", user_id: randomUUID(), device_id: device });
+/** A keyring entry of this run's own. */
+const keyring = () => ({ service: "duvet-e2e-test", account: `core-${randomBytes(8).toString("hex")}` });
+
+// Where a keyring config's key lands somewhere a test may write: a file, on Linux with no session
+// bus (CI's container); Windows' Credential Manager, on windows.yml's runner. zbus finds the bus
+// at $XDG_RUNTIME_DIR/bus too, where it would be a developer's own keyring.
+const busSocket = join(process.env.XDG_RUNTIME_DIR ?? `/run/user/${process.getuid?.()}`, "bus");
+const keyFile = process.platform === "linux" && !process.env.DBUS_SESSION_BUS_ADDRESS && !existsSync(busSocket);
+const credentialManager = process.platform === "win32";
 
 describe("the C ABI", () => {
   test("status replies protocol 1", () => {
@@ -84,7 +97,7 @@ describe("the C ABI", () => {
 
   // Where no session bus runs, as in CI's container, Linux has no Secret Service. Windows and macOS
   // keep the key in their own keyring, never in a file.
-  test.skipIf(process.platform !== "linux" || Boolean(process.env.DBUS_SESSION_BUS_ADDRESS))(
+  test.skipIf(!keyFile)(
     "without Secret Service the key goes to a file only its user reads",
     () => {
       const path = database();
@@ -102,4 +115,30 @@ describe("the C ABI", () => {
       close(again);
     },
   );
+
+  test.skipIf(!keyFile && !credentialManager)("destroy leaves nothing to open", () => {
+    const path = database();
+    const config = { path, keyring: keyring() };
+    const device = randomUUID();
+    const core = open(config).ok.handle;
+    expect(handle(core, createDevice(device)).ok).toBeDefined();
+
+    // While a handle has it open, nothing goes.
+    expect(destroy(config).error.code).toBe("locked");
+    close(core);
+    const kept = open(config).ok.handle;
+    expect(handle(kept, status).ok.device_id).toBe(device);
+    close(kept);
+
+    const key = keyFile ? readFileSync(`${path}.key`) : null;
+    expect(destroy(config)).toEqual({ ok: {} });
+    for (const file of [path, `${path}.lock`, `${path}.key`]) expect(existsSync(file)).toBe(false);
+
+    // What opens there now is a new database, with a key of its own.
+    const fresh = open(config).ok.handle;
+    expect(handle(fresh, status).ok.device_id).toBeUndefined();
+    close(fresh);
+    if (key) expect(readFileSync(`${path}.key`).equals(key)).toBe(false);
+    expect(destroy(config)).toEqual({ ok: {} });
+  });
 });

@@ -1,6 +1,7 @@
 //! The desktop's database key: kept in the system's keyring (Windows' Credential Manager, macOS's
-//! Keychain, the Secret Service), made on the database's first open. Where Linux has no Secret
-//! Service, it goes to `<path>.key`, which only its user reads, and `status` says `file`.
+//! Keychain, the Secret Service), made on the database's first open, deleted with the database.
+//! Where Linux has no Secret Service, it goes to `<path>.key`, which only its user reads, and
+//! `status` says `file`.
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -15,6 +16,7 @@ pub(crate) type Key = Zeroizing<[u8; 32]>;
 pub(crate) trait KeyStore {
     fn get(&self) -> keyring_core::Result<Vec<u8>>;
     fn set(&self, key: &[u8]) -> keyring_core::Result<()>;
+    fn delete(&self) -> keyring_core::Result<()>;
 }
 
 impl KeyStore for keyring_core::Entry {
@@ -24,6 +26,10 @@ impl KeyStore for keyring_core::Entry {
 
     fn set(&self, key: &[u8]) -> keyring_core::Result<()> {
         self.set_secret(key)
+    }
+
+    fn delete(&self) -> keyring_core::Result<()> {
+        self.delete_credential()
     }
 }
 
@@ -42,6 +48,15 @@ pub(crate) enum NoKeyring {
 /// first open.
 pub(crate) fn open(path: &Path, service: &str, account: &str) -> Result<Core, Error> {
     open_with(path, system_entry(service, account))
+}
+
+/// Deletes the database at `path` with the files beside it and its key: `<path>.key`, and the
+/// system keyring's entry when `keyring` names one (service, account).
+pub(crate) fn destroy(path: &Path, keyring: Option<(&str, &str)>) -> Result<(), Error> {
+    destroy_with(
+        path,
+        keyring.map(|(service, account)| system_entry(service, account)),
+    )
 }
 
 /// The system keyring's entry for the key, or why there is none.
@@ -144,6 +159,35 @@ fn lock_key(path: &Path) -> Result<File, Error> {
         .map_err(failed)?;
     file.lock().map_err(failed)?;
     Ok(file)
+}
+
+/// Deletes the database at `path` and what's beside it: SQLite's journals, `<path>.key` and the
+/// file it's written to first, then its key in `entry`, then `<path>.lock`.
+///
+/// It takes `<path>.key.lock`, as an open does, then the core's `<path>.lock`: `locked` while a
+/// core has the database open, and nothing is deleted then. `<path>.key.lock` stays, empty: an open
+/// may be waiting for it, and were it deleted, that open would go on holding the deleted file while
+/// the next open locked a new one, and the two would each choose a key.
+fn destroy_with(path: &Path, entry: Option<Result<impl KeyStore, NoKeyring>>) -> Result<(), Error> {
+    let entry = match entry {
+        Some(Ok(entry)) => Some(entry),
+        // No Secret Service at all: no entry holds a key.
+        Some(Err(NoKeyring::Absent)) | None => None,
+        Some(Err(NoKeyring::Failed(error))) => return Err(keyring_failed(&error)),
+    };
+    let _choosing = lock_key(path)?;
+    let _open = duvet_e2e::lock_database(path)?;
+    // The database first: what a destroy cut short leaves is a key, which a new database takes.
+    for suffix in ["", "-journal", "-wal", "-shm", ".key", ".key.tmp"] {
+        remove(&beside(path, suffix), "the database's files")?;
+    }
+    if let Some(entry) = entry {
+        match entry.delete() {
+            Ok(()) | Err(keyring_core::Error::NoEntry) => {}
+            Err(error) => return Err(keyring_failed(&error)),
+        }
+    }
+    remove(&beside(path, ".lock"), "the database's lock")
 }
 
 /// The key of the database at `path`, and where it's kept.
@@ -590,6 +634,10 @@ mod tests {
         fn set(&self, key: &[u8]) -> keyring_core::Result<()> {
             self.entry.set_secret(key)
         }
+
+        fn delete(&self) -> keyring_core::Result<()> {
+            self.entry.delete_credential()
+        }
     }
 
     #[test]
@@ -626,6 +674,71 @@ mod tests {
             .expect("the stored key opens the database")
             .close();
         open_with(&path, Ok(entry_in(&store))).unwrap().close();
+    }
+
+    /// The names of the files in `dir`, in order.
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|file| file.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn destroy_removes_the_database_and_its_key() {
+        // A database whose key the keyring keeps, beside the journal a crash left.
+        let store = mock_store();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.db");
+        open_with(&path, Ok(entry_in(&store))).unwrap().close();
+        std::fs::write(dir.path().join("core.db-journal"), b"a crash's journal").unwrap();
+
+        destroy_with(&path, Some(Ok(entry_in(&store)))).unwrap();
+        // Only the key's lock stays, empty: another open may be waiting for it.
+        assert_eq!(files_in(dir.path()), ["core.db.key.lock"]);
+        assert!(no_entry(&store));
+        // A second time, there's nothing left to delete.
+        destroy_with(&path, Some(Ok(entry_in(&store)))).unwrap();
+
+        // A database whose key its client keeps: no keyring is touched.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.db");
+        Core::open(OpenConfig::new(&path, [1; 32])).unwrap().close();
+        destroy_with(&path, None::<Result<Entry, NoKeyring>>).unwrap();
+        assert_eq!(files_in(dir.path()), ["core.db.key.lock"]);
+
+        // A database whose key is in `<path>.key`, where there's no Secret Service.
+        #[cfg(secret_service)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("core.db");
+            let none = || -> Result<Entry, NoKeyring> { Err(NoKeyring::Absent) };
+            open_with(&path, none()).unwrap().close();
+            assert!(dir.path().join("core.db.key").exists());
+            destroy_with(&path, Some(none())).unwrap();
+            assert_eq!(files_in(dir.path()), ["core.db.key.lock"]);
+        }
+    }
+
+    #[test]
+    fn destroy_refuses_an_open_database() {
+        let store = mock_store();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.db");
+        let core = open_with(&path, Ok(entry_in(&store))).unwrap();
+        let key = entry_in(&store).get_secret().unwrap();
+
+        let error = destroy_with(&path, Some(Ok(entry_in(&store)))).unwrap_err();
+        assert_eq!(error.code(), "locked");
+        core.close();
+        // Nothing went: the database is there, and the key the keyring keeps opens it.
+        assert!(path.exists());
+        assert_eq!(entry_in(&store).get_secret().unwrap(), key);
+        Core::open(OpenConfig::new(&path, key_from(&key).unwrap()))
+            .expect("the key opens the database")
+            .close();
     }
 
     #[cfg(secret_service)]

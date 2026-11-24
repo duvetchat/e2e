@@ -44,6 +44,20 @@ char *duvet_e2e_handle(uint64_t handle, const char *command_json);
 void duvet_e2e_close(uint64_t handle);
 
 /**
+ * Deletes the database `config_json` names, with the files beside it and its key: the keyring's
+ * entry or `<path>.key`. Answers `{"ok":{}}`, also when there was nothing to delete, or the error
+ * reply: `locked` while a handle has the database open, and nothing is deleted then.
+ *
+ * `config_json` is what `duvet_e2e_open` takes; `db_key`'s key is the caller's to forget.
+ * `<path>.key.lock` stays, empty: another open may be waiting for it.
+ *
+ * # Safety
+ *
+ * `config_json` is a NUL-terminated string that stays valid for the call.
+ */
+char *duvet_e2e_destroy(const char *config_json);
+
+/**
  * Hands back a string the library returned. NULL does nothing.
  *
  * # Safety
