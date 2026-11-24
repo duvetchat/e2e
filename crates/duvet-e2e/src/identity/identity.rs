@@ -3,7 +3,7 @@
 
 use duvet_e2e_rules::{DeviceCertificate, DeviceList};
 use openmls_traits::OpenMlsProvider;
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -11,18 +11,31 @@ use super::{
     BACKUP_KEY, DEVICE_LIST, IDENTITY_KEY, IDENTITY_SECRET, Identity, meta_get, meta_put,
     not_found, random, recovery, unix_ms,
 };
+use crate::messages::Empty;
 use crate::protocol::b64;
 use crate::{Error, OwnDevice, Tx};
 
-#[derive(Serialize)]
+/// `meta`'s row for what the last identity command made for the server, until the client confirms
+/// its upload (`identity_uploaded`): [`Kept`], as the command's reply, in JSON.
+const KEPT_IDENTITY: &str = "kept_identity";
+
+/// Room for a kept identity's JSON besides its blobs: its buffer is sized ahead, so no copy of the
+/// recovery key is left behind as it grows.
+const KEPT_ROOM: usize = 1024;
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CreatedIdentity {
     #[serde(with = "b64")]
     identity_key: Vec<u8>,
     #[serde(with = "b64")]
     certificate: Vec<u8>,
     #[serde(with = "b64")]
-    device_list: Vec<u8>,
-    #[serde(serialize_with = "secret_text")]
+    pub(super) device_list: Vec<u8>,
+    #[serde(
+        serialize_with = "secret_text",
+        deserialize_with = "super::recover::secret_text"
+    )]
     recovery_key: Zeroizing<String>,
     #[serde(with = "b64")]
     wrapped_backup_key: Vec<u8>,
@@ -30,16 +43,101 @@ pub(crate) struct CreatedIdentity {
     encrypted_identity: Vec<u8>,
 }
 
+/// What an identity command made for the server, kept until the client confirms its upload, so
+/// the command run again hands it out again: its recovery key is in no other place.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Kept {
+    pub(super) created: CreatedIdentity,
+    /// A rotation's: the backup keys before the new one, sealed with it.
+    #[serde(default, with = "b64::option", skip_serializing_if = "Option::is_none")]
+    pub(super) wrapped_previous_backup_keys: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) rotation: Option<KeptRotation>,
+}
+
+/// A rotation's devices it removed, in order, and what its transfers carry of the identity
+/// before: the rotating device's certificate and the user's list.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct KeptRotation {
+    pub(super) removed: Vec<Uuid>,
+    #[serde(with = "b64")]
+    pub(super) sender: Vec<u8>,
+    #[serde(with = "b64")]
+    pub(super) previous_list: Vec<u8>,
+}
+
+/// Keeps what an identity command made for the server, in place of anything kept before.
+pub(super) fn keep(tx: &Tx<'_>, kept: &Kept) -> Result<(), Error> {
+    let rotation = kept.rotation.as_ref().map_or(0, |rotation| {
+        rotation.sender.len() + rotation.previous_list.len() + rotation.removed.len() * 40
+    });
+    let blobs = kept.created.certificate.len()
+        + kept.created.device_list.len()
+        + kept.created.wrapped_backup_key.len()
+        + kept.created.encrypted_identity.len()
+        + kept
+            .wrapped_previous_backup_keys
+            .as_ref()
+            .map_or(0, Vec::len)
+        + rotation;
+    let mut row = Zeroizing::new(Vec::with_capacity(KEPT_ROOM + blobs * 2));
+    serde_json::to_writer(&mut *row, kept)
+        .map_err(|_| Error::Internal("the kept identity couldn't be written".into()))?;
+    meta_put(tx, KEPT_IDENTITY, &row)
+}
+
+/// What the last identity command made, while the client hasn't confirmed its upload.
+pub(super) fn kept(tx: &Tx<'_>) -> Result<Option<Kept>, Error> {
+    let Some(row) = meta_get(tx, KEPT_IDENTITY)?.map(Zeroizing::new) else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&row)
+        .map(Some)
+        .map_err(|_| Error::Internal("the kept identity is malformed".into()))
+}
+
+/// The server took what the last identity command made: its kept copy, the recovery key with it,
+/// goes (wiped: the database deletes securely). Nothing kept is `not_found` (`upload`).
+pub(crate) fn identity_uploaded(tx: &mut Tx<'_>) -> Result<Empty, Error> {
+    let deleted = tx
+        .conn()
+        .execute("DELETE FROM meta WHERE key = ?1", [KEPT_IDENTITY])?;
+    if deleted == 0 {
+        return Err(not_found("upload"));
+    }
+    Ok(Empty {})
+}
+
 /// The identity, on this device: it certifies the device, starts the device list at version 1, and
-/// a backup key wrapped by a new recovery key encrypts it. The recovery key is in the reply alone.
+/// a backup key wrapped by a new recovery key encrypts it. The reply is kept until the client
+/// confirms its upload (`identity_uploaded`), and the command run again until then answers it
+/// again; after it, `exists`.
 pub(crate) fn create_identity(tx: &mut Tx<'_>) -> Result<CreatedIdentity, Error> {
     let own = tx.own_device()?;
     if meta_get(tx, IDENTITY_KEY)?.is_some() {
-        return Err(Error::Exists {
-            what: "identity".into(),
-        });
+        return match kept(tx)? {
+            Some(Kept {
+                created,
+                rotation: None,
+                ..
+            }) => Ok(created),
+            _ => Err(Error::Exists {
+                what: "identity".into(),
+            }),
+        };
     }
-    Ok(new_identity(tx, &own, vec![own.device])?.0)
+    let (created, _) = new_identity(tx, &own, vec![own.device])?;
+    keep(
+        tx,
+        &Kept {
+            created: created.clone(),
+            wrapped_previous_backup_keys: None,
+            rotation: None,
+        },
+    )?;
+    Ok(created)
 }
 
 /// A new identity for this device's user, in place of any the device had: it certifies the device

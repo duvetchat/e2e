@@ -40,6 +40,9 @@ pub(crate) enum Command {
     },
     KeyPackages,
 
+    /// The server took what the last identity command made: its kept copy goes.
+    IdentityUploaded,
+
     // Starting over and changing the keys.
     ResetIdentity,
     RotateKeys {
@@ -135,6 +138,7 @@ pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error
             reply(identity::verify_user(tx, user_id, qr.as_deref())?)
         }
         Command::KeyPackages => reply(identity::key_packages(tx)?),
+        Command::IdentityUploaded => reply(identity::identity_uploaded(tx)?),
 
         Command::ResetIdentity => reply(identity::reset_identity(tx)?),
         Command::RotateKeys {
@@ -208,6 +212,12 @@ struct Status {
     device_id: Option<Uuid>,
     #[serde(with = "b64::option", skip_serializing_if = "Option::is_none")]
     identity_key: Option<Vec<u8>>,
+    /// This device's certificate and its user's latest list, as the identity commands answered
+    /// them: a client whose reply was lost before its upload has them again here.
+    #[serde(with = "b64::option", skip_serializing_if = "Option::is_none")]
+    certificate: Option<Vec<u8>>,
+    #[serde(with = "b64::option", skip_serializing_if = "Option::is_none")]
+    device_list: Option<Vec<u8>>,
     has_identity: bool,
     key_storage: KeyStorage,
 }
@@ -219,14 +229,21 @@ fn cmd_status(tx: &mut Tx<'_>) -> Result<Status, Error> {
             Ok((row.get(0)?, row.get(1)?))
         })
         .optional()?;
-    let identity_key: Option<Vec<u8>> = tx
+    let certificate: Option<Vec<u8>> = tx
         .conn()
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'identity_key'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
+        .query_row("SELECT certificate FROM device", [], |row| row.get(0))
+        .optional()?
+        .flatten();
+    let meta = |key: &str| -> Result<Option<Vec<u8>>, Error> {
+        Ok(tx
+            .conn()
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    };
+    let identity_key = meta("identity_key")?;
+    let device_list = meta("device_list")?;
     let uuid =
         |bytes: &[u8]| Uuid::from_slice(bytes).map_err(|error| Error::Internal(error.to_string()));
     Ok(Status {
@@ -237,6 +254,8 @@ fn cmd_status(tx: &mut Tx<'_>) -> Result<Status, Error> {
             .as_ref()
             .map(|(_, device)| uuid(device))
             .transpose()?,
+        certificate,
+        device_list,
         has_identity: identity_key.is_some(),
         identity_key,
         key_storage: tx.key_storage(),

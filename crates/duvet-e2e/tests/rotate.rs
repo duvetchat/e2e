@@ -378,8 +378,9 @@ fn rotate_keys_removes_the_lost_device() {
     let old_ids: BTreeSet<&Vec<u8>> = published_before.iter().map(|(id, _)| id).collect();
     assert!(published.iter().all(|(id, _)| !old_ids.contains(id)));
 
-    // Changing them again keeps both backup keys from before, oldest first, and starts another
-    // list at 1.
+    // Changing them again, once the server took the change, keeps both backup keys from before,
+    // oldest first, and starts another list at 1.
+    ok(&mut core, json!({"cmd": "identity_uploaded"}));
     let again = ok(&mut core, rotate(&[]));
     new_identity(user, device, &[device], &again);
     let (newest, _) = opened(user, &again);
@@ -622,6 +623,7 @@ fn commits_made_before_the_change_leave_their_group_due() {
     let rotated = ok(&mut a1.core, rotate(&[]));
     server.submit(&mut a1, group, &made).unwrap();
     server.take_identity(a, &rotated);
+    ok(&mut a1.core, json!({"cmd": "identity_uploaded"}));
     assert_eq!(due(&mut a1), BTreeSet::from([group]));
     server.deliver_all(&mut [&mut a1, &mut b1]);
 
@@ -1487,4 +1489,59 @@ fn new_members_join_past_a_leaf_from_before_the_change() {
         &json!([entries.len(), "welcome", "rejected", "leaf_not_signed"])
     );
     assert_eq!(d1.no_group(group)["what"], "group");
+}
+
+/// A1 changes A's keys, and its reply is lost before the upload. Run again with the certificates
+/// the server still serves, the identity before's, it answers the same new identity, recovery key
+/// and blobs, and seals the transfers again, which A3 takes; with other devices to remove it's
+/// refused. Once the client confirmed the upload, a rotation is a new one again.
+#[test]
+fn a_rotation_run_again_reseals_its_transfers() {
+    let mut server = FakeServer::new();
+    let a = new_id();
+    let mut a1 = server.device(a);
+    let mut a2 = server.device(a);
+    let mut a3 = server.device(a);
+    meet(&mut server, &mut [&mut a1, &mut a2, &mut a3]);
+
+    let lost = ok(&mut a1.core, rotating(&server, a, &[a2.id]));
+    // A2, lost, holds the identity before: A3's certificate it signs with keys of its own gets
+    // nothing sealed to them.
+    let forged = DeviceCertificate::new(a, a3.id, [7; 32], [8; 32], 1)
+        .sign(&signer(&held_secret(&mut a2)))
+        .unwrap();
+    let mut swapped = rotating(&server, a, &[a2.id]);
+    swapped["certificates"] = json!([b64(&forged)]);
+    let refused = error(&mut a1.core, swapped);
+    assert_eq!(
+        (&refused["code"], &refused["field"]),
+        (&json!("bad_command"), &json!("certificates"))
+    );
+    let rotated = ok(&mut a1.core, rotating(&server, a, &[a2.id]));
+    for field in [
+        "identity_key",
+        "certificate",
+        "device_list",
+        "recovery_key",
+        "wrapped_backup_key",
+        "encrypted_identity",
+        "wrapped_previous_backup_keys",
+    ] {
+        assert_eq!(rotated[field], lost[field], "{field}");
+    }
+    let other = error(&mut a1.core, rotating(&server, a, &[]));
+    assert_eq!(
+        (&other["code"], &other["field"]),
+        (&json!("bad_command"), &json!("remove"))
+    );
+
+    server.take_identity(a, &rotated);
+    let new_key = key(&rotated["identity_key"]);
+    let transfer = server.inbox(a3.id).pop().expect("A3's transfer");
+    let taken = ok(&mut a3.core, receiving(&transfer, &new_key));
+    assert_eq!(taken["identity_key"], rotated["identity_key"]);
+
+    ok(&mut a1.core, json!({"cmd": "identity_uploaded"}));
+    let next = ok(&mut a1.core, rotating(&server, a, &[]));
+    assert_ne!(next["identity_key"], rotated["identity_key"]);
 }

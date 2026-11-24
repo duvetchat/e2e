@@ -21,7 +21,7 @@ pub(crate) use approval::{
 pub(crate) use certificates::{keep_certificates, keep_earlier_identity};
 pub(crate) use contacts::{observe_user, safety_number, verify_user};
 pub(crate) use device::{create_device, key_packages};
-pub(crate) use identity::{create_identity, sign_device_list};
+pub(crate) use identity::{create_identity, identity_uploaded, sign_device_list};
 pub(crate) use recover::{Recover, recover};
 pub(crate) use rotate::{
     ROTATION_TRANSFER, Transferred, receive_rotation, renewed_at, reset_identity, rotate_keys,

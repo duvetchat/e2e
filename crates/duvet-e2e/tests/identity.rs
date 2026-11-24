@@ -324,6 +324,10 @@ fn create_identity_signs_own_device() {
         "{recovery_key}"
     );
 
+    // Run again before the client confirms its upload, it answers the same; once confirmed, it's
+    // `exists`.
+    assert_eq!(ok(&mut core, json!({"cmd": "create_identity"})), identity);
+    ok(&mut core, json!({"cmd": "identity_uploaded"}));
     let again = error(&mut core, json!({"cmd": "create_identity"}));
     assert_eq!(again["code"], "exists", "{again}");
 

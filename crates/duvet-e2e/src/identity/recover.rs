@@ -155,7 +155,9 @@ pub(super) fn thirty_two(bytes: &[u8]) -> Result<[u8; 32], Error> {
 }
 
 /// A secret the command holds as text, read into memory that's wiped as it drops.
-fn secret_text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Zeroizing<String>, D::Error> {
+pub(super) fn secret_text<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Zeroizing<String>, D::Error> {
     struct Text;
 
     impl Visitor<'_> for Text {

@@ -1624,3 +1624,49 @@ fn own_list_that_lost_to_another_of_its_version_is_replaced() {
     assert_eq!(next.version, 4);
     assert!(next.contains(a2.id) && next.contains(a3.id));
 }
+
+/// What an identity command made, its reply lost before the upload, can be had again: a recovered
+/// device's certificate and its user's list from `status`; `create_identity`'s and
+/// `reset_identity`'s recovery key and blobs from the same command run again, until the client
+/// confirms the upload (`identity_uploaded`), which wipes them.
+#[test]
+fn identity_replies_lost_before_their_upload_are_had_again() {
+    let mut server = FakeServer::new();
+    let a = new_id();
+    let (mut a1, created) = server.first_device(a);
+    assert_eq!(ok(&mut a1.core, json!({"cmd": "create_identity"})), created);
+    let shown = status(&mut a1);
+    assert_eq!(
+        (&shown["certificate"], &shown["device_list"]),
+        (&created["certificate"], &created["device_list"])
+    );
+    ok(&mut a1.core, json!({"cmd": "identity_uploaded"}));
+    assert_eq!(meta(&mut a1, "kept_identity"), None);
+    let again = error(&mut a1.core, json!({"cmd": "create_identity"}));
+    assert_eq!(again["code"], "exists");
+    let confirmed = error(&mut a1.core, json!({"cmd": "identity_uploaded"}));
+    assert_eq!(
+        (&confirmed["code"], &confirmed["what"]),
+        (&json!("not_found"), &json!("upload"))
+    );
+
+    let mut a2 = server.bare_device(a);
+    let served = server.observed(a);
+    let recovered = ok(
+        &mut a2.core,
+        recovering(
+            created["recovery_key"].as_str().unwrap(),
+            &created,
+            &served["device_list"],
+        ),
+    );
+    let shown = status(&mut a2);
+    assert_eq!(
+        (&shown["certificate"], &shown["device_list"]),
+        (&recovered["certificate"], &recovered["device_list"])
+    );
+
+    let mut b1 = server.bare_device(new_id());
+    let reset = ok(&mut b1.core, json!({"cmd": "reset_identity"}));
+    assert_eq!(ok(&mut b1.core, json!({"cmd": "reset_identity"})), reset);
+}
