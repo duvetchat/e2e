@@ -2268,3 +2268,35 @@ fn a_commit_applied_after_its_key_package_expired_applies() {
     assert_eq!(state["epoch"], 2);
     assert!(device_set(&state).contains(&short_lived));
 }
+
+/// A1 renews its leaf, and the client loses the commit before sending it. Told then that the commit
+/// wasn't taken, A1 keeps it staged for the queue to settle, and sends nothing meanwhile. Knowing it
+/// never sent it, the client reports it refused by the validator: A1 drops it, and writes again.
+#[test]
+fn a_commit_never_sent_is_dropped_after_its_answer() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut b1] = new_devices(&mut server, [a, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Dm, None, &[a, b], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    ok(&mut a1.core, command("refresh", conversation));
+    let refused =
+        json!({"cmd": "commit_result", "conversation_id": conversation, "accepted": false});
+    ok(&mut a1.core, refused.clone());
+    assert_eq!(
+        ready(&mut a1, conversation).unwrap_err()["code"],
+        "pending_commit"
+    );
+
+    let mut never_sent = refused;
+    never_sent["invalid"] = json!(true);
+    let dropped = ok(&mut a1.core, never_sent);
+    assert_eq!(dropped["epoch"], 1);
+    assert_eq!(ready(&mut a1, conversation), Ok(()));
+    server
+        .commit(&mut a1, conversation, command("refresh", conversation))
+        .unwrap();
+}
