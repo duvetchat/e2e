@@ -384,7 +384,8 @@ pub(crate) fn merge_own(
 /// applied or made took them out of `conversation`'s group, or a reset left them out of its next
 /// generation. They stay out ([`brings_back_removed`]). So does the identity that certified such a
 /// leaf, when it isn't the one this device pins for its user now: one the user had before, which
-/// certifies nothing more in the conversation ([`check_applied`]).
+/// certifies nothing more in the conversation ([`check_applied`]). A device whose user the same
+/// commit takes off the member list left with them, not as a device, and isn't noted.
 pub(crate) fn note_removed(
     tx: &Tx<'_>,
     conversation: Uuid,
@@ -396,8 +397,10 @@ pub(crate) fn note_removed(
         .values()
         .map(|leaf| leaf.device)
         .collect();
+    let listed = MemberList::from_group_context(group.public_group().group_context())
+        .map_err(|_| stored_state())?;
     for leaf in before.values() {
-        if staying.contains(&leaf.device) {
+        if staying.contains(&leaf.device) || !listed.contains(leaf.user) {
             continue;
         }
         tx.conn().execute(

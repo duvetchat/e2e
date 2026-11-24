@@ -2170,6 +2170,44 @@ fn a_device_with_the_id_of_another_user_s_removed_one_applies_late() {
     assert!(device_set(&c1.group(conversation)).contains(&shared));
 }
 
+/// A removes B, which C1 applies, and adds B back while C1 is away; then B takes B2 off its list,
+/// which C1 sees before it's back (from another conversation, say). B2 left the group with its
+/// user, not as a device, so the record of the devices the group took out doesn't hold it, and B's
+/// return applies late, as any device's that left its list after the server took it.
+#[test]
+fn a_device_whose_user_left_and_came_back_applies_late() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1, mut b1, mut b2, mut c1] = new_devices(&mut server, [a, b, b, c]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b, c], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2, &mut c1]);
+
+    let remove = json!({"cmd": "remove_members", "conversation_id": conversation, "users": [b]});
+    server.commit(&mut a1, conversation, remove).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
+    take_queue(&server, &mut c1, conversation);
+    assert!(!device_set(&c1.group(conversation)).contains(&b2.id));
+
+    let add = adding(&mut server, conversation, b);
+    server.commit(&mut a1, conversation, add).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
+    let list = ok(
+        &mut b1.core,
+        json!({"cmd": "sign_device_list", "remove": [b2.id]}),
+    );
+    server.take_list(b, &list["device_list"]);
+    ok(&mut c1.core, server.observed(b));
+
+    let (_, taken) = take_queue(&server, &mut c1, conversation);
+    let taken = results(&[taken]);
+    let commit = taken.iter().find(|result| result[1] == "commit").unwrap();
+    assert_eq!(commit[2], "applied", "{taken:?}");
+    assert_eq!(c1.group(conversation)["blocked"], false);
+    assert!(device_set(&c1.group(conversation)).contains(&b2.id));
+}
+
 /// While C1 is away, B leaves from B2, and A1's commit takes B out with B2's statement; then B takes
 /// B2 off its list, which C1 sees. The statement holds for C1 all the same: B's identity certified
 /// B2's leaf, and the server took the commit while B2 was listed.
