@@ -126,6 +126,47 @@ impl DeviceList {
     }
 }
 
+/// A device's word that a session is its own (decision 13): the session's random challenge, with
+/// the device's user, ID and HPKE key, signed by the device's own key. It needs no certificate, so
+/// a device binds its HPKE key itself from its first session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BindProof {
+    pub v: u32,
+    pub user: Uuid,
+    pub device: Uuid,
+    #[serde(with = "serde_bytes")]
+    pub hpke_key: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub challenge: Vec<u8>,
+}
+
+impl BindProof {
+    pub fn new(user: Uuid, device: Uuid, hpke_key: [u8; 32], challenge: [u8; 32]) -> Self {
+        Self {
+            v: 1,
+            user,
+            device,
+            hpke_key: hpke_key.into(),
+            challenge: challenge.into(),
+        }
+    }
+
+    /// Signs the proof with the device's key.
+    pub fn sign(&self, device: &impl Signer) -> Result<Vec<u8>, SignerError> {
+        signed::sign(signed::DEVICE_BIND, encode(self), device)
+    }
+
+    /// The proof, once it verifies with `signature_key`, the device's.
+    pub fn verify(signed: &[u8], signature_key: &[u8; 32]) -> Result<Self, RuleViolation> {
+        let proof: Self = decode(&signed::verify(signed::DEVICE_BIND, signed, signature_key)?)?;
+        if proof.v == 1 && proof.hpke_key.len() == 32 && proof.challenge.len() == 32 {
+            Ok(proof)
+        } else {
+            Err(RuleViolation::Malformed)
+        }
+    }
+}
+
 /// A user's word that they leave a conversation, signed by one of their devices.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaveStatement {

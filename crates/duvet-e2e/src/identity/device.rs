@@ -1,6 +1,6 @@
 //! This device's keys, and the key packages it hands out so others can add it to their groups.
 
-use duvet_e2e_rules::{SUITE, leaf_capabilities};
+use duvet_e2e_rules::{BindProof, SUITE, leaf_capabilities};
 use openmls::prelude::tls_codec::{DeserializeBytes as _, Serialize as _, VLBytes};
 use openmls::prelude::{KeyPackage, KeyPackageBundle, KeyPackageRef, SignatureScheme};
 use openmls_basic_credential::SignatureKeyPair;
@@ -11,7 +11,7 @@ use rusqlite::params;
 use serde::Serialize;
 use uuid::Uuid;
 
-use super::random;
+use super::{invalid, random, stored_key};
 use crate::protocol::b64;
 use crate::{Error, SqlStorageError, Tx};
 
@@ -72,6 +72,31 @@ pub(crate) fn create_device(
         signature_key: signer.to_public_vec(),
         hpke_key: hpke.public,
     })
+}
+
+#[derive(Serialize)]
+pub(crate) struct Bound {
+    #[serde(with = "b64")]
+    proof: Vec<u8>,
+}
+
+/// The proof that binds a session to this device (decision 13): the session's 32-byte challenge,
+/// with the device's user, ID and HPKE key, signed by the device's own key. From `create_device`
+/// on: it needs no certificate.
+pub(crate) fn bind_proof(tx: &Tx<'_>, challenge: &[u8]) -> Result<Bound, Error> {
+    let challenge: [u8; 32] = challenge
+        .try_into()
+        .map_err(|_| invalid("challenge", "the challenge is 32 bytes"))?;
+    let own = tx.own_device()?;
+    let proof = BindProof::new(
+        own.user,
+        own.device,
+        stored_key(&own.hpke.public)?,
+        challenge,
+    )
+    .sign(&own.signer)
+    .map_err(|_| Error::Internal("the device couldn't sign".into()))?;
+    Ok(Bound { proof })
 }
 
 #[derive(Serialize)]

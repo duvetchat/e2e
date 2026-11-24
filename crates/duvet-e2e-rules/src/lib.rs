@@ -17,7 +17,7 @@ use uuid::Uuid;
 pub use extract::{
     Committer, Leaf, Leaves, MembershipChange, NewLeaf, Removed, extract_change, leaves,
 };
-pub use identity::{DeviceCertificate, DeviceList, LeaveStatement};
+pub use identity::{BindProof, DeviceCertificate, DeviceList, LeaveStatement};
 pub use members::{CommitAad, Entry, Kind, MAX_MEMBERS, MEMBER_LIST_EXTENSION, MemberList};
 pub use rules::{
     Place, Record, RuleContext, RuleViolation, certified, check_applied_change, check_change,
@@ -25,7 +25,8 @@ pub use rules::{
     unlisted_candidates,
 };
 pub use signed::{
-    DEVICE_CERTIFICATE, DEVICE_LIST, DIRECT_MESSAGE, HISTORY_SHARE, LEAVE, sign, verify,
+    DEVICE_BIND, DEVICE_CERTIFICATE, DEVICE_LIST, DIRECT_MESSAGE, HISTORY_SHARE, LEAVE, sign,
+    verify,
 };
 
 /// Duvet's one ciphersuite, 0x0001: X25519, AES-128-GCM, SHA-256 and Ed25519.

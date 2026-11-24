@@ -4,10 +4,12 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use duvet_e2e_rules::{
-    CommitAad, DeviceCertificate, DeviceList, Entry, Kind, LeaveStatement, MEMBER_LIST_EXTENSION,
-    MemberList, MembershipChange, Removed, RuleContext, RuleViolation, SUITE, check_applied_change,
-    check_change, check_joined_state, check_state, extract_change, group_config, group_id,
-    is_record, join_config, keeps_record, leaf_capabilities, leaves,
+    BindProof, CommitAad, DEVICE_BIND, DEVICE_CERTIFICATE, DEVICE_LIST, DIRECT_MESSAGE,
+    DeviceCertificate, DeviceList, Entry, HISTORY_SHARE, Kind, LEAVE, LeaveStatement,
+    MEMBER_LIST_EXTENSION, MemberList, MembershipChange, Removed, RuleContext, RuleViolation,
+    SUITE, check_applied_change, check_change, check_joined_state, check_state, extract_change,
+    group_config, group_id, is_record, join_config, keeps_record, leaf_capabilities, leaves, sign,
+    verify,
 };
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
@@ -1941,6 +1943,77 @@ fn signed_objects_reject_tampering() {
         DeviceList::verify(&list, &public(&stranger.identity)),
         Err(RuleViolation::InvalidSignature)
     );
+}
+
+/// A bind proof is no other signed object, and no other is a bind proof: each signs under its own
+/// label, so the same key and the same body don't carry from one to another.
+#[test]
+fn bind_proof_is_domain_separated() {
+    let user = User::new(1);
+    let device = &user.devices[0];
+    let key = public(&device.signer);
+    let proof = BindProof::new(user.id, device.id, [7; 32], [0xc4; 32])
+        .sign(&device.signer)
+        .unwrap();
+    assert!(BindProof::verify(&proof, &key).is_ok());
+    let others = [
+        DEVICE_CERTIFICATE,
+        DEVICE_LIST,
+        LEAVE,
+        DIRECT_MESSAGE,
+        HISTORY_SHARE,
+    ];
+
+    // The proof verifies as nothing else the device's key could sign...
+    let certificate = DeviceCertificate::read_unverified(&device.certificate).unwrap();
+    assert_eq!(
+        LeaveStatement::verify(&proof, &certificate),
+        Err(RuleViolation::InvalidSignature)
+    );
+    assert_eq!(
+        DeviceCertificate::verify(&proof, &key),
+        Err(RuleViolation::InvalidSignature)
+    );
+    assert_eq!(
+        DeviceList::verify(&proof, &key),
+        Err(RuleViolation::InvalidSignature)
+    );
+    for label in others {
+        assert_eq!(
+            verify(label, &proof, &key),
+            Err(RuleViolation::InvalidSignature),
+            "{label}"
+        );
+    }
+
+    // ...its body, signed under another label, isn't a proof...
+    let body = verify(DEVICE_BIND, &proof, &key).unwrap();
+    for label in others {
+        let signed = sign(label, body.clone(), &device.signer).unwrap();
+        assert_eq!(
+            BindProof::verify(&signed, &key),
+            Err(RuleViolation::InvalidSignature),
+            "{label}"
+        );
+    }
+
+    // ...and nothing else the device signs is one.
+    let statement = LeaveStatement::new(user.id, CONVERSATION, GENERATION, 1, device.id)
+        .sign(&device.signer)
+        .unwrap();
+    let list = user.list.sign(&device.signer).unwrap();
+    let certified = certificate.sign(&device.signer).unwrap();
+    for (what, signed) in [
+        ("a leave statement", statement),
+        ("a device list", list),
+        ("a certificate", certified),
+    ] {
+        assert_eq!(
+            BindProof::verify(&signed, &key),
+            Err(RuleViolation::InvalidSignature),
+            "{what}"
+        );
+    }
 }
 
 #[test]

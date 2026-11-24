@@ -210,12 +210,14 @@ impl Queue {
 
 #[test]
 fn opens_the_previous_version_db() {
+    // A schema's fixtures are `db-vN.*`: the folder holds other fixtures too.
     let mut versions: Vec<PathBuf> = std::fs::read_dir(fixtures())
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "json")
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("db-v") && name.ends_with(".json"))
         })
         .collect();
     versions.sort();
