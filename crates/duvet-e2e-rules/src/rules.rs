@@ -128,13 +128,20 @@ pub fn check_change(ctx: &RuleContext, change: &MembershipChange) -> Result<(), 
 /// takes it out (the core's `ready_to_send` and `commit_pending`).
 ///
 /// It doesn't tell a commit the server took while the device was listed from one it let in past
-/// its validator after: a lost device, back by the server's leave under the identity its user had
-/// before the device was left out of a rotation. The core asks it only of a commit that brings back
-/// no device the group took out as the member saw it (`brings_back_removed`), so a member that
-/// applied that device's removal refuses its return. A member that didn't (it entered after) lets
-/// it in, and until its next commit that device is its user there: its commits count as its user's
-/// (an owner's add and remove members, and stay), its edits and deletions of its user's messages
-/// apply, what it sends shows as its user's, and a leave statement it signs takes its user out.
+/// its validator after. So the core narrows `earlier_identities` to what the group shows (its
+/// `check_applied`): an identity the user had before certifies a leaf only while the group still
+/// lives in it, that is, it certifies a leaf of theirs there, none of theirs carries the pinned
+/// identity's certificate, and the group took out no device of theirs under it. And it asks this
+/// only of a commit that brings back no device the group took out (`brings_back_removed`).
+/// Whoever holds a device lost to a rotation keeps the identity from before, and gets no device in
+/// under it, a new device ID included, where the group shows the rotation. What's left is a group
+/// that shows nothing of it yet (no leaf of that user renewed under the new identity, none of
+/// theirs taken out under the old one), where an honest late join looks the same: there it comes
+/// in, and until the member's next commit takes it out that device is its user: its commits count
+/// as its user's (an owner's add and remove members, and stay), its edits and deletions of its
+/// user's messages apply, what it sends shows as its user's, and a leave statement it signs takes
+/// its user out. A device only taken off its list holds the identity its user still has, which
+/// signs lists: only a rotation takes that from it.
 pub fn check_applied_change(
     ctx: &RuleContext,
     change: &MembershipChange,

@@ -279,10 +279,10 @@ impl Conversation {
 /// knowledge refuses it again. Then a leaf, or a leave statement's signer, that only its user's
 /// latest list refuses, or that an identity the user had before certified, is let in
 /// (`check_applied_change`): the server took the commit then, and the device may have left the list
-/// since. But not a device this device saw the group take out (`brings_back_removed`): its return
-/// is refused, and blocks. This device's own commit never blocks it: one the server answered as
-/// refused is merged when the queue brings it back, and dropped once the queue shows it never
-/// entered.
+/// since. But not a device this device saw the group take out (`brings_back_removed`), nor one an
+/// identity from before certified where the group has moved past it (`check_applied`): those are
+/// refused, and block. This device's own commit never blocks it: one the server answered as refused
+/// is merged when the queue brings it back, and dropped once the queue shows it never entered.
 struct Commits;
 
 impl EntryHandler for Commits {
