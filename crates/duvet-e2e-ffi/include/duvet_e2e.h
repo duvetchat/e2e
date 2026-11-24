@@ -19,7 +19,9 @@ extern "C" {
  *
  * `config_json` is `{"path", "db_key"}`, the raw 32-byte key in base64, or
  * `{"path", "keyring": {"service", "account"}}`, which takes the key from the system's keyring
- * and makes it on the database's first open.
+ * and makes it on the database's first open. An entry keeps one database's key, which
+ * `duvet_e2e_destroy` deletes with that database: give each database a service and account of its
+ * own.
  *
  * An open through the keyring waits, with no limit, while another open of the same database
  * chooses its key (`<path>.key.lock`), that open's keyring prompt included, and asking the keyring
@@ -52,7 +54,8 @@ void duvet_e2e_close(uint64_t handle);
  * entry or `<path>.key`. Answers `{"ok":{}}`, also when there was nothing to delete, or the error
  * reply: `locked` while a handle has the database open, and nothing is deleted then.
  *
- * `config_json` is what `duvet_e2e_open` takes; `db_key`'s key is the caller's to forget.
+ * `config_json` is what `duvet_e2e_open` takes; `db_key`'s key is the caller's to forget. The
+ * keyring's entry goes whatever other database was opened with it: each database has its own.
  * `<path>.key.lock` and `<path>.lock` stay, empty: an open may be waiting for the one, or about to
  * lock the other.
  *
