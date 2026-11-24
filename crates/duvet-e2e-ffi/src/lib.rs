@@ -124,6 +124,10 @@ pub extern "C" fn duvet_e2e_close(handle: u64) {
 ///
 /// `config_json` is what `duvet_e2e_open` takes; `db_key`'s key is the caller's to forget. The
 /// keyring's entry goes whatever other database was opened with it: each database has its own.
+///
+/// It waits, with no limit, while an open of the same database chooses its key (`<path>.key.lock`),
+/// that open's keyring prompt included, and deleting the entry can raise a prompt of the keyring's
+/// own: call it off the thread that draws the app.
 /// `<path>.key.lock` and `<path>.lock` stay, empty: an open may be waiting for the one, or about to
 /// lock the other.
 ///
