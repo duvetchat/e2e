@@ -148,8 +148,9 @@ class RustBuilder {
   CargoBuildOptions? get _buildOptions =>
       environment.crateOptions.cargo[environment.configuration];
 
-  // Duvet: unless cargokit.yaml names one, the toolchain rust-toolchain.toml pins, which every
-  // other build of the workspace takes, where cargokit's own default is rustup's stable.
+  // Duvet: the toolchain rust-toolchain.toml pins, which every other build of the workspace takes,
+  // where cargokit's own default is rustup's stable. A cargokit.yaml section for the build's
+  // configuration, even one with extra_flags alone, puts it back on stable.
   String get _toolchain =>
       _buildOptions?.toolchain.name ??
       _pinnedToolchain(environment.manifestDir) ??
