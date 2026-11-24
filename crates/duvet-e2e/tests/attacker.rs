@@ -378,6 +378,15 @@ fn rotate_out(
     assert!(!device_set(member, conversation).contains(&lost));
 }
 
+/// Whether a group's state (`group`'s reply) has a leaf of `user`'s `device`.
+fn holds(state: &Value, user: Uuid, device: Uuid) -> bool {
+    state["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|leaf| leaf["user_id"] == json!(user) && leaf["device_id"] == json!(device))
+}
+
 /// The secret of the identity `device` holds, as whoever holds the device reads it.
 fn held_identity(device: &mut TestDevice) -> [u8; 32] {
     device.rolled_back(|tx| {
@@ -1223,6 +1232,55 @@ fn server_lets_a_device_in_under_a_replaced_identity_before_its_user_renews() {
     assert!(!devices(&state).contains(&a2.id) && devices(&state).contains(&a3.id));
 
     let mut z = forged_device(&mut server, a, &secret, &old, &[b]);
+    let seq = forced_join(&mut server, &mut z, conversation);
+    let state = refuses(&server, &mut b1, conversation, seq, "leaf_not_signed");
+    assert!(!devices(&state).contains(&z.id));
+}
+
+/// The same, where Y, whom B adds, has a device whose ID is A2's: a member that works with the
+/// server, as a device's ID is its client's choice. B1 takes A2 out, and notes A2 and the identity
+/// that certified it by their user and ID: Y's device, which stays, isn't A2. So Z is refused
+/// (`leaf_not_signed`).
+#[test]
+fn server_lets_a_device_in_under_a_replaced_identity_past_a_device_with_the_lost_one_s_id() {
+    let mut server = FakeServer::new();
+    let (a, b, y) = (new_id(), new_id(), new_id());
+    let [mut a2, mut a3, mut b1] = new_devices(&mut server, [a, a, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(b), &[a, b], false);
+    start(&mut server, &mut b1, conversation);
+    server.deliver_all(&mut [&mut a2, &mut a3, &mut b1]);
+    let mut yd = server.device_with_id(y, a2.id);
+    server.publish(&mut yd);
+    for device in [&mut b1, &mut yd] {
+        server.introduce(device);
+    }
+    let add = adding(&mut server, conversation, y);
+    server.commit(&mut b1, conversation, add).unwrap();
+    let mut a1 = server.device(a);
+    server.introduce(&mut a1);
+    let old = server.observed(a);
+    let secret = held_identity(&mut a2);
+    let rotated = ok(
+        &mut a1.core,
+        json!({"cmd": "rotate_keys", "remove": [a2.id], "certificates": old["certificates"]}),
+    );
+    server.take_identity(a, &rotated);
+    assert_eq!(ok(&mut b1.core, server.observed(a))["state"], "changed");
+    let asked = error(&mut b1.core, command("commit_pending", conversation));
+    assert_eq!(asked["code"], "needs_identities");
+    ok(&mut b1.core, server.observed(a));
+    server
+        .commit(
+            &mut b1,
+            conversation,
+            command("commit_pending", conversation),
+        )
+        .unwrap();
+    let state = b1.group(conversation);
+    assert!(!holds(&state, a, a2.id) && holds(&state, y, a2.id));
+
+    let mut z = forged_device(&mut server, a, &secret, &old, &[b, y]);
     let seq = forced_join(&mut server, &mut z, conversation);
     let state = refuses(&server, &mut b1, conversation, seq, "leaf_not_signed");
     assert!(!devices(&state).contains(&z.id));

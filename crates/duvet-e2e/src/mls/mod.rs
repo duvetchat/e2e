@@ -392,15 +392,16 @@ pub(crate) fn note_removed(
     before: &Leaves,
     group: &MlsGroup,
 ) -> Result<(), Error> {
-    let staying: BTreeSet<Uuid> = leaves(group.members())
+    // By user and ID: another user's device with that ID isn't this one.
+    let staying: BTreeSet<(Uuid, Uuid)> = leaves(group.members())
         .map_err(|_| stored_state())?
         .values()
-        .map(|leaf| leaf.device)
+        .map(|leaf| (leaf.user, leaf.device))
         .collect();
     let listed = MemberList::from_group_context(group.public_group().group_context())
         .map_err(|_| stored_state())?;
     for leaf in before.values() {
-        if staying.contains(&leaf.device) || !listed.contains(leaf.user) {
+        if staying.contains(&(leaf.user, leaf.device)) || !listed.contains(leaf.user) {
             continue;
         }
         tx.conn().execute(
@@ -847,9 +848,10 @@ pub(crate) fn check(
 /// a leaf it brings, or a leave statement's signer, may be off its user's latest list, certified by
 /// the identity pinned for its user or, off that list, by one this device knows the user had before
 /// while the group still lives in it: that identity certifies a leaf of theirs there, none of theirs
-/// carries the pinned identity's certificate, and the group took out no device of theirs under it
-/// ([`note_removed`]). `apply` asks it only of a commit that brings back no device the group took
-/// out ([`brings_back_removed`]).
+/// carries the pinned identity's certificate, and no removal this device applied or made noted it
+/// ([`note_removed`]: a leaf it certified, taken out once this device pinned another). `apply`
+/// asks it only of a commit that brings back no device the group took out
+/// ([`brings_back_removed`]).
 pub(crate) fn check_applied(
     tx: &Tx<'_>,
     change: &MembershipChange,

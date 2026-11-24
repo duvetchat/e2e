@@ -135,13 +135,17 @@ pub fn check_change(ctx: &RuleContext, change: &MembershipChange) -> Result<(), 
 /// only of a commit that brings back no device the group took out (`brings_back_removed`).
 /// Whoever holds a device lost to a rotation keeps the identity from before, and gets no device in
 /// under it, a new device ID included, where the group shows the rotation. What's left is a group
-/// that shows nothing of it yet (no leaf of that user renewed under the new identity, none of
-/// theirs taken out under the old one), where an honest late join looks the same: there it comes
-/// in, and until the member's next commit takes it out that device is its user: its commits count
-/// as its user's (an owner's add and remove members, and stay), its edits and deletions of its
-/// user's messages apply, what it sends shows as its user's, and a leave statement it signs takes
-/// its user out. A device only taken off its list holds the identity its user still has, which
-/// signs lists: only a rotation takes that from it.
+/// that shows the member nothing of it yet: no leaf of that user renewed under the new identity,
+/// and none of theirs taken out under the old one since the member pinned the new one (one taken
+/// out before, as a device taken off its list first and the keys changed later, is noted without
+/// its identity). An honest late join looks the same there, so it comes in. The server holds that
+/// open, not the member: as long as it keeps the user's renewal out of the queue, once per
+/// conversation (taking out what came in notes the identity), and until a commit that takes it out
+/// enters. Till then that device is its user: its commits count as its user's (an owner's add and
+/// remove members, and stay), its edits and deletions of its user's messages apply, what it sends
+/// shows as its user's, and a leave statement it signs takes its user out. A device only taken off
+/// its list holds the identity its user still has, which signs lists: only a rotation takes that
+/// from it.
 pub fn check_applied_change(
     ctx: &RuleContext,
     change: &MembershipChange,
