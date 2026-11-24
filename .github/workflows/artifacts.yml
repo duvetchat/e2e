@@ -1,0 +1,135 @@
+name: Artifacts
+
+# The core as each client takes it, which never compiles Rust: the C ABI for Linux and Windows, the
+# web's WebAssembly, and the Flutter plugin for Linux and Android. Started by hand on main, it
+# publishes them as the release artifacts-<commit>. A new workflow can only be started by hand from
+# main, so a pull request that changes this one builds and checks them without publishing.
+on:
+  pull_request:
+    branches: [main]
+    paths: [.github/workflows/artifacts.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_HOME: /cache/cargo
+
+jobs:
+  artifacts:
+    runs-on: [self-hosted, linux, x64, duvet]
+    timeout-minutes: 120
+    # One run at a time, and every run waits its turn: they share the target directory, and a run
+    # publishes the files it built.
+    concurrency:
+      group: artifacts
+      queue: max
+    permissions:
+      contents: write
+    container:
+      image: docker.io/library/rust:1.99.1-bookworm
+      volumes:
+        - /var/cache/duvet-e2e:/cache
+        # For its NDK. Read-only: the runner's other jobs build with it.
+        - /opt/android-sdk:/opt/android-sdk:ro
+    env:
+      CARGO_TARGET_DIR: /cache/target/artifacts
+      # The NDK of Flutter 3.47.7, which the runner's Android builds installed.
+      NDK_BIN: /opt/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The builds run every dependency's build script: none of them finds the token that publishes.
+          persist-credentials: false
+      # SQLCipher's C is compiled for wasm32 with clang, and for Windows with mingw-w64.
+      - name: Install clang, mingw-w64, gh, wasm-bindgen 0.2.130 and the Windows and Android targets
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends clang lld llvm gcc-mingw-w64-x86-64 gh
+          curl -sSfL -o /tmp/wasm-bindgen.tar.gz https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.130/wasm-bindgen-0.2.130-x86_64-unknown-linux-musl.tar.gz
+          echo "9687f3bb551b9f66f37ed32a40d7913a00f7962db653054e56857bc306c3227f  /tmp/wasm-bindgen.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/wasm-bindgen.tar.gz -C /tmp && install /tmp/wasm-bindgen-0.2.130-x86_64-unknown-linux-musl/wasm-bindgen /usr/local/bin/
+          rustup target add x86_64-pc-windows-gnu aarch64-linux-android
+          [ -x "$NDK_BIN/aarch64-linux-android21-clang" ] || { echo "The runner has no NDK at $NDK_BIN"; exit 1; }
+      # Each package on its own, as CI builds it: built together, they'd share their dependencies' features.
+      - name: Linux x64, the C ABI
+        run: cargo build --locked --release -p duvet-e2e-ffi
+      - name: Linux x64, the Flutter plugin
+        run: cargo build --locked --release -p duvet_e2e
+      - name: Windows x64, the C ABI
+        run: cargo build --locked --release --target x86_64-pc-windows-gnu -p duvet-e2e-ffi
+      - name: The web, the core in WebAssembly
+        run: cargo build --locked --release --target wasm32-unknown-unknown -p duvet-e2e-wasm
+      # Linked as cargokit links it for an APK: the NDK's clang for API 21, the lowest it takes.
+      - name: Android arm64-v8a, the Flutter plugin
+        env:
+          CC_aarch64_linux_android: ${{ env.NDK_BIN }}/aarch64-linux-android21-clang
+          AR_aarch64_linux_android: ${{ env.NDK_BIN }}/llvm-ar
+          RANLIB_aarch64_linux_android: ${{ env.NDK_BIN }}/llvm-ranlib
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ env.NDK_BIN }}/aarch64-linux-android21-clang
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: -C link-arg=-Wl,--hash-style=both -C link-arg=-Wl,-z,max-page-size=16384
+        run: cargo build --locked --release --target aarch64-linux-android -p duvet_e2e
+      # A release's files sit side by side, so the Android library takes its folder in its name.
+      - name: Gather the files and their SHA256SUMS
+        run: |
+          rm -rf dist /tmp/web && mkdir dist
+          cp "$CARGO_TARGET_DIR/release/libduvet_e2e_ffi.so" "$CARGO_TARGET_DIR/release/libduvet_e2e.so" dist/
+          cp "$CARGO_TARGET_DIR/x86_64-pc-windows-gnu/release/duvet_e2e_ffi.dll" dist/
+          cp "$CARGO_TARGET_DIR/aarch64-linux-android/release/libduvet_e2e.so" dist/android-arm64-v8a-libduvet_e2e.so
+          wasm-bindgen --target web --out-name duvet_e2e_wasm --out-dir /tmp/web "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/duvet_e2e_wasm.wasm"
+          cp /tmp/web/duvet_e2e_wasm.js /tmp/web/duvet_e2e_wasm_bg.wasm dist/
+          cd dist && sha256sum -- * > SHA256SUMS
+      # Before the checks, so a run they fail still shows what it built. The desktop's and mobile's
+      # Linux tests load the Linux libraries on other machines, whose glibc may be older.
+      - name: Each file's size, the checksums and the glibc the Linux libraries need, in the summary
+        run: |
+          glibc=$(objdump -T dist/libduvet_e2e_ffi.so dist/libduvet_e2e.so | grep -o 'GLIBC_[0-9][0-9.]*' | sort -uV | tail -n1)
+          {
+            echo "| File | Bytes |"
+            echo "|---|---:|"
+            for file in dist/*; do echo "| \`${file#dist/}\` | $(stat -c %s "$file") |"; done
+            echo
+            echo "The Linux libraries need ${glibc/_/ } or later."
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      # A user's PC has none of mingw-w64's runtime (libgcc_s, libwinpthread): the DLL may import
+      # nothing but Windows' own DLLs, or it must link that runtime statically.
+      - name: The DLL imports only Windows' own DLLs
+        run: |
+          imports=$(x86_64-w64-mingw32-objdump -p dist/duvet_e2e_ffi.dll | sed -n 's/^[[:space:]]*DLL Name: //p' | tr '[:upper:]' '[:lower:]' | sort -u)
+          echo "$imports"
+          [ -n "$imports" ] || { echo "objdump listed no imports"; exit 1; }
+          others=$(grep -Evx '(advapi32|bcrypt|bcryptprimitives|crypt32|gdi32|kernel32|msvcrt|ncrypt|ntdll|ole32|oleaut32|rpcrt4|secur32|shell32|ucrtbase|user32|userenv|ws2_32|api-ms-win-[a-z0-9-]+)\.dll' <<< "$imports" || true)
+          [ -z "$others" ] || { echo "Not Windows' own: $others"; exit 1; }
+      - name: The Android library needs only libc, libm, libdl and liblog, and has 16 KiB pages
+        run: |
+          lib=dist/android-arm64-v8a-libduvet_e2e.so
+          needed=$("$NDK_BIN/llvm-readelf" --dynamic "$lib" | sed -n 's/.*(NEEDED).*\[\(.*\)\]$/\1/p')
+          echo "$needed"
+          [ -n "$needed" ] || { echo "llvm-readelf listed no libraries"; exit 1; }
+          others=$(grep -Evx 'lib(c|m|dl|log)\.so' <<< "$needed" || true)
+          [ -z "$others" ] || { echo "It needs more: $others"; exit 1; }
+          aligns=$("$NDK_BIN/llvm-readelf" --program-headers --wide "$lib" | awk '$1 == "LOAD" { print $NF }')
+          [ -n "$aligns" ] || { echo "llvm-readelf listed no LOAD segments"; exit 1; }
+          for align in $aligns; do
+            (( align % 16384 == 0 )) || { echo "A LOAD segment is aligned to $align, not 16 KiB"; exit 1; }
+          done
+      # gh creates the release as a draft and publishes it once every file is up. A commit's release
+      # is made once: a second run fails, as its tag exists.
+      - name: Publish the release artifacts-<commit>
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="artifacts-${GITHUB_SHA:0:7}"
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$tag" \
+            --notes "The core built for each client from $GITHUB_SHA, by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID." \
+            ./*
