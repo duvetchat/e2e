@@ -1520,6 +1520,22 @@ fn write_vectors() {
     stale.new_group_info = Some(ByteBuf::from(chat.info.clone()));
     vectors.add("stale_group_info", &stale);
 
+    // The largest group the API takes, 20 people with 20 devices each: its start, and the widest
+    // commit right after it, an update by a member who didn't make the start, whose path is
+    // encrypted to every other leaf.
+    let world = World::new(&[20; 20]);
+    let everyone: Vec<usize> = (0..20).collect();
+    let members = world.list(Kind::Group, Some(O), &everyone);
+    let joined: Vec<(usize, usize)> = (0..20)
+        .flat_map(|user| (0..20).map(move |device| (user, device)))
+        .filter(|&device| device != (O, 0))
+        .collect();
+    let first = world.first_commit((O, 0), &members, &joined);
+    let created = vectors.add("largest-create", &world.create_request(&first, &members));
+    let mut chat = Chat::created_for(world, first, &created, &[(A, 0)]);
+    let staged = chat.stage((A, 0), Commit::default());
+    vectors.add("largest-commit", &chat.request(&staged));
+
     let outcomes: Vec<(&str, bool, Option<u64>, Option<&str>)> = vectors
         .vectors
         .iter()
@@ -1548,6 +1564,8 @@ fn write_vectors() {
             ("removal_committed", true, Some(4), None),
             ("external_join", true, Some(5), None),
             ("stale_group_info", false, None, Some("group_info_mismatch")),
+            ("largest-create", true, Some(1), None),
+            ("largest-commit", true, Some(2), None),
         ]
     );
     vectors.write();

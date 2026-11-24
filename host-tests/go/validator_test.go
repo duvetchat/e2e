@@ -199,7 +199,8 @@ func TestValidatorUnderWazero(t *testing.T) {
 	}
 	vectors := readVectors(t)
 
-	runtime := wazero.NewRuntime(ctx)
+	// The API's memory limit for the module: 1024 pages of 64 KiB, 64 MiB.
+	runtime := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig().WithMemoryLimitPages(1024))
 	t.Cleanup(func() {
 		if err := runtime.Close(ctx); err != nil {
 			t.Errorf("closing the runtime: %v", err)
@@ -221,6 +222,18 @@ func TestValidatorUnderWazero(t *testing.T) {
 			want := answer{ok: request.OK, epoch: request.Epoch, code: request.Code}
 			if got := v.answer(t, ctx, request); got != want {
 				t.Errorf("%s: got %+v, want %+v", request.Name, got, want)
+			}
+		}
+	})
+
+	t.Run("the largest group the API takes fits", func(t *testing.T) {
+		// 20 people with 20 devices each: its start, and the widest commit right after it, each
+		// on an instance of its own, in the API's 64 MiB.
+		for _, name := range []string{"largest-create", "largest-commit"} {
+			request := named(t, vectors, name)
+			v := instantiate(t, ctx, runtime, compiled, apis)
+			if got, want := v.answer(t, ctx, request), (answer{ok: true, epoch: request.Epoch}); got != want {
+				t.Errorf("%s (%d bytes): got %+v, want %+v", name, len(request.input), got, want)
 			}
 		}
 	})
