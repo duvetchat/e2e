@@ -17,9 +17,9 @@ use super::apply::Expected;
 use super::members::Committed;
 use super::{
     ConversationId, Extra, GroupRow, Pending, REFRESH_AFTER_MS, can_commit,
-    certify_leaves_by_pinned, delete_group, digest, draft, load_group, openmls_error, own_merged,
-    rule_context, stage, storage_error, stored_group, stored_state, tls, unlisted_leaves,
-    violation,
+    certify_leaves_by_pinned, delete_group, digest, draft, load_group, note_removed, openmls_error,
+    own_merged, rule_context, stage, storage_error, stored_group, stored_state, tls,
+    unlisted_leaves, violation,
 };
 use crate::identity::{invalid, not_found, stored_uuid};
 use crate::protocol::b64;
@@ -157,10 +157,22 @@ pub(crate) fn commit_result(tx: &Tx<'_>, request: CommitResult) -> Result<Epoch,
         return Ok(Epoch { epoch: None });
     }
 
+    // The leaves before: the devices a commit takes out, or a reset leaves out of the generation
+    // before, are noted.
+    let before = match pending {
+        Pending::Commit => Some(leaves(group.members()).map_err(|_| stored_state())?),
+        Pending::Reset => stored_group(tx, conversation, row.generation)?
+            .map(|old| leaves(old.members()).map_err(|_| stored_state()))
+            .transpose()?,
+        Pending::Create | Pending::External => None,
+    };
     if pending != Pending::External {
         group
             .merge_pending_commit(provider)
             .map_err(openmls_error)?;
+    }
+    if let Some(before) = before {
+        note_removed(tx, conversation, &before, &group)?;
     }
     if pending == Pending::Reset {
         delete_group(tx, conversation, row.generation)?;

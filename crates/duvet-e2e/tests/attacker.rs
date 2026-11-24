@@ -780,14 +780,9 @@ fn server_replays_old_commit() {
 }
 
 /// The server serves a user's list from before a device left it. A device that knows the newer
-/// list refuses the older one (`older_list`), its own user's included, and keeps the newer one.
-/// When the server lets the left device back in past its validator, a member takes the commit (its
-/// user's identity certified that leaf, and a member applying a commit late can't tell it from one
-/// the server took while the device was listed), but sends nothing while the leaf is in, and its
-/// next commit takes it out, whatever list the server serves then: the left device opens nothing
-/// the member sends after it.
-///
-/// The cost: until that commit, what the left device sends shows as its user's.
+/// list refuses the older one (`older_list`), its own user's included, and keeps the newer one;
+/// with it, it refuses a commit that brings the left device back, its own external commit included
+/// (`device_not_listed`), whatever list the server serves then.
 ///
 /// `recover`'s limit: a recovering device knows no list, takes the one the server serves, and signs
 /// it with itself into the next one. Devices that know a newer list refuse what it signs, a version
@@ -850,9 +845,7 @@ fn server_serves_old_device_list() {
     }
 
     // A2, which still holds the older list, joins by external commit; the server takes it past its
-    // validator. B1 asks about A first, is served the older list again, and takes the commit: A's
-    // identity certified A2's leaf. B1 sends nothing while it's in: it asks about A again, is served
-    // the older list again, and its next commit takes A2 out. A2 opens nothing B1 sends after it.
+    // validator. B1 asks about A first, is served the older list again, and refuses the commit.
     let joined = ok(&mut a2.core, joining(&server, conversation));
     let commit = bytes(&joined["commit"]);
     assert_eq!(
@@ -866,40 +859,16 @@ fn server_serves_old_device_list() {
     );
     let seq = server.force(conversation, "commit", commit);
     let forced = entry(&server, conversation, seq);
-    let (observed, taken) =
+    let (observed, refused) =
         apply_observing(&mut b1, conversation, std::slice::from_ref(&forced), |_| {
             old.clone()
         });
     assert_eq!(observed, [json!("rejected")]);
-    assert_eq!(results(&[taken]), [json!([seq, "commit", "applied", null])]);
-    let asked = ready(&mut b1, conversation).unwrap_err();
     assert_eq!(
-        (&asked["code"], &asked["users"]),
-        (&json!("needs_identities"), &json!([a.to_string()]))
+        results(&[refused]),
+        [json!([seq, "commit", "rejected", "device_not_listed"])]
     );
-    let seen = ok(&mut b1.core, old.clone());
-    assert_eq!(
-        (&seen["state"], &seen["reason"]),
-        (&json!("rejected"), &json!("older_list"))
-    );
-    assert_eq!(
-        ready(&mut b1, conversation).unwrap_err()["code"],
-        "pending_proposals"
-    );
-    let removal = ok(&mut b1.core, command("commit_pending", conversation));
-    take_unchecked(&mut server, &mut b1, conversation, &removal);
-    assert_eq!(ready(&mut b1, conversation), Ok(()));
     assert!(!device_set(&mut b1, conversation).contains(&a2.id));
-    ok(
-        &mut a2.core,
-        json!({"cmd": "commit_result", "conversation_id": conversation, "accepted": true, "seq": seq}),
-    );
-    let (said, _) = say(&mut server, &mut b1, conversation, "sin A2");
-    run(
-        &mut a2.core,
-        &apply(conversation, &server.entries(conversation)),
-    );
-    assert_eq!(message(&mut a2, conversation, said), None);
 
     // A new device of A's recovers with A's key against the older list: it signs that list, with
     // itself and A2, into the next version. A1 and B1, which hold that version with A1 alone,
@@ -937,6 +906,106 @@ fn server_serves_old_device_list() {
     assert_eq!(seen, json!({"state": "new", "verified": false}));
     let taken = c1.rolled_back(|tx| tx.device_list_of(a)).unwrap();
     assert!(taken.contains(a2.id));
+}
+
+/// A changes its keys without A2, which it lost, and A1's commit takes A2 out of A's group. The
+/// server lets A2 back in by its own external commit, past its validator, under the identity A had
+/// before. B1 and A1, which applied A2's removal, refuse its return as the latest list refuses it
+/// (`leaf_not_signed`), and block: what A2 makes after it (C added, an edit of A1's message, a
+/// message of its own) reaches neither.
+///
+/// The limit: a member that entered the group after A2's removal never applied it, and takes the
+/// return where it knows the identity that certified A2's leaf, as it takes any leaf a commit
+/// brings that its user's identity certified when the server took it.
+#[test]
+fn server_lets_a_removed_device_back() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1, mut a2, mut b1, _c1] = new_devices(&mut server, [a, a, b, c]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut a2, &mut b1]);
+    let (said, _) = say(&mut server, &mut a1, conversation, "before");
+    server.deliver_all(&mut [&mut a1, &mut a2, &mut b1]);
+
+    // A changes its keys without A2, and A1 takes A2 out. B1 observes A anew, and applies it.
+    let rotated = ok(
+        &mut a1.core,
+        json!({"cmd": "rotate_keys", "remove": [a2.id]}),
+    );
+    server.take_identity(a, &rotated);
+    ok(&mut a1.core, json!({"cmd": "identity_uploaded"}));
+    assert_eq!(
+        ready(&mut a1, conversation).unwrap_err()["code"],
+        "needs_identities"
+    );
+    ok(&mut a1.core, server.observed(a));
+    server
+        .commit(
+            &mut a1,
+            conversation,
+            command("commit_pending", conversation),
+        )
+        .unwrap();
+    let entries = server.entries(conversation);
+    let (observed, _) = apply_observing(&mut b1, conversation, &entries, |user| {
+        server.observed(user)
+    });
+    assert_eq!(observed, [json!("changed")]);
+    assert!(!device_set(&mut b1, conversation).contains(&a2.id));
+
+    // A2 joins by external commit, which the validator refuses; the server takes it anyway. A2,
+    // in the group as it holds it, adds C, edits what A1 said and writes a message of its own.
+    let joined = ok(&mut a2.core, joining(&server, conversation));
+    let commit = bytes(&joined["commit"]);
+    assert_eq!(
+        server
+            .check(conversation, &commit, &bytes(&joined["group_info"]))
+            .error
+            .unwrap()
+            .code,
+        "leaf_not_signed",
+        "the validator the server skips"
+    );
+    let seq = server.force(conversation, "commit", commit);
+    ok(
+        &mut a2.core,
+        json!({"cmd": "commit_result", "conversation_id": conversation, "accepted": true, "seq": seq}),
+    );
+    let added = ok(&mut a2.core, adding(&mut server, conversation, c));
+    take_unchecked(&mut server, &mut a2, conversation, &added);
+    let edited = ok(
+        &mut a2.core,
+        json!({"cmd": "edit", "conversation_id": conversation, "message_id": said, "text": "edited by A2"}),
+    );
+    server.post_change(
+        &a2,
+        conversation,
+        "edit",
+        said,
+        bytes(&edited["ciphertext"]),
+    );
+    let (forged, _) = say(&mut server, &mut a2, conversation, "written by A2");
+
+    // B1 and A1 refuse A2's return, and none of what A2 made after it reaches them.
+    let entries = server.entries(conversation);
+    for device in [&mut b1, &mut a1] {
+        let (_, reply) =
+            apply_observing(device, conversation, &entries, |user| server.observed(user));
+        assert!(
+            results(&[reply]).contains(&json!([seq, "commit", "rejected", "leaf_not_signed"])),
+            "A2's return is refused"
+        );
+        let state = device.group(conversation);
+        assert_eq!(state["blocked"], true);
+        assert!(!members(&state).contains(&c) && !devices(&state).contains(&a2.id));
+        assert_eq!(
+            message(device, conversation, said).unwrap()["text"],
+            "before"
+        );
+        assert!(message(device, conversation, forged).is_none_or(|shown| shown["text"].is_null()));
+    }
 }
 
 /// The API proposes removing A2, a device A took off its list, and an attacker server drops that

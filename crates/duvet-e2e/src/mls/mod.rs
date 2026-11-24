@@ -365,6 +365,83 @@ pub(crate) fn own_merged(tx: &Tx<'_>, row: &mut GroupRow, group: &MlsGroup) -> R
     Ok(())
 }
 
+/// Merges this device's waiting commit in `group`: what it took out is noted ([`note_removed`]),
+/// and the row follows ([`own_merged`]).
+pub(crate) fn merge_own(
+    tx: &Tx<'_>,
+    row: &mut GroupRow,
+    group: &mut MlsGroup,
+) -> Result<(), Error> {
+    let before = leaves(group.members()).map_err(|_| stored_state())?;
+    group
+        .merge_pending_commit(tx.provider())
+        .map_err(openmls_error)?;
+    note_removed(tx, row.conversation, &before, group)?;
+    own_merged(tx, row, group)
+}
+
+/// Notes the devices of `before`'s leaves that `group` no longer holds: a commit this device
+/// applied or made took them out of `conversation`'s group, or a reset left them out of its next
+/// generation. They stay out ([`brings_back_removed`]).
+pub(crate) fn note_removed(
+    tx: &Tx<'_>,
+    conversation: Uuid,
+    before: &Leaves,
+    group: &MlsGroup,
+) -> Result<(), Error> {
+    let staying: BTreeSet<Uuid> = leaves(group.members())
+        .map_err(|_| stored_state())?
+        .values()
+        .map(|leaf| leaf.device)
+        .collect();
+    for leaf in before.values() {
+        if !staying.contains(&leaf.device) {
+            tx.conn().execute(
+                "INSERT OR IGNORE INTO removed_devices (conversation_id, device_id) VALUES (?1, ?2)",
+                params![
+                    conversation.as_bytes().as_slice(),
+                    leaf.device.as_bytes().as_slice()
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether another device's commit brings back a device this device saw leave the conversation's
+/// group ([`note_removed`]), its device off its user's latest list as this device holds it. Such a
+/// commit is refused as [`check`] refuses it, whatever identity certified the leaf: a device the
+/// group took out (lost, then left out of a rotation or a list) doesn't come back by the server's
+/// leave. The cost: a device added again after its removal, and taken off its list since, blocks a
+/// member that applies its return late, as any such leaf did before `check_applied`.
+pub(crate) fn brings_back_removed(tx: &Tx<'_>, change: &MembershipChange) -> Result<bool, Error> {
+    let brought = change
+        .added
+        .iter()
+        .chain(change.updated.iter().map(|(_, leaf)| leaf));
+    for leaf in brought {
+        let Ok(claimed) = DeviceCertificate::read_unverified(&leaf.credential) else {
+            continue;
+        };
+        let listed = tx
+            .device_list_of(claimed.user)?
+            .is_some_and(|list| list.contains(claimed.device));
+        let removed: bool = tx.conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM removed_devices WHERE conversation_id = ?1 \
+             AND device_id = ?2)",
+            params![
+                change.conversation.as_bytes().as_slice(),
+                claimed.device.as_bytes().as_slice()
+            ],
+            |row| row.get(0),
+        )?;
+        if removed && !listed {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// The group stored for `conversation` at `generation`, while this device is in it.
 pub(crate) fn stored_group(
     tx: &Tx<'_>,
@@ -721,6 +798,8 @@ pub(crate) fn check(
 /// Holds another device's commit, as `apply` takes it late, to the rules ([`check_applied_change`]):
 /// a leaf it brings, or a leave statement's signer, may be off its user's latest list, certified by
 /// the identity pinned for its user or, off that list, by one this device knows the user had before.
+/// `apply` asks it only of a commit that brings back no device the group took out
+/// ([`brings_back_removed`]).
 pub(crate) fn check_applied(
     tx: &Tx<'_>,
     change: &MembershipChange,

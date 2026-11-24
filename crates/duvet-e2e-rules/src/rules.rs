@@ -126,6 +126,15 @@ pub fn check_change(ctx: &RuleContext, change: &MembershipChange) -> Result<(), 
 /// was taken since, or a new identity of its user. Refusing it then would block the group. The leaf
 /// is on its way out: no member that holds the newer list sends while it's in, and its next commit
 /// takes it out (the core's `ready_to_send` and `commit_pending`).
+///
+/// It doesn't tell a commit the server took while the device was listed from one it let in past
+/// its validator after: a lost device, back by the server's leave under the identity its user had
+/// before the device was left out of a rotation. The core asks it only of a commit that brings back
+/// no device the group took out as the member saw it (`brings_back_removed`), so a member that
+/// applied that device's removal refuses its return. A member that didn't (it entered after) lets
+/// it in, and until its next commit that device is its user there: its commits count as its user's
+/// (an owner's add and remove members, and stay), its edits and deletions of its user's messages
+/// apply, what it sends shows as its user's, and a leave statement it signs takes its user out.
 pub fn check_applied_change(
     ctx: &RuleContext,
     change: &MembershipChange,
