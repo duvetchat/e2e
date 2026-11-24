@@ -1160,3 +1160,238 @@ impl FakeServer {
         }
     }
 }
+
+// The end-to-end scenarios and the server as an attacker: what the server holds, the API's key as
+// an attacker server signs with it, and one installation opened again.
+
+impl FakeServer {
+    /// Every blob the server holds, each with where it holds it: each queue entry's MLS message,
+    /// the statement beside it and the fields the API adds to it; each group's info and its
+    /// validator state; the key packages; what waits in the inboxes; each user's identity key,
+    /// lists and certificates; and the nonces devices sent their messages under.
+    pub fn held(&self) -> Vec<(String, Vec<u8>)> {
+        let mut held = Vec::new();
+        for (conversation, chat) in &self.chats {
+            for entry in &chat.queue {
+                let place = format!("conversation {conversation}, entry {}", entry.seq);
+                held.push((format!("{place}: data"), entry.data.clone()));
+                if let Some(statement) = &entry.statement {
+                    held.push((format!("{place}: statement"), statement.clone()));
+                }
+                let meta = Value::Object(entry.meta.clone()).to_string();
+                held.push((format!("{place}: meta"), meta.into_bytes()));
+            }
+            if let Some(info) = &chat.group_info {
+                held.push((
+                    format!("conversation {conversation}: group info"),
+                    info.clone(),
+                ));
+            }
+            if let Some(state) = &chat.state {
+                held.push((
+                    format!("conversation {conversation}: state"),
+                    state.to_vec(),
+                ));
+            }
+        }
+        for (device, published) in &self.key_packages {
+            for key_package in published {
+                let data = STANDARD.decode(&key_package.data).expect("padded base64");
+                held.push((format!("device {device}: key package"), data));
+            }
+        }
+        for (device, inbox) in &self.inboxes {
+            for message in inbox {
+                held.push((format!("device {device}: inbox"), message.clone()));
+            }
+        }
+        for (user, record) in &self.users {
+            held.push((
+                format!("user {user}: identity key"),
+                record.identity_key.to_vec(),
+            ));
+            held.push((format!("user {user}: device list"), record.list.clone()));
+            for (device, certificate) in &record.certificates {
+                held.push((
+                    format!("user {user}: certificate of {device}"),
+                    certificate.clone(),
+                ));
+            }
+        }
+        for (device, nonce) in self.nonces.keys() {
+            held.push((format!("device {device}: nonce"), nonce.as_bytes().to_vec()));
+        }
+        held
+    }
+
+    /// The API's key, every group's external sender: what an attacker server signs its own
+    /// proposals with.
+    pub fn api_signer(&self) -> SignatureKeyPair {
+        SignatureKeyPair::from_raw(
+            SignatureScheme::ED25519,
+            self.api.to_bytes().to_vec(),
+            self.api.verifying_key().to_bytes().to_vec(),
+        )
+    }
+}
+
+impl TestDevice {
+    /// The same installation opened again: its client closed the core (a session that ended, a
+    /// logout, the app quitting) and opens the database it left, with its key.
+    pub fn reopened(self, clock: FakeClock) -> TestDevice {
+        let TestDevice {
+            core,
+            user,
+            id,
+            records,
+            _dir: dir,
+        } = self;
+        core.close();
+        let core = Core::open(OpenConfig {
+            clock: Box::new(clock),
+            ..OpenConfig::new(dir.path().join("core.db"), [1; 32])
+        })
+        .expect("the same database opens again");
+        TestDevice {
+            core,
+            user,
+            id,
+            records,
+            _dir: dir,
+        }
+    }
+}
+
+impl TestDevice {
+    /// The file of the device's database, which every command commits to before it answers.
+    pub fn db_path(&self) -> std::path::PathBuf {
+        self._dir.path().join("core.db")
+    }
+}
+
+impl FakeServer {
+    /// The server takes the commit `device` made (`reply`), and the device hears nothing: the
+    /// answer is still on its way. The commit's number.
+    pub fn take_unanswered(
+        &mut self,
+        device: &mut TestDevice,
+        conversation: Uuid,
+        reply: &Value,
+    ) -> u64 {
+        self.take(device, conversation, reply)
+            .expect("the server takes it")
+    }
+
+    /// The validator's request for `commit` on `conversation`'s state, in CBOR, as `check` builds
+    /// it: a seed for the fuzz target of the validator's input.
+    pub fn commit_request(&self, conversation: Uuid, commit: &[u8], group_info: &[u8]) -> Vec<u8> {
+        let chat = &self.chats[&conversation];
+        let request = Request {
+            state: chat.state.clone(),
+            message: Some(ByteBuf::from(commit.to_vec())),
+            new_group_info: Some(ByteBuf::from(group_info.to_vec())),
+            identities: self.identities(),
+            device_lists: self.device_lists(),
+            ..Request::new(Op::Commit, conversation, chat.generation.unwrap())
+        };
+        let mut out = Vec::new();
+        ciborium::into_writer(&request, &mut out).unwrap();
+        out
+    }
+}
+
+// A history package's import, for the tests that bound what an import holds (history_memory.rs,
+// hostile.rs).
+
+/// A group of A and B, a device each, both in it: its conversation and the devices.
+pub fn group(server: &mut FakeServer, a: Uuid, b: Uuid) -> (Uuid, TestDevice, TestDevice) {
+    let mut devices = [a, b].map(|user| server.device(user));
+    for device in &mut devices {
+        server.publish(device);
+    }
+    for device in &mut devices {
+        server.introduce(device);
+    }
+    let [mut a1, mut b1] = devices;
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+    let create = server.create_group(conversation);
+    server.commit(&mut a1, conversation, create).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    (conversation, a1, b1)
+}
+
+/// The certificates of `user`'s devices as the server serves them.
+pub fn certificates(server: &FakeServer, user: Uuid) -> Vec<Vec<u8>> {
+    server.observed(user)["certificates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(bytes)
+        .collect()
+}
+
+/// The certificate of `user`'s `device`, in base64.
+pub fn certificate(server: &FakeServer, user: Uuid, device: Uuid) -> String {
+    let found = certificates(server, user)
+        .into_iter()
+        .find(|signed| DeviceCertificate::read_unverified(signed).unwrap().device == device)
+        .expect("the device's certificate");
+    b64(&found)
+}
+
+/// A1's package of `deflated` records for B, whose key B1 takes: the command that imports it.
+pub fn import_of(
+    server: &FakeServer,
+    a1: &mut TestDevice,
+    b1: &mut TestDevice,
+    conversation: Uuid,
+    deflated: &[u8],
+) -> String {
+    import_package(server, a1, b1, conversation, |own, header| {
+        duvet_e2e::history::package(&own.signer, header, deflated)
+    })
+}
+
+/// The package `make` makes on A1 from its device and the share's header, sealed for B, whose key
+/// B1 takes: the command that imports it.
+pub fn import_package(
+    server: &FakeServer,
+    a1: &mut TestDevice,
+    b1: &mut TestDevice,
+    conversation: Uuid,
+    make: impl FnOnce(&duvet_e2e::OwnDevice, &duvet_e2e::history::Header) -> Result<Vec<u8>, Error>,
+) -> String {
+    use duvet_e2e::history::{self, Header, ShareKind};
+
+    let (a, b) = (a1.user, b1.user);
+    let devices = certificates(server, b);
+    let sealed = a1
+        .core
+        .transaction(|tx| {
+            let own = tx.own_device()?;
+            let header = Header {
+                kind: ShareKind::Share,
+                conversation,
+                user: a,
+                device: own.device,
+                to: b,
+            };
+            let package = make(&own, &header)?;
+            history::seal(tx, ShareKind::Share, conversation, b, &package, &devices)
+        })
+        .unwrap();
+    let shared = serde_json::to_value(&sealed).unwrap();
+    let key = json!({
+        "cmd": "receive_direct",
+        "message": shared["keys"][0]["message"],
+        "from_certificate": certificate(server, a, a1.id),
+    });
+    ok(&mut b1.core, key);
+    json!({
+        "cmd": "history_import",
+        "share_id": shared["share_id"],
+        "parts": shared["parts"],
+    })
+    .to_string()
+}

@@ -27,7 +27,7 @@ use std::io::{self, Read};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use duvet_e2e_rules::{DeviceCertificate, HISTORY_SHARE, RuleViolation, sign, verify};
+use duvet_e2e_rules::{CBOR_DEPTH, DeviceCertificate, HISTORY_SHARE, RuleViolation, sign, verify};
 use miniz_oxide::deflate::core::{CompressorOxide, create_comp_flags_from_zip_params};
 use miniz_oxide::deflate::stream::deflate;
 use miniz_oxide::inflate::stream::{InflateState, inflate};
@@ -239,8 +239,108 @@ pub(crate) struct CatchUpDelivered {
 #[derive(Debug, Deserialize)]
 pub(crate) struct HistoryImport {
     share_id: Uuid,
-    #[serde(with = "b64::list")]
-    parts: Vec<Vec<u8>>,
+    parts: Parts,
+}
+
+/// The most parts a package has: every part but the last holds 1 MiB, and the package 64 MiB.
+const MAX_PARTS: usize = MAX_PACKAGE / PACKAGE_PART;
+
+/// A package's parts as the command lists them, in padded base64, decoded only once they're known
+/// to fit in a package: `MAX_PARTS` of them, `MAX_PACKAGE` bytes in all, which each one's base64
+/// tells before a byte of it is decoded. Past either, the rest is read but not kept.
+#[derive(Debug)]
+enum Parts {
+    Fit(Vec<Vec<u8>>),
+    Over,
+}
+
+impl<'de> Deserialize<'de> for Parts {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_seq(PartsVisitor)
+    }
+}
+
+struct PartsVisitor;
+
+impl<'de> serde::de::Visitor<'de> for PartsVisitor {
+    type Value = Parts;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a list of padded base64")
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Parts, A::Error> {
+        let mut texts = Vec::new();
+        let mut total = 0;
+        while let Some(text) = seq.next_element_seed(PartText {
+            room: MAX_PACKAGE - total,
+        })? {
+            match text {
+                Some(text) if texts.len() < MAX_PARTS => {
+                    total += decoded_len(&text);
+                    texts.push(text);
+                }
+                _ => {
+                    while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                    return Ok(Parts::Over);
+                }
+            }
+        }
+        texts
+            .iter()
+            .map(|text| STANDARD.decode(text.as_bytes()))
+            .collect::<Result<_, _>>()
+            .map(Parts::Fit)
+            .map_err(|_| serde::de::Error::custom("not padded base64"))
+    }
+}
+
+/// One part's base64, as the command holds it (borrowed where it can be), when what it decodes to
+/// fits in `room` bytes; `None` when it doesn't.
+struct PartText {
+    room: usize,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for PartText {
+    type Value = Option<std::borrow::Cow<'de, str>>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_str(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for PartText {
+    type Value = Option<std::borrow::Cow<'de, str>>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("padded base64")
+    }
+
+    fn visit_borrowed_str<E>(self, text: &'de str) -> Result<Self::Value, E> {
+        Ok((decoded_len(text) <= self.room).then_some(text.into()))
+    }
+
+    fn visit_str<E>(self, text: &str) -> Result<Self::Value, E> {
+        Ok((decoded_len(text) <= self.room).then(|| text.to_owned().into()))
+    }
+
+    fn visit_string<E>(self, text: String) -> Result<Self::Value, E> {
+        Ok((decoded_len(&text) <= self.room).then_some(text.into()))
+    }
+}
+
+/// How many bytes padded base64 of `text`'s length decodes to.
+fn decoded_len(text: &str) -> usize {
+    let padding = text
+        .bytes()
+        .rev()
+        .take(2)
+        .filter(|&byte| byte == b'=')
+        .count();
+    (text.len() / 4 * 3).saturating_sub(padding)
 }
 
 #[derive(Serialize)]
@@ -1026,15 +1126,21 @@ impl StoredKey {
 /// A package whose key this device took: opened, its signature verified with the key of the device
 /// that sent the key, its header checked against what that key said, and its records imported as
 /// shared by its user. The package's user must be a member of the conversation as this device's
-/// group has it (`user_not_member`). How many records changed something.
+/// group has it (`user_not_member`). Parts past what a package holds are `too_large` first, before
+/// anything else is read. How many records changed something.
 pub(crate) fn history_import(tx: &Tx<'_>, request: HistoryImport) -> Result<Imported, Error> {
+    let Parts::Fit(parts) = request.parts else {
+        return Err(Error::TooLarge {
+            limit: MAX_PACKAGE as u64,
+        });
+    };
     let stored = StoredKey::read(tx, request.share_id)?.ok_or_else(|| not_found("share"))?;
     let row = GroupRow::read(tx, stored.conversation)?.ok_or_else(|| not_found("group"))?;
     if !row.members.contains(stored.user) {
         return Err(rule("user_not_member"));
     }
     let own = tx.own_user()?.ok_or_else(|| not_found("device"))?;
-    let package = open_parts(&stored.key, request.share_id, request.parts)?;
+    let package = open_parts(&stored.key, request.share_id, parts)?;
     let signed =
         verify(HISTORY_SHARE, &package, &stored.signature_key).map_err(|error| match error {
             RuleViolation::InvalidSignature => Error::InvalidSignature {
@@ -1043,9 +1149,7 @@ pub(crate) fn history_import(tx: &Tx<'_>, request: HistoryImport) -> Result<Impo
             _ => unreadable(),
         })?;
     drop(package);
-    let body: Body = from_cbor(&signed)
-        .filter(|body: &Body| body.v == 1)
-        .ok_or_else(unreadable)?;
+    let body = read_body(&signed)?;
     drop(signed);
     let expected = Header {
         kind: stored.kind,
@@ -1091,18 +1195,36 @@ fn open_parts(key: &[u8; 32], share: Uuid, parts: Vec<Vec<u8>>) -> Result<Vec<u8
     Ok(package)
 }
 
-/// Imports the records `deflated` holds as shared by `sharer`, one at a time as they inflate: what
-/// this holds is one record, never the list, and a record is read through `MAX_RECORD`, so one
-/// longer than a message's can be is `too_large` before it's held whole. Once more than
-/// `MAX_RECORDS` bytes inflated, it's `too_large` too, and nothing more is inflated; a stream that
-/// isn't DEFLATE, or what it inflates to that isn't one list of records and nothing after, is
-/// `decrypt_failed` (`history`). Each undoes what was imported, with the rest of the command. How
-/// many records changed something.
+/// A package's signed body: `{v: 1, header, records}`, or `decrypt_failed` (`history`).
+fn read_body(signed: &[u8]) -> Result<Body, Error> {
+    from_cbor(signed)
+        .filter(|body: &Body| body.v == 1)
+        .ok_or_else(unreadable)
+}
+
+/// Imports the records `deflated` holds as shared by `sharer`, one at a time as they inflate
+/// (`read_records`). Each refusal undoes what was imported, with the rest of the command. How many
+/// records changed something.
 fn import_records(
     tx: &Tx<'_>,
     conversation: Uuid,
     sharer: Uuid,
     deflated: &[u8],
+) -> Result<usize, Error> {
+    read_records(deflated, |record| {
+        import_shared(tx, conversation, record, sharer)
+    })
+}
+
+/// Hands `take` each record `deflated` holds, one at a time as they inflate: what this holds is one
+/// record, never the list, and a record is read through `MAX_RECORD`, so one longer than a
+/// message's can be is `too_large` before it's held whole. Once more than `MAX_RECORDS` bytes
+/// inflated, it's `too_large` too, and nothing more is inflated; a stream that isn't DEFLATE, or
+/// what it inflates to that isn't one list of records and nothing after, is `decrypt_failed`
+/// (`history`). How many records `take` says changed something.
+pub(crate) fn read_records(
+    deflated: &[u8],
+    mut take: impl FnMut(&Record) -> Result<bool, Error>,
 ) -> Result<usize, Error> {
     let mut inflater = Inflater {
         state: InflateState::new_boxed(DataFormat::Raw),
@@ -1125,7 +1247,8 @@ fn import_records(
     let mut imported = 0;
     for _ in 0..count {
         let mut capped = (&mut inflater).take(MAX_RECORD as u64);
-        let read: Result<Record, _> = ciborium::from_reader(&mut capped);
+        let read: Result<Record, _> =
+            ciborium::de::from_reader_with_recursion_limit(&mut capped, CBOR_DEPTH);
         let cut = capped.limit() == 0;
         let record = read.map_err(|_| {
             if cut && !inflater.over {
@@ -1136,12 +1259,24 @@ fn import_records(
                 refused(&inflater)
             }
         })?;
-        imported += usize::from(import_shared(tx, conversation, &record, sharer)?);
+        imported += usize::from(take(&record)?);
     }
     if !inflater.finished() {
         return Err(unreadable());
     }
     Ok(imported)
+}
+
+/// `read_body`, for the fuzz targets.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn read_package_body(signed: &[u8]) -> Result<(), Error> {
+    read_body(signed).map(drop)
+}
+
+/// `read_key`, for the fuzz targets.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn read_key_payload(payload: &[u8]) -> Result<(), Error> {
+    read_key(payload).map(drop)
 }
 
 /// The length of the CBOR array `reader` begins with: a definite one, as this core writes its

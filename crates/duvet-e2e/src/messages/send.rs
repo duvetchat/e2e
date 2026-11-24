@@ -129,6 +129,7 @@ pub(crate) fn encrypt(tx: &Tx<'_>, request: Encrypt) -> Result<Encrypted, Error>
             deleted: false,
             shared_by: None,
             reply_to: None,
+            imported: false,
         },
     )?;
     // Noted as it leaves, for whoever has no device now: by the API's answer, the client may have

@@ -22,5 +22,10 @@ wasm-bindgen-futures.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dev-dependencies]
+base64.workspace = true
+ciborium.workspace = true
+duvet-e2e-rules.workspace = true
+duvet-e2e-validator.workspace = true
+miniz_oxide.workspace = true
 rusqlite.workspace = true
 wasm-bindgen-test.workspace = true

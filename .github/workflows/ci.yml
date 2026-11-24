@@ -4,13 +4,23 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      fuzz:
+        description: "Run the fuzz job alone, as the nightly does"
+        type: boolean
+        default: false
+  # The fuzz job, alone.
+  schedule:
+    - cron: "0 3 * * *"
 
 permissions:
   contents: read
 
+# The fuzz runs, nightly or by hand, in a group of their own that waits instead of cancelling: a
+# fuzz run and a run of the checks on the same branch never cancel each other.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ${{ (github.event_name == 'schedule' || inputs.fuzz) && 'fuzz' || format('ci-{0}', github.event.pull_request.number || github.ref) }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' && !inputs.fuzz }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,6 +31,7 @@ env:
 # instances never install a toolchain into the home they share.
 jobs:
   rust:
+    if: github.event_name != 'schedule' && !inputs.fuzz
     runs-on: [self-hosted, linux, x64, duvet]
     container:
       image: docker.io/library/rust:1.99.1-bookworm
@@ -33,8 +44,24 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      # What the nightly fuzz job builds, checked on every pull request: the core's `fuzzing`
+      # feature, the fuzz crate, and its lock against the workspace's.
+      - run: cargo clippy -p duvet-e2e --features fuzzing --locked -- -D warnings
+      - run: cargo check --locked --manifest-path fuzz/Cargo.toml
+      - name: fuzz/Cargo.lock holds the workspace's versions
+        run: |
+          pairs() { awk '/^name = /{name = $3} /^version = /{print name, $3}' "$1" | sort -u; }
+          pairs Cargo.lock > /tmp/workspace.pairs
+          pairs fuzz/Cargo.lock > /tmp/fuzz.pairs
+          drift=$(awk 'NR == FNR { names[$1]; held[$0]; next } ($1 in names) && !($0 in held)' /tmp/workspace.pairs /tmp/fuzz.pairs)
+          if [ -n "$drift" ]; then
+            echo "fuzz/Cargo.lock holds versions the workspace's Cargo.lock doesn't:"
+            echo "$drift"
+            exit 1
+          fi
 
   deny:
+    if: github.event_name != 'schedule' && !inputs.fuzz
     runs-on: [self-hosted, linux, x64, duvet]
     container:
       image: docker.io/library/rust:1.99.1-bookworm
@@ -51,6 +78,7 @@ jobs:
       - run: cargo deny --locked check
 
   wasm:
+    if: github.event_name != 'schedule' && !inputs.fuzz
     runs-on: [self-hosted, linux, x64, duvet]
     container:
       image: docker.io/library/rust:1.99.1-bookworm
@@ -66,6 +94,7 @@ jobs:
 
   # The C ABI the desktop loads: its header, and the library under Bun.
   ffi:
+    if: github.event_name != 'schedule' && !inputs.fuzz
     runs-on: [self-hosted, linux, x64, duvet]
     container:
       image: docker.io/library/rust:1.99.1-bookworm
@@ -97,6 +126,7 @@ jobs:
 
   # The core in WebAssembly, under Node: SQLCipher encrypts there too.
   wasm-test:
+    if: github.event_name != 'schedule' && !inputs.fuzz
     runs-on: [self-hosted, linux, x64, duvet]
     container:
       image: docker.io/library/rust:1.99.1-bookworm
@@ -126,6 +156,7 @@ jobs:
   # The Flutter plugin: its tests on the core built for this host, then the example's APK, whose
   # Android libraries cargokit builds. On the runner itself, for its Android SDK (and NDK 28).
   flutter:
+    if: github.event_name != 'schedule' && !inputs.fuzz
     runs-on: [self-hosted, linux, x64, duvet]
     timeout-minutes: 60
     defaults:
@@ -173,6 +204,7 @@ jobs:
           jar tf build/app/outputs/flutter-apk/app-debug.apk | grep -Fx lib/arm64-v8a/libduvet_e2e.so
 
   validator:
+    if: github.event_name != 'schedule' && !inputs.fuzz
     runs-on: [self-hosted, linux, x64, duvet]
     container:
       image: docker.io/library/rust:1.99.1-bookworm
@@ -205,3 +237,39 @@ jobs:
           GOFLAGS: -mod=readonly
           GOTOOLCHAIN: local
         run: /usr/local/go/bin/go test -count=1 ./...
+
+  # Each format the core reads from the server or the disk, fuzzed 5 minutes a night with the pinned
+  # nightly. The corpus grows in the runner's cache from night to night. Nothing is uploaded: a crash
+  # prints its input, in base64, in the log.
+  fuzz:
+    if: github.event_name == 'schedule' || inputs.fuzz
+    runs-on: [self-hosted, linux, x64, duvet]
+    timeout-minutes: 120
+    container:
+      image: docker.io/library/rust:1.99.1-bookworm
+      volumes:
+        - /var/cache/duvet-e2e:/cache
+    env:
+      CARGO_TARGET_DIR: /cache/target/fuzz
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install nightly-2026-11-20 and cargo-fuzz 0.13.2
+        run: |
+          rustup toolchain install nightly-2026-11-20 --profile minimal
+          cargo +1.99.1 install cargo-fuzz --version 0.13.2 --locked
+      # cargo-fuzz takes no --locked: this fails if fuzz/Cargo.lock needs a change.
+      - run: cargo +nightly-2026-11-20 fetch --locked --manifest-path fuzz/Cargo.toml
+      - name: Fuzz each target for 5 minutes
+        run: |
+          failed=0
+          for target in envelope parts direct segment history validator_input signed member_list; do
+            mkdir -p "/cache/fuzz-corpus/$target"
+            # The seeds the tests made are read too; new inputs go to the cache's corpus. No
+            # allocation may pass 64 MiB, the bound the hostile inputs are held to.
+            cargo +nightly-2026-11-20 fuzz run "$target" "/cache/fuzz-corpus/$target" "fuzz/seeds/$target" -- \
+              -max_total_time=300 -timeout=10 -malloc_limit_mb=64 || failed=1
+          done
+          for input in fuzz/artifacts/*/*; do
+            if [ -f "$input" ]; then echo "$input: $(base64 -w0 "$input")"; fi
+          done
+          exit "$failed"

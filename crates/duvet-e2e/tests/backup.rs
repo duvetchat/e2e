@@ -1922,3 +1922,97 @@ fn recovery_refuses_earlier_keys_that_dont_open() {
     assert_eq!(earlier_keys(&mut a2), [old_key]);
     assert_eq!(imported(&mut a2, &old["data"]), 1);
 }
+
+#[test]
+fn a_message_the_device_decrypted_goes_only_by_its_authors_deletion() {
+    let mut dm = dm();
+    let (conversation, day) = (dm.conversation, dm.day);
+    // A2, recovered with A's key, joins the DM the day before `day`.
+    dm.at(day - 11 * HOUR);
+    let mut a2 = recovered(&mut dm.server, dm.a, &dm.identity);
+    dm.server.publish(&mut a2);
+    for device in [&mut dm.a1, &mut dm.b1, &mut a2] {
+        dm.server.introduce(device);
+    }
+    let join = json!({
+        "cmd": "join_external",
+        "conversation_id": conversation,
+        "generation": 0,
+        "group_info": dm.server.group_info(conversation),
+    });
+    dm.server
+        .commit(&mut a2, conversation, join)
+        .expect("the server takes the external commit");
+    dm.server
+        .deliver_all(&mut [&mut dm.a1, &mut dm.b1, &mut a2]);
+
+    // On `day` A1 writes and edits a message, and B1 answers: A2 reads both. The next day A1
+    // deletes its message and backs the day up without it; A2, away, misses the deletion.
+    dm.at(day + HOUR);
+    let gone = say(&mut dm.server, &mut dm.a1, conversation, "lo borraré");
+    edit(&mut dm.server, &mut dm.a1, conversation, gone, "editado");
+    let stays = say(&mut dm.server, &mut dm.b1, conversation, "esto queda");
+    dm.server
+        .deliver_all(&mut [&mut dm.a1, &mut dm.b1, &mut a2]);
+    dm.at(day + DAY_MS + HOUR);
+    delete(&mut dm.server, &mut dm.a1, conversation, gone);
+    dm.deliver();
+    let the_day = utc_day(day);
+    let copy = back_up(&mut dm.a1, conversation, &the_day);
+
+    // A2 takes that copy with the ID the API saw deleted: A2 decrypted the message, so the API's
+    // word doesn't take it, as it would take a copy an import brought.
+    ok(
+        &mut a2.core,
+        json!({"cmd": "backup_import", "data": copy["data"], "deleted": [gone]}),
+    );
+    assert_eq!(shown_ids(&mut a2, conversation), [stays, gone]);
+    // Yet the day A2 seals with the same IDs leaves it out, its edit too: the server's copy never
+    // gets it back.
+    let built = ok(
+        &mut a2.core,
+        json!({
+            "cmd": "backup_segment",
+            "conversation_id": conversation,
+            "day": the_day,
+            "deleted": [gone],
+        }),
+    );
+    let held: Vec<Uuid> = Segment::read(&bytes(&built["data"]))
+        .open(&backup_key_of(dm.a, &dm.identity))
+        .iter()
+        .map(|record| record.id)
+        .collect();
+    assert_eq!(held, [stays]);
+
+    // Its author's deletion, from the queue, takes it.
+    dm.server.deliver(&mut a2);
+    assert_eq!(shown_ids(&mut a2, conversation), [stays]);
+}
+
+#[test]
+fn a_message_imported_first_is_the_devices_own_once_its_queue_brings_it() {
+    let (mut dm, mut a2) = dm_with_a2();
+    let (conversation, day) = (dm.conversation, dm.day);
+    // On `day` A1 writes, and A2 takes it from its queue; then B1 writes, and A2 stops there.
+    dm.at(day + HOUR);
+    let first = say(&mut dm.server, &mut dm.a1, conversation, "primero");
+    dm.server
+        .deliver_all(&mut [&mut dm.a1, &mut dm.b1, &mut a2]);
+    let later = say(&mut dm.server, &mut dm.b1, conversation, "después");
+    dm.deliver();
+
+    // The next day A2 imports A1's copy of the day, which brings B's message first, then takes its
+    // queue, which brings the same message: A2 has decrypted it.
+    dm.at(day + DAY_MS + HOUR);
+    let copy = back_up(&mut dm.a1, conversation, &utc_day(day));
+    imported(&mut a2, &copy["data"]);
+    dm.server.deliver(&mut a2);
+
+    // The API names it as deleted, though B never deleted it: A2 keeps it.
+    ok(
+        &mut a2.core,
+        json!({"cmd": "backup_import", "data": copy["data"], "deleted": [later]}),
+    );
+    assert_eq!(shown_ids(&mut a2, conversation), [later, first]);
+}

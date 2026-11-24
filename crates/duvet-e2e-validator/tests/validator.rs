@@ -1414,3 +1414,15 @@ fn write_vectors() {
     );
     vectors.write();
 }
+
+/// A request whose state the validator didn't make (found by the `validator_input` fuzz target: one byte
+/// of a stored value changed). openmls_memory_storage 0.6.0 unwraps what it stores, so the load
+/// panics: natively the panic is caught and answered `internal`; in the wasm32-wasip1 module it aborts
+/// the call. The API hands back only states the validator made.
+#[test]
+fn a_state_the_validator_didnt_make_is_answered() {
+    let response = validate_bytes(include_bytes!("corrupted-state.cbor"));
+    let response: Response = ciborium::from_reader(response.as_slice()).unwrap();
+    assert!(!response.ok);
+    assert_eq!(response.error.unwrap().code, "internal");
+}

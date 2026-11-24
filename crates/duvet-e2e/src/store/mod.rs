@@ -5,6 +5,7 @@ mod openmls_kv;
 
 use std::cell::RefCell;
 use std::path::Path;
+use std::sync::{Mutex, PoisonError};
 
 use openmls_rust_crypto::RustCrypto;
 use rusqlite::{Connection, ErrorCode, TransactionBehavior};
@@ -29,6 +30,7 @@ impl Db {
     pub(crate) fn open(path: &Path, key: &[u8; 32]) -> Result<Db, Error> {
         #[cfg(not(target_family = "wasm"))]
         let lock = lock(path)?;
+        initialize_sqlite()?;
         let mut conn = Connection::open(path)?;
         unlock(&conn, key)?;
         // What's deleted (a message's text, a key OpenMLS used) is overwritten, not left in the
@@ -165,6 +167,26 @@ fn lock(path: &Path) -> Result<std::fs::File, Error> {
         Err(TryLockError::WouldBlock) => Err(Error::Locked),
         Err(TryLockError::Error(error)) => Err(Error::Storage(format!("the lock file: {error}"))),
     }
+}
+
+/// Initializes SQLite once, before any open. SQLite marks itself initialized before it runs
+/// SQLCipher's initialization (`SQLITE_EXTRA_INIT`), outside its own mutex, so an open on another
+/// thread in between found SQLCipher not ready and its key couldn't be set. Every open waits here
+/// instead, until one initialization has run whole; one that failed is tried again by the next.
+fn initialize_sqlite() -> Result<(), Error> {
+    static INITIALIZED: Mutex<bool> = Mutex::new(false);
+    let mut initialized = INITIALIZED.lock().unwrap_or_else(PoisonError::into_inner);
+    if !*initialized {
+        // SAFETY: `sqlite3_initialize` takes no arguments and may be called from any thread.
+        let code = unsafe { rusqlite::ffi::sqlite3_initialize() };
+        if code != rusqlite::ffi::SQLITE_OK {
+            return Err(Error::Storage(format!(
+                "SQLite couldn't be initialized ({code})"
+            )));
+        }
+        *initialized = true;
+    }
+    Ok(())
 }
 
 /// Hands SQLCipher the raw key and checks it: SQLCipher reads nothing until the first query.

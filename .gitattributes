@@ -1,1 +1,5 @@
 * text=auto eol=lf
+# The databases the compatibility test opens, and the fuzz targets' seeds, kept byte for byte.
+*.sqlite binary
+*.cbor binary
+fuzz/seeds/** binary

@@ -18,7 +18,7 @@ use crate::{Attachment, Envelope, Error, Tx};
 
 /// The columns `Row::read` takes, in its order.
 const COLUMNS: &str = "id, message_id, nonce, conversation_id, seq, user_id, device_id, \
-    sent_at, envelope, text, edited_at, deleted, status, shared_by, reply_to";
+    sent_at, envelope, text, edited_at, deleted, status, shared_by, reply_to, imported";
 
 /// Whether a message can be shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -72,6 +72,10 @@ pub(crate) struct Row {
     pub(crate) shared_by: Option<Uuid>,
     /// The message it answers, as the API gives it.
     pub(crate) reply_to: Option<Uuid>,
+    /// Whether its content came from an import (a backup copy, a history share, a catch-up), which
+    /// the API's word on deletions may erase; else this device decrypted it from its queue or sent
+    /// it, and only its author's deletion erases it.
+    pub(crate) imported: bool,
 }
 
 impl Row {
@@ -93,6 +97,7 @@ impl Row {
             status: row.get(12)?,
             shared_by: row.get(13)?,
             reply_to: row.get(14)?,
+            imported: row.get(15)?,
         })
     }
 
@@ -125,6 +130,7 @@ struct Columns {
     status: String,
     shared_by: Option<Vec<u8>>,
     reply_to: Option<Vec<u8>>,
+    imported: bool,
 }
 
 impl Columns {
@@ -149,6 +155,7 @@ impl Columns {
             status: Status::from_name(&self.status)?,
             shared_by: uuid(self.shared_by)?,
             reply_to: uuid(self.reply_to)?,
+            imported: self.imported,
         })
     }
 }
@@ -231,14 +238,16 @@ pub(crate) struct NewRow<'a> {
     pub(crate) deleted: bool,
     pub(crate) shared_by: Option<Uuid>,
     pub(crate) reply_to: Option<Uuid>,
+    /// Whether an import brought it (`Row::imported`).
+    pub(crate) imported: bool,
 }
 
 /// Keeps a message: its row's ID.
 pub(crate) fn insert(tx: &Tx<'_>, new: NewRow<'_>) -> Result<i64, Error> {
     tx.conn().execute(
         "INSERT INTO messages (message_id, nonce, conversation_id, seq, user_id, device_id, \
-         sent_at, envelope, text, deleted, status, shared_by, has, reply_to) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+         sent_at, envelope, text, deleted, status, shared_by, has, reply_to, imported) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             new.message_id.map(|id| id.as_bytes().to_vec()),
             new.nonce,
@@ -254,6 +263,7 @@ pub(crate) fn insert(tx: &Tx<'_>, new: NewRow<'_>) -> Result<i64, Error> {
             new.shared_by.map(|user| user.as_bytes().to_vec()),
             new.opened.and_then(|opened| opened.has.as_deref()),
             new.reply_to.map(|id| id.as_bytes().to_vec()),
+            new.imported,
         ],
     )?;
     Ok(tx.conn().last_insert_rowid())
@@ -270,13 +280,23 @@ pub(crate) struct Filled<'a> {
     pub(crate) shared_by: Option<Uuid>,
     /// What it answers, if this content says; else what the row knew stays.
     pub(crate) reply_to: Option<Uuid>,
+    /// Whether an import brought it (`Row::imported`).
+    pub(crate) imported: bool,
+}
+
+/// The row `id`, a copy an import brought, holds a message this device has now decrypted itself: only
+/// its author's deletion takes it from here on (`Row::imported`). Its text and edits stay as they are.
+pub(crate) fn decrypted(tx: &Tx<'_>, id: i64) -> Result<(), Error> {
+    tx.conn()
+        .execute("UPDATE messages SET imported = 0 WHERE id = ?1", [id])?;
+    Ok(())
 }
 
 pub(crate) fn fill(tx: &Tx<'_>, id: i64, filled: Filled<'_>) -> Result<(), Error> {
     tx.conn().execute(
         "UPDATE messages SET seq = ?2, user_id = ?3, device_id = ?4, sent_at = ?5, envelope = ?6, \
          text = ?7, has = ?8, edited_at = NULL, deleted = 0, status = 'ok', shared_by = ?9, \
-         reply_to = COALESCE(?10, reply_to) WHERE id = ?1",
+         reply_to = COALESCE(?10, reply_to), imported = ?11 WHERE id = ?1",
         params![
             id,
             filled.seq.map(stored_seq).transpose()?,
@@ -288,6 +308,7 @@ pub(crate) fn fill(tx: &Tx<'_>, id: i64, filled: Filled<'_>) -> Result<(), Error
             filled.opened.has.as_deref(),
             filled.shared_by.map(|user| user.as_bytes().to_vec()),
             filled.reply_to.map(|id| id.as_bytes().to_vec()),
+            filled.imported,
         ],
     )?;
     Ok(())
@@ -905,6 +926,7 @@ fn import_message(
                 deleted: false,
                 shared_by,
                 reply_to: record.reply_to,
+                imported: true,
             },
         )?,
         Some(row) if row.conversation != conversation => return Ok(false),
@@ -938,6 +960,7 @@ fn import_message(
                     opened: &opened,
                     shared_by,
                     reply_to: record.reply_to,
+                    imported: true,
                 },
             )?;
             row.id

@@ -1,6 +1,9 @@
 //! DEFLATE streams made by hand, for tests that need far more inflated bytes than they hold: runs
 //! of zeros as copies of the byte before, in about 13 bits for each 258 of them.
 
+// Each test file uses its share of these.
+#![allow(dead_code)]
+
 use duvet_e2e::messages::Record;
 
 /// A raw DEFLATE stream that inflates to each part's bytes, then its zeros, in turn: one block of
@@ -90,4 +93,29 @@ impl Bits {
 /// A Huffman code of `count` bits, its bits in the order DEFLATE packs them.
 fn reversed(code: u64, count: u32) -> u64 {
     (0..count).fold(0, |out, bit| out | ((code >> bit) & 1) << (count - 1 - bit))
+}
+
+/// A raw DEFLATE stream that inflates to `prefix`, then `mibs` MiB of zeros, about as small as
+/// DEFLATE makes it (some 1 KiB for each MiB): miniz_oxide's own blocks, the zeros' MiB compressed
+/// once and repeated, each run of blocks ended on a byte by a sync flush, then an empty last block.
+pub fn dense_bomb(prefix: &[u8], mibs: usize) -> Vec<u8> {
+    use miniz_oxide::MZFlush;
+    use miniz_oxide::deflate::core::{CompressorOxide, create_comp_flags_from_zip_params};
+    use miniz_oxide::deflate::stream::deflate;
+
+    let blocks = |input: &[u8], flush: MZFlush| {
+        let mut compressor = CompressorOxide::new(create_comp_flags_from_zip_params(9, -15, 0));
+        let mut out = vec![0; input.len() + 1024];
+        let step = deflate(&mut compressor, input, &mut out, flush);
+        assert_eq!(step.bytes_consumed, input.len(), "{:?}", step.status);
+        out.truncate(step.bytes_written);
+        out
+    };
+    let zeros = blocks(&vec![0; 1 << 20], MZFlush::Sync);
+    [
+        blocks(prefix, MZFlush::Sync),
+        zeros.repeat(mibs),
+        blocks(&[], MZFlush::Finish),
+    ]
+    .concat()
 }
