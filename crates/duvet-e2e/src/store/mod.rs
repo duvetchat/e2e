@@ -151,7 +151,7 @@ impl<'a> Tx<'a> {
 /// Takes `<path>.lock` for as long as the database is open. Another instance, in another
 /// process or in this one (another Flutter engine), gets `locked`.
 #[cfg(not(target_family = "wasm"))]
-fn lock(path: &Path) -> Result<std::fs::File, Error> {
+pub(crate) fn lock(path: &Path) -> Result<std::fs::File, Error> {
     use std::fs::{OpenOptions, TryLockError};
 
     let mut lock_path = path.as_os_str().to_owned();

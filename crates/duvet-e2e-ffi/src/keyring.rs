@@ -1,9 +1,10 @@
 //! The desktop's database key: kept in the system's keyring (Windows' Credential Manager, macOS's
-//! Keychain, the Secret Service), made on the database's first open. Where Linux has no Secret
-//! Service, it goes to `<path>.key`, which only its user reads, and `status` says `file`.
+//! Keychain, the Secret Service), made on the database's first open, deleted with the database.
+//! Where Linux has no Secret Service, it goes to `<path>.key`, which only its user reads, and
+//! `status` says `file`.
 
 use std::fs::{File, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use duvet_e2e::{Core, Error, KeyStorage, OpenConfig};
 use rand_core::{OsRng, RngCore};
@@ -15,6 +16,7 @@ pub(crate) type Key = Zeroizing<[u8; 32]>;
 pub(crate) trait KeyStore {
     fn get(&self) -> keyring_core::Result<Vec<u8>>;
     fn set(&self, key: &[u8]) -> keyring_core::Result<()>;
+    fn delete(&self) -> keyring_core::Result<()>;
 }
 
 impl KeyStore for keyring_core::Entry {
@@ -24,6 +26,10 @@ impl KeyStore for keyring_core::Entry {
 
     fn set(&self, key: &[u8]) -> keyring_core::Result<()> {
         self.set_secret(key)
+    }
+
+    fn delete(&self) -> keyring_core::Result<()> {
+        self.delete_credential()
     }
 }
 
@@ -42,6 +48,15 @@ pub(crate) enum NoKeyring {
 /// first open.
 pub(crate) fn open(path: &Path, service: &str, account: &str) -> Result<Core, Error> {
     open_with(path, system_entry(service, account))
+}
+
+/// Deletes the database at `path` with the files beside it and its key: `<path>.key`, and the
+/// system keyring's entry when `keyring` names one (service, account).
+pub(crate) fn destroy(path: &Path, keyring: Option<(&str, &str)>) -> Result<(), Error> {
+    destroy_with(
+        path,
+        keyring.map(|(service, account)| system_entry(service, account)),
+    )
 }
 
 /// The system keyring's entry for the key, or why there is none.
@@ -105,12 +120,13 @@ fn absent(_: &keyring_core::Result<()>) -> bool {
 }
 
 /// A keyring that's there but failed, which never sends the key to a file. Its text can name the
-/// entry, so the message is fixed.
+/// entry, so the message is fixed. Access is refused by a locked keyring, and by a Secret Service
+/// with no default collection (`NoResult`), which unlocking doesn't give.
 fn keyring_failed(error: &keyring_core::Error) -> Error {
     Error::Storage(
         match error {
             keyring_core::Error::NoStorageAccess(_) => {
-                "the system keyring is locked or refused access: unlock it and try again"
+                "the system keyring refused access: it's locked, or has no default keyring"
             }
             _ => "the system keyring failed",
         }
@@ -134,25 +150,70 @@ fn open_with(path: &Path, entry: Result<impl KeyStore, NoKeyring>) -> Result<Cor
 /// Takes `<path>.key.lock`, waiting for any other open of the database that holds it. It isn't
 /// the core's `<path>.lock`, which the core only tries on a handle of its own.
 fn lock_key(path: &Path) -> Result<File, Error> {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".key.lock");
     let failed =
         |error: std::io::Error| Error::Storage(format!("the key's lock: {}", error.kind()));
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(name)
+        .open(beside(path, ".key.lock"))
         .map_err(failed)?;
     file.lock().map_err(failed)?;
     Ok(file)
+}
+
+/// Deletes the database at `path` and what's beside it: SQLite's journals, `<path>.key` and the
+/// file it's written to first, then its key in `entry`. The database's deletion is on the disk
+/// before the key goes (`sync_folder`; Windows has no folder sync).
+///
+/// It takes `<path>.key.lock`, as an open does, then the core's `<path>.lock`: `locked` while a
+/// core has the database open, and nothing is deleted then. Both locks stay, empty. An open may be
+/// waiting for `<path>.key.lock`, and were it deleted, that open would go on holding the deleted
+/// file while the next open locked a new one, and the two would each choose a key. And an open
+/// that doesn't take that one (a `db_key` one, as every open on Android) could open `<path>.lock`
+/// before its deletion and lock it after, while the next open locked a new one: two cores on one
+/// database.
+fn destroy_with(path: &Path, entry: Option<Result<impl KeyStore, NoKeyring>>) -> Result<(), Error> {
+    let entry = match entry {
+        Some(Ok(entry)) => Some(entry),
+        // No Secret Service at all: no entry holds a key.
+        Some(Err(NoKeyring::Absent)) | None => None,
+        Some(Err(NoKeyring::Failed(error))) => return Err(keyring_failed(&error)),
+    };
+    // Without its folder there's no database, and no lock to take: only the key may be left.
+    let folder = std::fs::exists(folder_of(path))
+        .map_err(|error| Error::Storage(format!("the database's folder: {}", error.kind())))?;
+    if !folder {
+        return delete_key(entry);
+    }
+    let _choosing = lock_key(path)?;
+    let _open = duvet_e2e::lock_database(path)?;
+    // The database first: what a destroy cut short leaves is a key, which a new database takes.
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        remove(&beside(path, suffix), "the database's files")?;
+    }
+    // On the disk before its key goes, so a power loss can't bring the database back without it.
+    sync_folder(path)?;
+    for suffix in [".key", ".key.tmp"] {
+        remove(&beside(path, suffix), "the database's files")?;
+    }
+    delete_key(entry)
+}
+
+/// Deletes the key `entry` keeps, when there's an entry. One already empty is deleted already.
+fn delete_key(entry: Option<impl KeyStore>) -> Result<(), Error> {
+    match entry.map(|entry| entry.delete()) {
+        None | Some(Ok(()) | Err(keyring_core::Error::NoEntry)) => Ok(()),
+        Some(Err(error)) => Err(keyring_failed(&error)),
+    }
 }
 
 /// The key of the database at `path`, and where it's kept.
 ///
 /// A key is made only for a database that doesn't exist yet: for one that does, a missing key
 /// can't open it, and a new one would only hide the key that might come back. The plaintext
-/// `<path>.key` only where there's no Secret Service at all.
+/// `<path>.key` only where there's no Secret Service at all. A `<path>.key` of another length than
+/// a key's is replaced while there's no database, and refused once there is one.
 fn database_key(
     path: &Path,
     entry: Result<impl KeyStore, NoKeyring>,
@@ -161,8 +222,19 @@ fn database_key(
     let fresh = !std::fs::exists(path)
         .map_err(|error| Error::Storage(format!("the database: {}", error.kind())))?;
     #[cfg(secret_service)]
-    if let Some(key) = file::read(path)? {
-        return Ok((key, KeyStorage::File));
+    match file::read(path)? {
+        Some(bytes) if bytes.len() == 32 => {
+            return key_from(&bytes).map(|key| (key, KeyStorage::File));
+        }
+        // Not a key, and no database it could be for: a write cut short left it, before key files
+        // were renamed into place whole. It goes, and the database gets a key as if it weren't there.
+        Some(_) if fresh => file::remove(path)?,
+        Some(_) => {
+            return Err(Error::Storage(
+                "the database's key file isn't 32 bytes".into(),
+            ));
+        }
+        None => {}
     }
     match entry {
         Ok(entry) => key_in(&entry, fresh).map(|key| (key, KeyStorage::Keyring)),
@@ -204,50 +276,100 @@ fn random_key() -> Result<Key, Error> {
     Ok(key)
 }
 
+/// `<path><suffix>`: a file the database keeps beside it.
+fn beside(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// The folder `file` is in: `.` for a bare name.
+fn folder_of(file: &Path) -> &Path {
+    file.parent()
+        .filter(|folder| !folder.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+/// Puts on the disk what was renamed into or deleted from `file`'s folder.
+#[cfg(unix)]
+fn sync_folder(file: &Path) -> Result<(), Error> {
+    File::open(folder_of(file))
+        .and_then(|folder| folder.sync_all())
+        .map_err(|error| Error::Storage(format!("the database's folder: {}", error.kind())))
+}
+
+/// Windows has no folder sync: there it does nothing.
+#[cfg(not(unix))]
+fn sync_folder(_: &Path) -> Result<(), Error> {
+    Ok(())
+}
+
+/// Deletes `file`, which may not be there. `what` names it in the error.
+fn remove(file: &Path, what: &str) -> Result<(), Error> {
+    match std::fs::remove_file(file) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(Error::Storage(format!("{what}: {}", error.kind())))
+        }
+        _ => Ok(()),
+    }
+}
+
 #[cfg(secret_service)]
 mod file {
     use std::fs::OpenOptions;
     use std::io::{ErrorKind, Read, Write};
     use std::os::unix::fs::OpenOptionsExt;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use duvet_e2e::Error;
     use zeroize::Zeroizing;
 
-    use super::{Key, key_from};
+    use super::{Key, beside};
 
-    fn key_path(path: &Path) -> PathBuf {
-        let mut name = path.as_os_str().to_owned();
-        name.push(".key");
-        PathBuf::from(name)
+    fn failed(error: std::io::Error) -> Error {
+        Error::Storage(format!("the key file: {}", error.kind()))
     }
 
-    /// The key in `<path>.key`, when there is one.
-    pub(super) fn read(path: &Path) -> Result<Option<Key>, Error> {
-        let mut file = match OpenOptions::new().read(true).open(key_path(path)) {
+    /// What `<path>.key` holds, when it's there: 33 bytes at most, which tells a key from what
+    /// isn't one.
+    pub(super) fn read(path: &Path) -> Result<Option<Zeroizing<Vec<u8>>>, Error> {
+        let file = match OpenOptions::new().read(true).open(beside(path, ".key")) {
             Ok(file) => file,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(Error::Storage(format!("the key file: {}", error.kind()))),
+            Err(error) => return Err(failed(error)),
         };
+        // Read into its final capacity, so no copy is left in a block it outgrew.
         let mut bytes = Zeroizing::new(Vec::with_capacity(33));
-        file.read_to_end(&mut bytes)
-            .map_err(|error| Error::Storage(format!("the key file: {}", error.kind())))?;
-        key_from(&bytes).map(Some)
+        file.take(33).read_to_end(&mut bytes).map_err(failed)?;
+        Ok(Some(bytes))
     }
 
-    /// A new random key in `<path>.key`, made readable and writable by its user alone.
+    /// A new random key in `<path>.key`, readable and writable by its user alone. It's written
+    /// whole to `<path>.key.tmp`, then renamed: `<path>.key` holds all of it or isn't there. Only
+    /// under `<path>.key.lock`, which keeps any other writer out.
     pub(super) fn create(path: &Path) -> Result<Key, Error> {
         let key = super::random_key()?;
+        let (temporary, key_file) = (beside(path, ".key.tmp"), beside(path, ".key"));
+        // What a write cut short left.
+        super::remove(&temporary, "the key file")?;
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(key_path(path))
-            .map_err(|error| Error::Storage(format!("the key file: {}", error.kind())))?;
+            .open(&temporary)
+            .map_err(failed)?;
         file.write_all(&*key)
             .and_then(|()| file.sync_all())
-            .map_err(|error| Error::Storage(format!("the key file: {}", error.kind())))?;
+            .map_err(failed)?;
+        std::fs::rename(&temporary, &key_file).map_err(failed)?;
+        // The rename itself on the disk, before the database the key opens is made.
+        super::sync_folder(&key_file)?;
         Ok(key)
+    }
+
+    /// Deletes `<path>.key`.
+    pub(super) fn remove(path: &Path) -> Result<(), Error> {
+        super::remove(&beside(path, ".key"), "the key file")
     }
 }
 
@@ -322,25 +444,153 @@ mod tests {
         );
     }
 
+    /// `<path>.key` as a write cut short leaves it: 5 of its 32 bytes.
+    #[cfg(secret_service)]
+    const CUT_KEY: [u8; 5] = [7; 5];
+
+    #[cfg(secret_service)]
+    #[test]
+    fn a_short_key_file_without_a_database_is_replaced() {
+        // No database ever got that key. Without a Secret Service, a whole one takes its place.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.db");
+        std::fs::write(dir.path().join("core.db.key"), CUT_KEY).unwrap();
+        let none: Result<Entry, NoKeyring> = Err(NoKeyring::Absent);
+        let (key, storage) = database_key(&path, none).unwrap();
+        assert_eq!(storage, KeyStorage::File);
+        assert_eq!(
+            std::fs::read(dir.path().join("core.db.key")).unwrap(),
+            key.to_vec()
+        );
+
+        // With one, the key goes to the keyring, and the file goes: every open reads it first.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.db");
+        std::fs::write(dir.path().join("core.db.key"), CUT_KEY).unwrap();
+        let store = mock_store();
+        let (key, storage) = database_key(&path, Ok(entry_in(&store))).unwrap();
+        assert_eq!(storage, KeyStorage::Keyring);
+        assert_eq!(entry_in(&store).get_secret().unwrap(), key.to_vec());
+        assert!(!dir.path().join("core.db.key").exists());
+    }
+
+    #[cfg(secret_service)]
+    #[test]
+    fn a_short_key_file_with_a_database_is_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.db");
+        std::fs::write(&path, b"a database").unwrap();
+        std::fs::write(dir.path().join("core.db.key"), CUT_KEY).unwrap();
+
+        let store = mock_store();
+        for entry in [Ok(entry_in(&store)), Err(NoKeyring::Absent)] {
+            let error = database_key(&path, entry).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "storage: the database's key file isn't 32 bytes"
+            );
+        }
+        // Nothing takes its place: a new key wouldn't open the database either.
+        assert_eq!(
+            std::fs::read(dir.path().join("core.db.key")).unwrap(),
+            CUT_KEY
+        );
+        assert!(no_entry(&store));
+    }
+
+    /// Run by `the_key_file_lands_whole_or_not_at_all` in a process of its own, which can't write
+    /// a file past 5 bytes: it makes the key file of the database `DUVET_E2E_CUT_KEY` names.
+    #[cfg(all(secret_service, target_os = "linux"))]
+    #[test]
+    #[ignore = "a child process of the_key_file_lands_whole_or_not_at_all"]
+    fn make_a_key_file_and_be_cut() {
+        if let Some(path) = std::env::var_os("DUVET_E2E_CUT_KEY") {
+            let none: Result<Entry, NoKeyring> = Err(NoKeyring::Absent);
+            database_key(Path::new(&path), none).ok();
+        }
+    }
+
+    #[cfg(all(secret_service, target_os = "linux"))]
+    #[test]
+    fn the_key_file_lands_whole_or_not_at_all() {
+        use std::os::unix::process::ExitStatusExt;
+
+        // Linux's number for SIGXFSZ, which ends a process that writes past its file size limit.
+        const SIGXFSZ: i32 = 25;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.db");
+        let child = std::process::Command::new("prlimit")
+            .arg("--fsize=5")
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "keyring::tests::make_a_key_file_and_be_cut"])
+            .args(["--ignored", "--test-threads=1"])
+            .env("DUVET_E2E_CUT_KEY", &path)
+            .output()
+            .unwrap();
+        // The kernel ended it halfway through the key: 5 of its bytes are in a file.
+        assert_eq!(child.status.signal(), Some(SIGXFSZ), "{child:?}");
+        let cut = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|file| file.as_ref().unwrap().metadata().unwrap().len() == 5)
+            .count();
+        assert_eq!(cut, 1, "one file holds the 5 bytes written");
+
+        let key_file = dir.path().join("core.db.key");
+        assert!(
+            !key_file.exists(),
+            "a key file landed cut short: {:?}",
+            std::fs::read(&key_file)
+        );
+        // The next open makes it, whole.
+        let none: Result<Entry, NoKeyring> = Err(NoKeyring::Absent);
+        let (key, _) = database_key(&path, none).unwrap();
+        assert_eq!(std::fs::read(&key_file).unwrap(), key.to_vec());
+    }
+
     #[cfg(secret_service)]
     #[test]
     fn only_a_missing_secret_service_counts_as_none() {
         use std::io::{self, ErrorKind};
 
+        // The store's errors as its construction gives them: the Secret Service's own, from
+        // `SecretService::connect`, in a `PlatformFailure`.
         let failure = |cause: secret_service::Error| -> keyring_core::Result<()> {
             Err(keyring_core::Error::PlatformFailure(Box::new(cause)))
         };
-        let bus = |kind: ErrorKind| {
-            failure(secret_service::Error::Zbus(zbus::Error::InputOutput(
+        // zbus can't connect to the session bus's socket: its I/O error, and the bus's address.
+        let socket = |kind: ErrorKind| {
+            failure(secret_service::Error::Zbus(zbus::Error::Connection(
                 Arc::new(io::Error::from(kind)),
+                "unix:path=/run/user/1000/bus".parse().unwrap(),
             )))
         };
+        // The bus's answer to `OpenSession` when nothing on it provides the Secret Service and
+        // nothing can be started to.
+        let open_session = zbus::Message::method_call("/org/freedesktop/secrets", "OpenSession")
+            .unwrap()
+            .build(&())
+            .unwrap();
+        let unknown = "org.freedesktop.DBus.Error.ServiceUnknown";
+        let no_provider = zbus::Error::from(
+            zbus::Message::error(&open_session.header(), unknown)
+                .unwrap()
+                .build(&("The name is not activatable",))
+                .unwrap(),
+        );
+        assert!(
+            matches!(no_provider, zbus::Error::MethodError(..)),
+            "{no_provider:?}"
+        );
         for none in [
+            // No address for the session bus at all.
             failure(secret_service::Error::Unavailable),
             // No socket where the session bus would be, or nothing listening on it.
-            bus(ErrorKind::NotFound),
-            bus(ErrorKind::ConnectionRefused),
+            socket(ErrorKind::NotFound),
+            socket(ErrorKind::ConnectionRefused),
             // A bus, but nothing on it provides the Secret Service.
+            failure(secret_service::Error::Zbus(no_provider)),
+            // The same answer as zbus's own D-Bus interfaces give it.
             failure(secret_service::Error::Zbus(zbus::Error::FDO(Box::new(
                 zbus::fdo::Error::ServiceUnknown("no provider".into()),
             )))),
@@ -351,7 +601,7 @@ mod tests {
         for there in [
             failure(secret_service::Error::Locked),
             failure(secret_service::Error::Prompt),
-            bus(ErrorKind::PermissionDenied),
+            socket(ErrorKind::PermissionDenied),
             Err(keyring_core::Error::NoStorageAccess(Box::new(
                 secret_service::Error::Unavailable,
             ))),
@@ -365,11 +615,13 @@ mod tests {
         }
     }
 
+    // Unix only: on Windows a path through a file is `NotFound`, a database that isn't there.
+    #[cfg(unix)]
     #[test]
     fn a_database_that_cant_be_looked_for_gets_no_key() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a-file"), b"").unwrap();
-        // Whether it exists can't be known: its folder is a file.
+        // Whether it exists can't be known: its folder is a file (`NotADirectory`).
         let path = dir.path().join("a-file").join("core.db");
 
         let store = mock_store();
@@ -382,12 +634,17 @@ mod tests {
         assert!(no_entry(&store));
     }
 
+    /// What a keyring that refuses access answers: locked, or with no default keyring to keep a
+    /// key in, which unlocking doesn't give.
+    const REFUSED: &str =
+        "the system keyring refused access: it's locked, or has no default keyring";
+
     #[test]
     fn a_locked_or_failing_keyring_writes_no_file() {
         for (refusal, message) in [
             (
                 keyring_core::Error::NoStorageAccess("locked".into()),
-                "the system keyring is locked or refused access: unlock it and try again",
+                REFUSED,
             ),
             (
                 keyring_core::Error::PlatformFailure("a running service failed".into()),
@@ -406,6 +663,32 @@ mod tests {
             assert_eq!(error.to_string(), format!("storage: {message}"));
             assert!(!dir.path().join("core.db.key").exists(), "{message}");
             assert!(no_entry(&store));
+        }
+
+        // A locked Secret Service finds no key, then refuses as the new one is stored, its unlock
+        // prompt dismissed.
+        let dir = tempfile::tempdir().unwrap();
+        let error = database_key(&dir.path().join("core.db"), Ok(RefusesToStore)).unwrap_err();
+        assert_eq!(error.to_string(), format!("storage: {REFUSED}"));
+        assert!(!dir.path().join("core.db.key").exists());
+    }
+
+    /// An entry with no key, whose keyring refuses to store one.
+    struct RefusesToStore;
+
+    impl KeyStore for RefusesToStore {
+        fn get(&self) -> keyring_core::Result<Vec<u8>> {
+            Err(keyring_core::Error::NoEntry)
+        }
+
+        fn set(&self, _: &[u8]) -> keyring_core::Result<()> {
+            Err(keyring_core::Error::NoStorageAccess(
+                "the prompt was dismissed".into(),
+            ))
+        }
+
+        fn delete(&self) -> keyring_core::Result<()> {
+            Err(keyring_core::Error::NoEntry)
         }
     }
 
@@ -440,6 +723,10 @@ mod tests {
 
         fn set(&self, key: &[u8]) -> keyring_core::Result<()> {
             self.entry.set_secret(key)
+        }
+
+        fn delete(&self) -> keyring_core::Result<()> {
+            self.entry.delete_credential()
         }
     }
 
@@ -479,6 +766,195 @@ mod tests {
         open_with(&path, Ok(entry_in(&store))).unwrap().close();
     }
 
+    /// The names of the files in `dir`, in order.
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|file| file.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// What a destroy leaves: the two locks, empty, which an open may be waiting for or racing.
+    fn only_the_locks_are_left(dir: &Path) {
+        assert_eq!(files_in(dir), ["core.db.key.lock", "core.db.lock"]);
+        for lock in ["core.db.key.lock", "core.db.lock"] {
+            assert_eq!(
+                std::fs::metadata(dir.join(lock)).unwrap().len(),
+                0,
+                "{lock}"
+            );
+        }
+    }
+
+    #[test]
+    fn destroy_removes_the_database_and_its_key() {
+        // A database whose key the keyring keeps, beside the journal a crash left.
+        let store = mock_store();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.db");
+        open_with(&path, Ok(entry_in(&store))).unwrap().close();
+        std::fs::write(dir.path().join("core.db-journal"), b"a crash's journal").unwrap();
+
+        destroy_with(&path, Some(Ok(entry_in(&store)))).unwrap();
+        only_the_locks_are_left(dir.path());
+        assert!(no_entry(&store));
+        // A second time, there's nothing left to delete.
+        destroy_with(&path, Some(Ok(entry_in(&store)))).unwrap();
+
+        // A database whose key its client keeps: no keyring is touched.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.db");
+        Core::open(OpenConfig::new(&path, [1; 32])).unwrap().close();
+        destroy_with(&path, None::<Result<Entry, NoKeyring>>).unwrap();
+        only_the_locks_are_left(dir.path());
+
+        // A database whose key is in `<path>.key`, where there's no Secret Service.
+        #[cfg(secret_service)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("core.db");
+            let none = || -> Result<Entry, NoKeyring> { Err(NoKeyring::Absent) };
+            open_with(&path, none()).unwrap().close();
+            assert!(dir.path().join("core.db.key").exists());
+            destroy_with(&path, Some(none())).unwrap();
+            only_the_locks_are_left(dir.path());
+        }
+    }
+
+    #[test]
+    fn destroy_refuses_an_open_database() {
+        let store = mock_store();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.db");
+        let core = open_with(&path, Ok(entry_in(&store))).unwrap();
+        let key = entry_in(&store).get_secret().unwrap();
+
+        let error = destroy_with(&path, Some(Ok(entry_in(&store)))).unwrap_err();
+        assert_eq!(error.code(), "locked");
+        core.close();
+        // Nothing went: the database is there, and the key the keyring keeps opens it.
+        assert!(path.exists());
+        assert_eq!(entry_in(&store).get_secret().unwrap(), key);
+        Core::open(OpenConfig::new(&path, key_from(&key).unwrap()))
+            .expect("the key opens the database")
+            .close();
+    }
+
+    #[test]
+    fn destroy_where_the_folder_is_gone_deletes_the_key() {
+        // The app's data was deleted, and the keyring kept the key of the database it held.
+        let store = mock_store();
+        entry_in(&store).set_secret(&[7; 32]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gone").join("core.db");
+
+        // No folder, no database: nothing to delete there, and nothing made.
+        destroy_with(&path, Some(Ok(entry_in(&store)))).unwrap();
+        assert!(no_entry(&store));
+        assert!(!dir.path().join("gone").exists());
+    }
+
+    /// A mock entry whose deletion pauses once it says so: a destroy holding its locks meanwhile.
+    struct DeletePauses<'a> {
+        entry: Entry,
+        deleting: &'a AtomicBool,
+    }
+
+    impl KeyStore for DeletePauses<'_> {
+        fn get(&self) -> keyring_core::Result<Vec<u8>> {
+            self.entry.get_secret()
+        }
+
+        fn set(&self, key: &[u8]) -> keyring_core::Result<()> {
+            self.entry.set_secret(key)
+        }
+
+        fn delete(&self) -> keyring_core::Result<()> {
+            self.deleting.store(true, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(500));
+            self.entry.delete_credential()
+        }
+    }
+
+    #[test]
+    fn destroy_keeps_its_locks_while_an_open_runs() {
+        let store = mock_store();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.db");
+        let first = AtomicBool::new(true);
+        thread::scope(|scope| {
+            // A first open, paused while it chooses its key under `<path>.key.lock`.
+            let opening = scope.spawn(|| {
+                open_with(
+                    &path,
+                    Ok(FirstReadPauses {
+                        entry: entry_in(&store),
+                        first: &first,
+                    }),
+                )
+            });
+            while first.load(Ordering::SeqCst) {
+                thread::yield_now();
+            }
+            // Destroy waits for that open to end, and finds its core holding the database.
+            let error = destroy_with(&path, Some(Ok(entry_in(&store)))).unwrap_err();
+            assert_eq!(error.code(), "locked");
+            opening.join().unwrap().unwrap().close();
+        });
+        // Nothing went: the key the open chose opens its database.
+        let chosen = entry_in(&store).get_secret().unwrap();
+        Core::open(OpenConfig::new(&path, key_from(&chosen).unwrap()))
+            .expect("the key opens the database")
+            .close();
+
+        let deleting = AtomicBool::new(false);
+        thread::scope(|scope| {
+            // A destroy, paused as it deletes the key, with both locks held.
+            let destroying = scope.spawn(|| {
+                destroy_with(
+                    &path,
+                    Some(Ok(DeletePauses {
+                        entry: entry_in(&store),
+                        deleting: &deleting,
+                    })),
+                )
+            });
+            while !deleting.load(Ordering::SeqCst) {
+                thread::yield_now();
+            }
+            // An open with `db_key` takes no `<path>.key.lock`: locked.
+            let refused = Core::open(OpenConfig::new(&path, [1; 32])).err();
+            assert_eq!(refused.expect("locked").code(), "locked");
+            // One through the keyring waits for the destroy, then makes a new database.
+            open_with(&path, Ok(entry_in(&store)))
+                .expect("an open after the destroy")
+                .close();
+            destroying.join().unwrap().unwrap();
+        });
+        assert_ne!(entry_in(&store).get_secret().unwrap(), chosen);
+    }
+
+    #[test]
+    fn a_destroy_whose_keyring_cant_be_reached_deletes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.db");
+        Core::open(OpenConfig::new(&path, [1; 32])).unwrap().close();
+        let before = files_in(dir.path());
+
+        let unreachable: Result<Entry, NoKeyring> = Err(NoKeyring::Failed(
+            keyring_core::Error::PlatformFailure("no keyring answers".into()),
+        ));
+        let destroyed = destroy_with(&path, Some(unreachable));
+        // The database and its files are as they were: its key may be the keyring's.
+        assert_eq!(files_in(dir.path()), before);
+        assert_eq!(
+            destroyed.unwrap_err().to_string(),
+            "storage: the system keyring failed"
+        );
+    }
+
     #[cfg(secret_service)]
     #[test]
     fn file_key_is_private_and_read_back() {
@@ -491,7 +967,10 @@ mod tests {
         let created = file::create(&path).unwrap();
         let metadata = std::fs::metadata(dir.path().join("core.db.key")).unwrap();
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-        assert_eq!(*file::read(&path).unwrap().unwrap(), *created);
-        assert!(file::create(&path).is_err(), "never overwritten");
+        assert_eq!(*file::read(&path).unwrap().unwrap(), created.to_vec());
+        // A whole key is never replaced: the next open, of a database still to be made, takes it.
+        let none: Result<Entry, NoKeyring> = Err(NoKeyring::Absent);
+        let (reused, storage) = database_key(&path, none).unwrap();
+        assert_eq!((*reused, storage), (*created, KeyStorage::File));
     }
 }

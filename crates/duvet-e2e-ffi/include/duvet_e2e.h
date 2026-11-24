@@ -19,7 +19,13 @@ extern "C" {
  *
  * `config_json` is `{"path", "db_key"}`, the raw 32-byte key in base64, or
  * `{"path", "keyring": {"service", "account"}}`, which takes the key from the system's keyring
- * and makes it on the database's first open.
+ * and makes it on the database's first open. An entry keeps one database's key, which
+ * `duvet_e2e_destroy` deletes with that database: give each database a service and account of its
+ * own.
+ *
+ * An open through the keyring waits, with no limit, while another open of the same database
+ * chooses its key (`<path>.key.lock`), that open's keyring prompt included, and asking the keyring
+ * can raise a prompt of its own: call it off the thread that draws the app.
  *
  * # Safety
  *
@@ -42,6 +48,26 @@ char *duvet_e2e_handle(uint64_t handle, const char *command_json);
  * handle is running; an unknown handle does nothing.
  */
 void duvet_e2e_close(uint64_t handle);
+
+/**
+ * Deletes the database `config_json` names, with the files beside it and its key: the keyring's
+ * entry or `<path>.key`. Answers `{"ok":{}}`, also when there was nothing to delete, or the error
+ * reply: `locked` while a handle has the database open, and nothing is deleted then.
+ *
+ * `config_json` is what `duvet_e2e_open` takes; `db_key`'s key is the caller's to forget. The
+ * keyring's entry goes whatever other database was opened with it: each database has its own.
+ *
+ * It waits, with no limit, while an open of the same database chooses its key (`<path>.key.lock`),
+ * that open's keyring prompt included, and deleting the entry can raise a prompt of the keyring's
+ * own: call it off the thread that draws the app.
+ * `<path>.key.lock` and `<path>.lock` stay, empty: an open may be waiting for the one, or about to
+ * lock the other.
+ *
+ * # Safety
+ *
+ * `config_json` is a NUL-terminated string that stays valid for the call.
+ */
+char *duvet_e2e_destroy(const char *config_json);
 
 /**
  * Hands back a string the library returned. NULL does nothing.

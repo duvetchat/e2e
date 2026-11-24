@@ -9,6 +9,11 @@ publish.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# For the tests under Node, which has no OPFS: `use_memory_vfs` lets `open` take SQLite's
+# in-memory VFS. Never in a build for the web, whose databases must outlive a reload.
+memory-vfs = []
+
 # Everything is for the browser: natively the crate is empty.
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
 duvet-e2e.workspace = true

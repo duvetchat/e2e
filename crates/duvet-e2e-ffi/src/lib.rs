@@ -56,7 +56,13 @@ struct KeyringEntry {
 ///
 /// `config_json` is `{"path", "db_key"}`, the raw 32-byte key in base64, or
 /// `{"path", "keyring": {"service", "account"}}`, which takes the key from the system's keyring
-/// and makes it on the database's first open.
+/// and makes it on the database's first open. An entry keeps one database's key, which
+/// `duvet_e2e_destroy` deletes with that database: give each database a service and account of its
+/// own.
+///
+/// An open through the keyring waits, with no limit, while another open of the same database
+/// chooses its key (`<path>.key.lock`), that open's keyring prompt included, and asking the keyring
+/// can raise a prompt of its own: call it off the thread that draws the app.
 ///
 /// # Safety
 ///
@@ -110,6 +116,37 @@ pub extern "C" fn duvet_e2e_close(handle: u64) {
         }
     })
     .ok();
+}
+
+/// Deletes the database `config_json` names, with the files beside it and its key: the keyring's
+/// entry or `<path>.key`. Answers `{"ok":{}}`, also when there was nothing to delete, or the error
+/// reply: `locked` while a handle has the database open, and nothing is deleted then.
+///
+/// `config_json` is what `duvet_e2e_open` takes; `db_key`'s key is the caller's to forget. The
+/// keyring's entry goes whatever other database was opened with it: each database has its own.
+///
+/// It waits, with no limit, while an open of the same database chooses its key (`<path>.key.lock`),
+/// that open's keyring prompt included, and deleting the entry can raise a prompt of the keyring's
+/// own: call it off the thread that draws the app.
+/// `<path>.key.lock` and `<path>.lock` stay, empty: an open may be waiting for the one, or about to
+/// lock the other.
+///
+/// # Safety
+///
+/// `config_json` is a NUL-terminated string that stays valid for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duvet_e2e_destroy(config_json: *const c_char) -> *mut c_char {
+    answer(|| {
+        // Safety: as the caller promised.
+        let config = unsafe { read(config_json) }?;
+        let mut config: Config = serde_json::from_str(config).map_err(Error::bad_command)?;
+        let destroyed = destroy(&config);
+        if let Some(db_key) = &mut config.db_key {
+            db_key.zeroize();
+        }
+        destroyed?;
+        Ok(json!({ "ok": {} }).to_string())
+    })
 }
 
 /// Hands back a string the library returned. NULL does nothing.
@@ -178,6 +215,19 @@ fn open(config: &Config) -> Result<Core, Error> {
             Core::open(OpenConfig::new(config.path.clone(), decode_key(db_key)?))
         }
         (None, Some(entry)) => keyring::open(&config.path, &entry.service, &entry.account),
+        _ => Err(bad_command("give either db_key or keyring", "db_key")),
+    }
+}
+
+fn destroy(config: &Config) -> Result<(), Error> {
+    match (&config.db_key, &config.keyring) {
+        (Some(db_key), None) => {
+            decode_key(db_key)?;
+            keyring::destroy(&config.path, None)
+        }
+        (None, Some(entry)) => {
+            keyring::destroy(&config.path, Some((&entry.service, &entry.account)))
+        }
         _ => Err(bad_command("give either db_key or keyring", "db_key")),
     }
 }
