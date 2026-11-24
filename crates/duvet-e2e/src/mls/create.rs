@@ -10,10 +10,9 @@ use uuid::Uuid;
 
 use super::apply::Expected;
 use super::{
-    Draft, Extra, GroupRow, Pending, Skipped, Staged, choose, load_group, openmls_error, stage,
-    tls, violation,
+    Draft, Extra, GroupRow, Pending, Skipped, Staged, api_key, choose, load_group, openmls_error,
+    stage, tls, violation,
 };
-use crate::identity::invalid;
 use crate::protocol::b64;
 use crate::{Error, Tx};
 
@@ -77,11 +76,7 @@ pub(crate) fn create_group(tx: &Tx<'_>, request: CreateGroup) -> Result<Created,
             what: "group".into(),
         });
     }
-    let key: [u8; 32] = request
-        .external_sender
-        .as_slice()
-        .try_into()
-        .map_err(|_| invalid("external_sender", "the external sender isn't a 32-byte key"))?;
+    let key = api_key(&request.external_sender)?;
     let entries = request
         .members
         .iter()

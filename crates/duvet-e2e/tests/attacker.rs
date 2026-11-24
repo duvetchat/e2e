@@ -1397,6 +1397,83 @@ fn server_drops_pending_removal() {
 /// its device in.
 /// Every other format holds the same against changes: `formats.rs` (envelopes, attachments' parts,
 /// messages between devices), `backup.rs` (segments) and `history.rs` (packages).
+/// A DM of A and B whose group A1 made under a key the server made, in place of the API's, which
+/// the server took past its validator: a server that hands out groups whose external sender is
+/// its own key, which proposes removals there. Its welcome is entry 2, and the creation's reply
+/// has the group info of its first commit.
+fn group_under_another_key() -> (FakeServer, Uuid, [TestDevice; 3], Value) {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, b1, b2] = new_devices(&mut server, [a, b, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Dm, None, &[a, b], false);
+    let mut create = server.create_group(conversation);
+    create["external_sender"] = json!(b64(server_key().public()));
+    let created = ok(&mut a1.core, create);
+    take_unchecked(&mut server, &mut a1, conversation, &created);
+    assert_eq!(entry(&server, conversation, 2)["kind"], "welcome");
+    (server, conversation, [a1, b1, b2], created)
+}
+
+#[test]
+fn a_welcome_with_another_external_sender_is_rejected() {
+    let (server, conversation, [_, mut b1, mut b2], _) = group_under_another_key();
+    let welcome = entry(&server, conversation, 2);
+
+    // A key that isn't one is refused, and nothing of the call stays.
+    let mut short = apply(conversation, std::slice::from_ref(&welcome));
+    short["external_sender"] = json!(b64(&[1; 31]));
+    let refused = error(&mut b1.core, short);
+    assert_eq!(
+        (&refused["code"], &refused["field"]),
+        (&json!("bad_command"), &json!("external_sender"))
+    );
+
+    // B1's client gives the API's key: the welcome is refused, and B1 joins nothing.
+    let mut applied = apply(conversation, std::slice::from_ref(&welcome));
+    applied["external_sender"] = json!(server.external_sender());
+    let taken = ok(&mut b1.core, applied);
+    assert_eq!(
+        results(&[taken]),
+        [json!([
+            2,
+            "welcome",
+            "rejected",
+            "external_sender_mismatch"
+        ])]
+    );
+    assert_eq!(b1.no_group(conversation)["what"], "group");
+
+    // Without the key, as before: B2 joins.
+    let taken = ok(&mut b2.core, apply(conversation, &[welcome]));
+    assert_eq!(results(&[taken]), [json!([2, "welcome", "applied", null])]);
+}
+
+#[test]
+fn join_external_refuses_another_external_sender() {
+    let (server, conversation, [_, mut b1, _], created) = group_under_another_key();
+    let mut join = json!({
+        "cmd": "join_external",
+        "conversation_id": conversation,
+        "generation": 0,
+        "group_info": created["group_info"],
+        "external_sender": server.external_sender(),
+    });
+
+    // B1's client gives the API's key: refused, and nothing of the group stays.
+    let refused = error(&mut b1.core, join.clone());
+    assert_eq!(
+        (&refused["code"], &refused["rule"]),
+        (&json!("rule_violation"), &json!("external_sender_mismatch"))
+    );
+    assert_eq!(b1.no_group(conversation)["what"], "group");
+
+    // Without the key, as before: B1 joins.
+    join.as_object_mut().unwrap().remove("external_sender");
+    let joined = ok(&mut b1.core, join);
+    assert!(joined["commit"].is_string());
+}
+
 #[test]
 fn server_changes_ciphertext() {
     let mut server = FakeServer::new();

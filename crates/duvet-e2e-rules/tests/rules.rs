@@ -8,8 +8,8 @@ use duvet_e2e_rules::{
     DeviceCertificate, DeviceList, Entry, HISTORY_SHARE, Kind, LEAVE, LeaveStatement,
     MEMBER_LIST_EXTENSION, MemberList, MembershipChange, Record, Removed, RuleContext,
     RuleViolation, SUITE, check_applied_change, check_change, check_joined_state, check_state,
-    extract_change, group_config, group_id, is_record, join_config, keeps_record,
-    leaf_capabilities, leaves, sign, verify,
+    external_sender_is, extract_change, group_config, group_id, is_record, join_config,
+    keeps_record, leaf_capabilities, leaves, sign, verify,
 };
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
@@ -1528,6 +1528,71 @@ fn starting_context(
         group.public_group().group_context(),
         group.members(),
     )
+}
+
+/// A client holds a group it joins to the API's key as it was given it: the group names that key,
+/// by the key alone, and no other sender.
+#[test]
+fn the_api_is_the_one_external_sender() {
+    let world = World::new(&[1, 1]);
+    let members = MemberList::new(
+        Kind::Group,
+        Some(world.id(O)),
+        vec![world.entry(O, 0), world.entry(A, 0)],
+    );
+    let key = world.server.public().to_vec();
+    let sender = |key: &[u8], name: &[u8]| {
+        ExternalSender::new(key.into(), BasicCredential::new(name.to_vec()).into())
+    };
+    let stranger = signer().public().to_vec();
+    let names_the_api = |senders: Option<Vec<ExternalSender>>| {
+        let required = RequiredCapabilitiesExtension::new(
+            &[ExtensionType::Unknown(MEMBER_LIST_EXTENSION)],
+            &[],
+            &[],
+        );
+        let mut extensions = vec![
+            members.to_extension(),
+            Extension::RequiredCapabilities(required),
+        ];
+        extensions.extend(senders.map(Extension::ExternalSenders));
+        let config = config_with(SUITE, extensions, leaf_capabilities());
+        let creator = world.device((O, 0));
+        let mut group = world.create((O, 0), creator.credential(), &config, GENERATION);
+        let named = external_sender_is(group.public_group().group_context(), &key);
+        group.delete(creator.provider.storage()).unwrap();
+        named
+    };
+    let verdicts = [
+        (
+            "the API",
+            names_the_api(Some(vec![world.external_sender()])),
+        ),
+        (
+            "the API's key under another name",
+            names_the_api(Some(vec![sender(&key, b"another")])),
+        ),
+        (
+            "another key",
+            names_the_api(Some(vec![sender(&stranger, b"duvet")])),
+        ),
+        (
+            "the API and another",
+            names_the_api(Some(vec![
+                world.external_sender(),
+                sender(&stranger, b"duvet"),
+            ])),
+        ),
+        ("none", names_the_api(None)),
+    ];
+    let expected = [
+        ("the API", true),
+        ("the API's key under another name", true),
+        ("another key", false),
+        ("the API and another", false),
+        ("none", false),
+    ];
+    assert_eq!(verdicts, expected);
 }
 
 #[test]

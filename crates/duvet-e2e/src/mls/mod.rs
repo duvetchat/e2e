@@ -32,7 +32,7 @@ use serde_bytes::ByteBuf;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::identity::{from_cbor, not_found, renewed_at, to_cbor};
+use crate::identity::{from_cbor, invalid, not_found, renewed_at, to_cbor};
 use crate::protocol::b64;
 use crate::{Error, OwnDevice, SqlStorageError, Tx};
 
@@ -50,6 +50,16 @@ const REFRESH_AFTER_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// What a blocked group answers to the commands that would commit in it: only a reset, the
 /// owner's, takes it on.
 const GROUP_BLOCKED: &str = "group_blocked";
+
+/// What refuses a welcome or a group info whose group doesn't have the API's key, as the client
+/// gave it, as its one external sender.
+const EXTERNAL_SENDER_MISMATCH: &str = "external_sender_mismatch";
+
+/// The API's Ed25519 public key, the groups' one external sender, as a command takes it.
+pub(crate) fn api_key(key: &[u8]) -> Result<[u8; 32], Error> {
+    key.try_into()
+        .map_err(|_| invalid("external_sender", "the external sender isn't a 32-byte key"))
+}
 
 /// A command about one conversation, and nothing else.
 #[derive(Debug, Deserialize)]

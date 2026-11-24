@@ -457,6 +457,15 @@ fn check_context(ctx: &RuleContext, context: &GroupContext) -> Result<(), RuleVi
     }
 }
 
+/// Whether `context`'s group has `key` as its one external sender: what a client holds a group it
+/// joins to, with the API's key as it was given it. The API is known by its key alone.
+pub fn external_sender_is(context: &GroupContext, key: &[u8]) -> bool {
+    match context.extensions().external_senders().map(Vec::as_slice) {
+        Some([sender]) => sender_key(sender).is_ok_and(|named| named == key),
+        _ => false,
+    }
+}
+
 /// An external sender's signature key: the first field of its encoding, as OpenMLS keeps the
 /// accessor to itself.
 fn sender_key(sender: &ExternalSender) -> Result<Vec<u8>, RuleViolation> {

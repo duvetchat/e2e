@@ -21,8 +21,8 @@ pub use identity::{BindProof, DeviceCertificate, DeviceList, LeaveStatement};
 pub use members::{CommitAad, Entry, Kind, MAX_MEMBERS, MEMBER_LIST_EXTENSION, MemberList};
 pub use rules::{
     Place, Record, RuleContext, RuleViolation, certified, check_applied_change, check_change,
-    check_joined_state, check_state, is_record, keeps_record, signed_for, statement_user,
-    unlisted_candidates,
+    check_joined_state, check_state, external_sender_is, is_record, keeps_record, signed_for,
+    statement_user, unlisted_candidates,
 };
 pub use signed::{
     DEVICE_BIND, DEVICE_CERTIFICATE, DEVICE_LIST, DIRECT_MESSAGE, HISTORY_SHARE, LEAVE, sign,

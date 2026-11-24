@@ -2,8 +2,8 @@
 //! removals, its leaf's renewal), joining by external commit, and what the group is.
 
 use duvet_e2e_rules::{
-    CommitAad, Kind, MemberList, check_joined_state, group_id, join_config, leaf_capabilities,
-    leaves,
+    CommitAad, Kind, MemberList, check_joined_state, external_sender_is, group_id, join_config,
+    leaf_capabilities, leaves,
 };
 use openmls::prelude::tls_codec::DeserializeBytes as _;
 use openmls::prelude::{
@@ -16,9 +16,9 @@ use uuid::Uuid;
 use super::apply::Expected;
 use super::members::Committed;
 use super::{
-    ConversationId, Extra, GroupRow, Pending, REFRESH_AFTER_MS, can_commit,
-    certify_leaves_by_pinned, delete_group, digest, draft, load_group, note_removed, openmls_error,
-    own_merged, rule_context, stage, storage_error, stored_group, stored_state, tls,
+    ConversationId, EXTERNAL_SENDER_MISMATCH, Extra, GroupRow, Pending, REFRESH_AFTER_MS, api_key,
+    can_commit, certify_leaves_by_pinned, delete_group, digest, draft, load_group, note_removed,
+    openmls_error, own_merged, rule_context, stage, storage_error, stored_group, stored_state, tls,
     unlisted_leaves, violation,
 };
 use crate::identity::{invalid, not_found, stored_uuid};
@@ -57,6 +57,10 @@ pub(crate) struct JoinExternal {
     /// entry's `expected`.
     #[serde(default)]
     expected: Option<Expected>,
+    /// The API's key, as the client pinned it: the group must have it as its one external sender,
+    /// as `apply`'s welcomes do.
+    #[serde(default, with = "b64::option")]
+    external_sender: Option<Vec<u8>>,
 }
 
 #[derive(Serialize)]
@@ -279,10 +283,16 @@ pub(crate) fn refresh_due(tx: &Tx<'_>) -> Result<Due, Error> {
 /// API serves: a device on its user's list whose user is a member, coming back after it was
 /// removed or its state fell behind, or new to the group. Whatever this device had of the group
 /// goes, and the queue counts again from this commit. The group it enters is held to the rules
-/// first, and to the client's record of a conversation from before the cutover, as a welcome's is.
-/// Merged as it's made, it waits for `commit_result` all the same.
+/// first, to the client's record of a conversation from before the cutover, as a welcome's is, and
+/// to the API's key as its one external sender when the client gives it. Merged as it's made, it
+/// waits for `commit_result` all the same.
 pub(crate) fn join_external(tx: &Tx<'_>, request: JoinExternal) -> Result<Committed, Error> {
     let conversation = request.conversation_id;
+    let api = request
+        .external_sender
+        .as_deref()
+        .map(api_key)
+        .transpose()?;
     let own = tx.own_device()?;
     let credential = own.credential()?;
     let info = match MlsMessageIn::tls_deserialize_exact_bytes(&request.group_info)
@@ -380,6 +390,13 @@ pub(crate) fn join_external(tx: &Tx<'_>, request: JoinExternal) -> Result<Commit
     // identity (or by the certificate it signed for the same device), its user a member, this
     // device's own among them.
     let context = group.public_group().group_context();
+    if let Some(key) = &api
+        && !external_sender_is(context, key)
+    {
+        return Err(Error::RuleViolation {
+            rule: EXTERNAL_SENDER_MISMATCH.into(),
+        });
+    }
     let mut leaves = leaves(group.members()).map_err(violation)?;
     certify_leaves_by_pinned(tx, &mut leaves)?;
     let mut ctx = rule_context(tx, leaves.values().map(|leaf| leaf.user))?;
