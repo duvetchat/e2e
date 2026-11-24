@@ -3,7 +3,7 @@
 //! Service, it goes to `<path>.key`, which only its user reads, and `status` says `file`.
 
 use std::fs::{File, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use duvet_e2e::{Core, Error, KeyStorage, OpenConfig};
 use rand_core::{OsRng, RngCore};
@@ -134,15 +134,13 @@ fn open_with(path: &Path, entry: Result<impl KeyStore, NoKeyring>) -> Result<Cor
 /// Takes `<path>.key.lock`, waiting for any other open of the database that holds it. It isn't
 /// the core's `<path>.lock`, which the core only tries on a handle of its own.
 fn lock_key(path: &Path) -> Result<File, Error> {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".key.lock");
     let failed =
         |error: std::io::Error| Error::Storage(format!("the key's lock: {}", error.kind()));
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(name)
+        .open(beside(path, ".key.lock"))
         .map_err(failed)?;
     file.lock().map_err(failed)?;
     Ok(file)
@@ -152,7 +150,8 @@ fn lock_key(path: &Path) -> Result<File, Error> {
 ///
 /// A key is made only for a database that doesn't exist yet: for one that does, a missing key
 /// can't open it, and a new one would only hide the key that might come back. The plaintext
-/// `<path>.key` only where there's no Secret Service at all.
+/// `<path>.key` only where there's no Secret Service at all. A `<path>.key` of another length than
+/// a key's is replaced while there's no database, and refused once there is one.
 fn database_key(
     path: &Path,
     entry: Result<impl KeyStore, NoKeyring>,
@@ -161,8 +160,19 @@ fn database_key(
     let fresh = !std::fs::exists(path)
         .map_err(|error| Error::Storage(format!("the database: {}", error.kind())))?;
     #[cfg(secret_service)]
-    if let Some(key) = file::read(path)? {
-        return Ok((key, KeyStorage::File));
+    match file::read(path)? {
+        Some(bytes) if bytes.len() == 32 => {
+            return key_from(&bytes).map(|key| (key, KeyStorage::File));
+        }
+        // Not a key, and no database it could be for: a write cut short left it, before key files
+        // were renamed into place whole. It goes, and the database gets a key as if it weren't there.
+        Some(_) if fresh => file::remove(path)?,
+        Some(_) => {
+            return Err(Error::Storage(
+                "the database's key file isn't 32 bytes".into(),
+            ));
+        }
+        None => {}
     }
     match entry {
         Ok(entry) => key_in(&entry, fresh).map(|key| (key, KeyStorage::Keyring)),
@@ -204,50 +214,85 @@ fn random_key() -> Result<Key, Error> {
     Ok(key)
 }
 
+/// `<path><suffix>`: a file the database keeps beside it.
+fn beside(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Deletes `file`, which may not be there. `what` names it in the error.
+fn remove(file: &Path, what: &str) -> Result<(), Error> {
+    match std::fs::remove_file(file) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(Error::Storage(format!("{what}: {}", error.kind())))
+        }
+        _ => Ok(()),
+    }
+}
+
 #[cfg(secret_service)]
 mod file {
-    use std::fs::OpenOptions;
+    use std::fs::{File, OpenOptions};
     use std::io::{ErrorKind, Read, Write};
     use std::os::unix::fs::OpenOptionsExt;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use duvet_e2e::Error;
     use zeroize::Zeroizing;
 
-    use super::{Key, key_from};
+    use super::{Key, beside};
 
-    fn key_path(path: &Path) -> PathBuf {
-        let mut name = path.as_os_str().to_owned();
-        name.push(".key");
-        PathBuf::from(name)
+    fn failed(error: std::io::Error) -> Error {
+        Error::Storage(format!("the key file: {}", error.kind()))
     }
 
-    /// The key in `<path>.key`, when there is one.
-    pub(super) fn read(path: &Path) -> Result<Option<Key>, Error> {
-        let mut file = match OpenOptions::new().read(true).open(key_path(path)) {
+    /// What `<path>.key` holds, when it's there: 33 bytes at most, which tells a key from what
+    /// isn't one.
+    pub(super) fn read(path: &Path) -> Result<Option<Zeroizing<Vec<u8>>>, Error> {
+        let file = match OpenOptions::new().read(true).open(beside(path, ".key")) {
             Ok(file) => file,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(Error::Storage(format!("the key file: {}", error.kind()))),
+            Err(error) => return Err(failed(error)),
         };
+        // Read into its final capacity, so no copy is left in a block it outgrew.
         let mut bytes = Zeroizing::new(Vec::with_capacity(33));
-        file.read_to_end(&mut bytes)
-            .map_err(|error| Error::Storage(format!("the key file: {}", error.kind())))?;
-        key_from(&bytes).map(Some)
+        file.take(33).read_to_end(&mut bytes).map_err(failed)?;
+        Ok(Some(bytes))
     }
 
-    /// A new random key in `<path>.key`, made readable and writable by its user alone.
+    /// A new random key in `<path>.key`, readable and writable by its user alone. It's written
+    /// whole to `<path>.key.tmp`, then renamed: `<path>.key` holds all of it or isn't there. Only
+    /// under `<path>.key.lock`, which keeps any other writer out.
     pub(super) fn create(path: &Path) -> Result<Key, Error> {
         let key = super::random_key()?;
+        let (temporary, key_file) = (beside(path, ".key.tmp"), beside(path, ".key"));
+        // What a write cut short left.
+        super::remove(&temporary, "the key file")?;
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(key_path(path))
-            .map_err(|error| Error::Storage(format!("the key file: {}", error.kind())))?;
+            .open(&temporary)
+            .map_err(failed)?;
         file.write_all(&*key)
             .and_then(|()| file.sync_all())
-            .map_err(|error| Error::Storage(format!("the key file: {}", error.kind())))?;
+            .map_err(failed)?;
+        std::fs::rename(&temporary, &key_file).map_err(failed)?;
+        // The rename itself on the disk, before the database the key opens is made.
+        let folder = key_file
+            .parent()
+            .filter(|folder| !folder.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        File::open(folder)
+            .and_then(|folder| folder.sync_all())
+            .map_err(failed)?;
         Ok(key)
+    }
+
+    /// Deletes `<path>.key`.
+    pub(super) fn remove(path: &Path) -> Result<(), Error> {
+        super::remove(&beside(path, ".key"), "the key file")
     }
 }
 
@@ -320,6 +365,110 @@ mod tests {
             std::fs::read(dir.path().join("core.db.key")).unwrap(),
             key.to_vec()
         );
+    }
+
+    /// `<path>.key` as a write cut short leaves it: 5 of its 32 bytes.
+    #[cfg(secret_service)]
+    const CUT_KEY: [u8; 5] = [7; 5];
+
+    #[cfg(secret_service)]
+    #[test]
+    fn a_short_key_file_without_a_database_is_replaced() {
+        // No database ever got that key. Without a Secret Service, a whole one takes its place.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.db");
+        std::fs::write(dir.path().join("core.db.key"), CUT_KEY).unwrap();
+        let none: Result<Entry, NoKeyring> = Err(NoKeyring::Absent);
+        let (key, storage) = database_key(&path, none).unwrap();
+        assert_eq!(storage, KeyStorage::File);
+        assert_eq!(
+            std::fs::read(dir.path().join("core.db.key")).unwrap(),
+            key.to_vec()
+        );
+
+        // With one, the key goes to the keyring, and the file goes: every open reads it first.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.db");
+        std::fs::write(dir.path().join("core.db.key"), CUT_KEY).unwrap();
+        let store = mock_store();
+        let (key, storage) = database_key(&path, Ok(entry_in(&store))).unwrap();
+        assert_eq!(storage, KeyStorage::Keyring);
+        assert_eq!(entry_in(&store).get_secret().unwrap(), key.to_vec());
+        assert!(!dir.path().join("core.db.key").exists());
+    }
+
+    #[cfg(secret_service)]
+    #[test]
+    fn a_short_key_file_with_a_database_is_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.db");
+        std::fs::write(&path, b"a database").unwrap();
+        std::fs::write(dir.path().join("core.db.key"), CUT_KEY).unwrap();
+
+        let store = mock_store();
+        for entry in [Ok(entry_in(&store)), Err(NoKeyring::Absent)] {
+            let error = database_key(&path, entry).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "storage: the database's key file isn't 32 bytes"
+            );
+        }
+        // Nothing takes its place: a new key wouldn't open the database either.
+        assert_eq!(
+            std::fs::read(dir.path().join("core.db.key")).unwrap(),
+            CUT_KEY
+        );
+        assert!(no_entry(&store));
+    }
+
+    /// Run by `the_key_file_lands_whole_or_not_at_all` in a process of its own, which can't write
+    /// a file past 5 bytes: it makes the key file of the database `DUVET_E2E_CUT_KEY` names.
+    #[cfg(all(secret_service, target_os = "linux"))]
+    #[test]
+    #[ignore = "a child process of the_key_file_lands_whole_or_not_at_all"]
+    fn make_a_key_file_and_be_cut() {
+        if let Some(path) = std::env::var_os("DUVET_E2E_CUT_KEY") {
+            let none: Result<Entry, NoKeyring> = Err(NoKeyring::Absent);
+            database_key(Path::new(&path), none).ok();
+        }
+    }
+
+    #[cfg(all(secret_service, target_os = "linux"))]
+    #[test]
+    fn the_key_file_lands_whole_or_not_at_all() {
+        use std::os::unix::process::ExitStatusExt;
+
+        // Linux's number for SIGXFSZ, which ends a process that writes past its file size limit.
+        const SIGXFSZ: i32 = 25;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.db");
+        let child = std::process::Command::new("prlimit")
+            .arg("--fsize=5")
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "keyring::tests::make_a_key_file_and_be_cut"])
+            .args(["--ignored", "--test-threads=1"])
+            .env("DUVET_E2E_CUT_KEY", &path)
+            .output()
+            .unwrap();
+        // The kernel ended it halfway through the key: 5 of its bytes are in a file.
+        assert_eq!(child.status.signal(), Some(SIGXFSZ), "{child:?}");
+        let cut = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|file| file.as_ref().unwrap().metadata().unwrap().len() == 5)
+            .count();
+        assert_eq!(cut, 1, "one file holds the 5 bytes written");
+
+        let key_file = dir.path().join("core.db.key");
+        assert!(
+            !key_file.exists(),
+            "a key file landed cut short: {:?}",
+            std::fs::read(&key_file)
+        );
+        // The next open makes it, whole.
+        let none: Result<Entry, NoKeyring> = Err(NoKeyring::Absent);
+        let (key, _) = database_key(&path, none).unwrap();
+        assert_eq!(std::fs::read(&key_file).unwrap(), key.to_vec());
     }
 
     #[cfg(secret_service)]
@@ -491,7 +640,10 @@ mod tests {
         let created = file::create(&path).unwrap();
         let metadata = std::fs::metadata(dir.path().join("core.db.key")).unwrap();
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-        assert_eq!(*file::read(&path).unwrap().unwrap(), *created);
-        assert!(file::create(&path).is_err(), "never overwritten");
+        assert_eq!(*file::read(&path).unwrap().unwrap(), created.to_vec());
+        // A whole key is never replaced: the next open, of a database still to be made, takes it.
+        let none: Result<Entry, NoKeyring> = Err(NoKeyring::Absent);
+        let (reused, storage) = database_key(&path, none).unwrap();
+        assert_eq!((*reused, storage), (*created, KeyStorage::File));
     }
 }
