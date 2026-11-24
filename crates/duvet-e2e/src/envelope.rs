@@ -1,7 +1,8 @@
 //! The envelope: what a message of a conversation holds once MLS opens it, in CBOR. It takes one
 //! of three forms:
 //!
-//! - a message, `{v: 1, text?, attachments?: [Attachment]}`, with text or at least one file;
+//! - a message, `{v: 1, text?, attachments?: [Attachment]}`: with neither, the body of a message
+//!   whose content goes in the clear, a sticker;
 //! - an edit, `{v: 1, edit: message_id, text}`;
 //! - a deletion, `{v: 1, delete: message_id}`.
 //!
@@ -25,7 +26,7 @@ pub const MAX_THUMBNAIL: usize = 8 * 1024;
 /// What a message of a conversation holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Envelope {
-    /// A message: its text, its files, or both.
+    /// A message: its text, its files, both, or neither (a sticker, which goes in the clear).
     Message {
         text: Option<String>,
         attachments: Vec<Attachment>,
@@ -115,9 +116,6 @@ impl Envelope {
             Envelope::Message { text, attachments } => {
                 if text.as_deref() == Some("") {
                     return Err("a message without text leaves the text field out");
-                }
-                if text.is_none() && attachments.is_empty() {
-                    return Err("a message has text or a file");
                 }
                 attachments.iter().try_for_each(Attachment::check)
             }

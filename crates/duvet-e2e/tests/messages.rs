@@ -486,6 +486,25 @@ fn messages_by_ids_returns_what_it_holds() {
     );
 }
 
+/// A message that carries only what goes in the clear, a sticker, has an empty envelope: its sender
+/// keeps it, and the other device stores it as a message, `ok`, without text or files.
+#[test]
+fn a_sticker_only_message_round_trips() {
+    let (mut server, conversation, [a, _], [mut a1, mut b1]) = dm();
+    let sticker = send(&mut server, &mut a1, conversation, json!({}), &[]);
+    let taken = server.deliver(&mut b1);
+    assert_eq!(results(&taken), [json!([3, "message", "applied", null])]);
+    let taken = server.deliver(&mut a1);
+    assert_eq!(results(&taken), [json!([3, "message", "own", null])]);
+    for device in [&mut a1, &mut b1] {
+        let shown = message(device, conversation, sticker).unwrap();
+        assert_eq!(shown["status"], "ok");
+        assert_eq!(shown["user_id"], json!(a));
+        assert_eq!(shown["text"], Value::Null);
+        assert_eq!(shown["attachments"], json!([]));
+    }
+}
+
 #[test]
 fn nonce_retry_does_not_duplicate() {
     let (mut server, conversation, _, [mut a1, mut b1]) = dm();
