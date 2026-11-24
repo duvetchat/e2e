@@ -176,19 +176,28 @@ fn destroy_with(path: &Path, entry: Option<Result<impl KeyStore, NoKeyring>>) ->
         Some(Err(NoKeyring::Absent)) | None => None,
         Some(Err(NoKeyring::Failed(error))) => return Err(keyring_failed(&error)),
     };
+    // Without its folder there's no database, and no lock to take: only the key may be left.
+    let folder = std::fs::exists(folder_of(path))
+        .map_err(|error| Error::Storage(format!("the database's folder: {}", error.kind())))?;
+    if !folder {
+        return delete_key(entry);
+    }
     let _choosing = lock_key(path)?;
     let _open = duvet_e2e::lock_database(path)?;
     // The database first: what a destroy cut short leaves is a key, which a new database takes.
     for suffix in ["", "-journal", "-wal", "-shm", ".key", ".key.tmp"] {
         remove(&beside(path, suffix), "the database's files")?;
     }
-    if let Some(entry) = entry {
-        match entry.delete() {
-            Ok(()) | Err(keyring_core::Error::NoEntry) => {}
-            Err(error) => return Err(keyring_failed(&error)),
-        }
-    }
+    delete_key(entry)?;
     remove(&beside(path, ".lock"), "the database's lock")
+}
+
+/// Deletes the key `entry` keeps, when there's an entry. One already empty is deleted already.
+fn delete_key(entry: Option<impl KeyStore>) -> Result<(), Error> {
+    match entry.map(|entry| entry.delete()) {
+        None | Some(Ok(()) | Err(keyring_core::Error::NoEntry)) => Ok(()),
+        Some(Err(error)) => Err(keyring_failed(&error)),
+    }
 }
 
 /// The key of the database at `path`, and where it's kept.
@@ -266,6 +275,13 @@ fn beside(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// The folder `file` is in: `.` for a bare name.
+fn folder_of(file: &Path) -> &Path {
+    file.parent()
+        .filter(|folder| !folder.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
 /// Deletes `file`, which may not be there. `what` names it in the error.
 fn remove(file: &Path, what: &str) -> Result<(), Error> {
     match std::fs::remove_file(file) {
@@ -325,11 +341,7 @@ mod file {
             .map_err(failed)?;
         std::fs::rename(&temporary, &key_file).map_err(failed)?;
         // The rename itself on the disk, before the database the key opens is made.
-        let folder = key_file
-            .parent()
-            .filter(|folder| !folder.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        File::open(folder)
+        File::open(super::folder_of(&key_file))
             .and_then(|folder| folder.sync_all())
             .map_err(failed)?;
         Ok(key)
@@ -797,6 +809,20 @@ mod tests {
         Core::open(OpenConfig::new(&path, key_from(&key).unwrap()))
             .expect("the key opens the database")
             .close();
+    }
+
+    #[test]
+    fn destroy_where_the_folder_is_gone_deletes_the_key() {
+        // The app's data was deleted, and the keyring kept the key of the database it held.
+        let store = mock_store();
+        entry_in(&store).set_secret(&[7; 32]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gone").join("core.db");
+
+        // No folder, no database: nothing to delete there, and nothing made.
+        destroy_with(&path, Some(Ok(entry_in(&store)))).unwrap();
+        assert!(no_entry(&store));
+        assert!(!dir.path().join("gone").exists());
     }
 
     #[cfg(secret_service)]
