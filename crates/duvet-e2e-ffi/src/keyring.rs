@@ -558,11 +558,13 @@ mod tests {
         }
     }
 
+    // Unix only: on Windows a path through a file is `NotFound`, a database that isn't there.
+    #[cfg(unix)]
     #[test]
     fn a_database_that_cant_be_looked_for_gets_no_key() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a-file"), b"").unwrap();
-        // Whether it exists can't be known: its folder is a file.
+        // Whether it exists can't be known: its folder is a file (`NotADirectory`).
         let path = dir.path().join("a-file").join("core.db");
 
         let store = mock_store();

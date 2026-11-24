@@ -3,9 +3,9 @@
 import { describe, expect, test } from "bun:test";
 import { CString, dlopen, FFIType, suffix } from "bun:ffi";
 import { randomBytes, randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 // duvet_e2e_ffi.dll on Windows, libduvet_e2e_ffi.dylib on macOS, libduvet_e2e_ffi.so elsewhere.
 const name = `${process.platform === "win32" ? "" : "lib"}duvet_e2e_ffi.${suffix}`;
@@ -140,5 +140,38 @@ describe("the C ABI", () => {
     close(fresh);
     if (key) expect(readFileSync(`${path}.key`).equals(key)).toBe(false);
     expect(destroy(config)).toEqual({ ok: {} });
+  });
+
+  // Windows' Credential Manager, the desktop's keyring: windows.yml runs these on a release's DLL.
+  test.skipIf(!credentialManager)("the keyring keeps the key", () => {
+    const path = database();
+    const config = { path, keyring: keyring() };
+    const device = randomUUID();
+    const core = open(config).ok.handle;
+    expect(handle(core, status).ok.key_storage).toBe("keyring");
+    expect(handle(core, createDevice(device)).ok).toBeDefined();
+    close(core);
+    expect(existsSync(`${path}.key`)).toBe(false);
+
+    // The next open takes the key from the credential: the same database, with its device.
+    const again = open(config).ok.handle;
+    expect(handle(again, status).ok).toMatchObject({ key_storage: "keyring", device_id: device });
+    close(again);
+    expect(destroy(config)).toEqual({ ok: {} });
+  });
+
+  test.skipIf(!credentialManager)("destroy removes the credential", () => {
+    const path = database();
+    const config = { path, keyring: keyring() };
+    close(open(config).ok.handle);
+    // A copy of the database, under the same entry: only the credential's key opens it.
+    const copy = { path: join(dirname(path), "copy.db"), keyring: config.keyring };
+    copyFileSync(path, copy.path);
+    close(open(copy).ok.handle);
+
+    expect(destroy(config)).toEqual({ ok: {} });
+    // The credential went with its database: nothing opens the copy now.
+    expect(open(copy).error.code).toBe("bad_key");
+    expect(destroy(copy)).toEqual({ ok: {} });
   });
 });
