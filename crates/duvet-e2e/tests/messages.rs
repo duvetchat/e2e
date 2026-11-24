@@ -417,6 +417,94 @@ fn two_users_two_devices_converse() {
     assert_eq!(newest["messages"].as_array().unwrap().len(), 1);
 }
 
+/// `messages` by IDs: the rows the device has of the messages named, as its page shows them, newest
+/// first. One that waits is there; one it doesn't have, one deleted and another conversation's
+/// aren't. 200 IDs at most.
+#[test]
+fn messages_by_ids_returns_what_it_holds() {
+    let (mut server, conversation, [a, b], [mut a1, mut b1]) = dm();
+    let first = say(&mut server, &mut a1, conversation, "uno");
+    let second = say(&mut server, &mut b1, conversation, "dos");
+    let gone = say(&mut server, &mut a1, conversation, "borrado");
+    delete(&mut server, &mut a1, conversation, gone);
+    // A message B1 can't read: it waits.
+    let (waits, _) =
+        server.post_message(&a1, conversation, "huge", vec![0; MAX_CIPHERTEXT + 1], &[]);
+    let other = new_id();
+    server.conversation(other, Kind::Dm, None, &[a, b], false);
+    start(&mut server, &mut a1, other);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    let elsewhere = say(&mut server, &mut a1, other, "otra conversación");
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    assert!(message(&mut b1, other, elsewhere).is_some());
+
+    let by_ids = |device: &mut TestDevice, ids: Value| {
+        let command = json!({"cmd": "messages", "conversation_id": conversation, "ids": ids});
+        ok(&mut device.core, command)["messages"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    let asked = json!([first, new_id(), waits, gone, elsewhere, second]);
+    let shown = by_ids(&mut b1, asked);
+    let ids: Vec<&Value> = shown.iter().map(|shown| &shown["message_id"]).collect();
+    assert_eq!(ids, [&json!(waits), &json!(second), &json!(first)]);
+    assert_eq!(shown[0]["status"], "waiting");
+    assert_eq!(shown, messages_of(&mut b1, conversation));
+    assert_eq!(by_ids(&mut b1, json!([])), Vec::<Value>::new());
+
+    // 200 IDs at most.
+    let mut most: Vec<Uuid> = (1..200).map(|_| new_id()).collect();
+    most.push(first);
+    assert_eq!(by_ids(&mut b1, json!(most)).len(), 1);
+    most.push(new_id());
+    let refused = error(
+        &mut b1.core,
+        json!({"cmd": "messages", "conversation_id": conversation, "ids": most}),
+    );
+    assert_eq!(
+        (&refused["code"], &refused["limit"]),
+        (&json!("too_large"), &json!(200))
+    );
+
+    // Either the IDs or a page: not both, nor a page without its length.
+    let refused = error(
+        &mut b1.core,
+        json!({"cmd": "messages", "conversation_id": conversation, "ids": [first], "limit": 10}),
+    );
+    assert_eq!(
+        (&refused["code"], &refused["field"]),
+        (&json!("bad_command"), &json!("ids"))
+    );
+    let refused = error(
+        &mut b1.core,
+        json!({"cmd": "messages", "conversation_id": conversation}),
+    );
+    assert_eq!(
+        (&refused["code"], &refused["field"]),
+        (&json!("bad_command"), &json!("limit"))
+    );
+}
+
+/// A message that carries only what goes in the clear, a sticker, has an empty envelope: its sender
+/// keeps it, and the other device stores it as a message, `ok`, without text or files.
+#[test]
+fn a_sticker_only_message_round_trips() {
+    let (mut server, conversation, [a, _], [mut a1, mut b1]) = dm();
+    let sticker = send(&mut server, &mut a1, conversation, json!({}), &[]);
+    let taken = server.deliver(&mut b1);
+    assert_eq!(results(&taken), [json!([3, "message", "applied", null])]);
+    let taken = server.deliver(&mut a1);
+    assert_eq!(results(&taken), [json!([3, "message", "own", null])]);
+    for device in [&mut a1, &mut b1] {
+        let shown = message(device, conversation, sticker).unwrap();
+        assert_eq!(shown["status"], "ok");
+        assert_eq!(shown["user_id"], json!(a));
+        assert_eq!(shown["text"], Value::Null);
+        assert_eq!(shown["attachments"], json!([]));
+    }
+}
+
 #[test]
 fn nonce_retry_does_not_duplicate() {
     let (mut server, conversation, _, [mut a1, mut b1]) = dm();

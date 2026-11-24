@@ -5,8 +5,8 @@
 
 use duvet_e2e_rules::{
     Entry as ListEntry, Kind, LeaveStatement, MemberList, Place, Record, RuleContext,
-    RuleViolation, check_joined_state, extract_change, group_id_parts, join_config, leaves,
-    statement_user,
+    RuleViolation, check_joined_state, external_sender_is, extract_change, group_id_parts,
+    join_config, leaves, statement_user,
 };
 use openmls::prelude::tls_codec::DeserializeBytes as _;
 use openmls::prelude::{
@@ -19,10 +19,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    Extra, GroupRow, brings_back_removed, certify_by_pinned, certify_leaves_by_pinned, check,
-    check_applied, commit_asks_first, delete_group, digest, merge_own, note_removed, openmls_error,
-    rule_context, skip_unchanged_leaves, storage_error, stored_group, stored_state,
-    welcome_asks_first,
+    EXTERNAL_SENDER_MISMATCH, Extra, GroupRow, api_key, brings_back_removed, can_commit,
+    certify_by_pinned, certify_leaves_by_pinned, check, check_applied, commit_asks_first,
+    delete_group, digest, merge_own, note_removed, openmls_error, removals_waiting, rule_context,
+    skip_unchanged_leaves, storage_error, stored_group, stored_state, welcome_asks_first,
 };
 use crate::identity::{invalid, not_found};
 use crate::protocol::b64;
@@ -32,6 +32,10 @@ use crate::{Error, Tx};
 pub(crate) struct ApplyRequest {
     conversation_id: Uuid,
     entries: Vec<Entry>,
+    /// The API's key, as the client pinned it: a welcome's group must have it as its one external
+    /// sender. Without it, a welcome's is held to having one, whatever its key.
+    #[serde(default, with = "b64::option")]
+    external_sender: Option<Vec<u8>>,
 }
 
 /// An entry of a conversation's queue, as the API hands it out.
@@ -137,12 +141,13 @@ pub(crate) enum Applied {
     /// A commit that took this device out of the group.
     Removed,
     /// Refused, for the rule it breaks (or `malformed`, `invalid_commit`, `invalid_welcome`,
-    /// `invalid_proposal`, `wrong_group` for what isn't a valid message of this group, and
-    /// `stale_welcome` for a welcome to an epoch this device held or saw pass; `not_author` for an
-    /// edit or a deletion of another user's message). Another device's commit refused for a rule,
-    /// or one OpenMLS can't process, also blocks the group, and nothing goes on it but a reset; a
-    /// malformed entry, a commit entry that holds no commit, and a refused welcome or proposal
-    /// leave the group as it was.
+    /// `invalid_proposal`, `wrong_group` for what isn't a valid message of this group,
+    /// `stale_welcome` for a welcome to an epoch this device held or saw pass, and
+    /// `external_sender_mismatch` for one whose group doesn't have the API's key the client gave as
+    /// its one external sender; `not_author` for an edit or a deletion of another user's message).
+    /// Another device's commit refused for a rule, or one OpenMLS can't process, also blocks the
+    /// group, and nothing goes on it but a reset; a malformed entry, a commit entry that holds no
+    /// commit, and a refused welcome or proposal leave the group as it was.
     Rejected { rule: String },
     /// Not for this device, or not now: a welcome for other devices, an entry of another generation
     /// or epoch, of a group this device isn't in, or after its group was blocked; a message this
@@ -166,6 +171,10 @@ pub(crate) struct ApplyReply {
     /// What each entry this call applied did; those applied before aren't in it.
     results: Vec<EntryResult>,
     catch_up_due: Vec<Uuid>,
+    /// Whether this device would commit in the group now to take leaves out (`commit_pending`):
+    /// a removal the server proposed, or a member's leaf whose device is off its user's latest
+    /// list as this device knows it. So a member that only reads takes them out too.
+    commit_due: bool,
 }
 
 /// A conversation as `apply` walks its queue: its row, and the group this device holds of it,
@@ -175,6 +184,8 @@ pub(crate) struct Conversation {
     pub(crate) row: Option<GroupRow>,
     /// The group at the row's generation, while this device is in it.
     pub(crate) group: Option<MlsGroup>,
+    /// The API's key the client gave, which a welcome's group must have as its one external sender.
+    external_sender: Option<[u8; 32]>,
 }
 
 /// What an entry of one kind does to its conversation. `apply` hands each entry, in order, to the
@@ -212,6 +223,11 @@ pub(crate) fn apply(tx: &Tx<'_>, request: ApplyRequest) -> Result<ApplyReply, Er
         id: request.conversation_id,
         row,
         group,
+        external_sender: request
+            .external_sender
+            .as_deref()
+            .map(api_key)
+            .transpose()?,
     };
     let start = at.last_seq();
     let held = at.group.is_some();
@@ -259,10 +275,15 @@ pub(crate) fn apply(tx: &Tx<'_>, request: ApplyRequest) -> Result<ApplyReply, Er
     if let Some(row) = &at.row {
         row.write(tx)?;
     }
+    let commit_due = match (&at.group, &at.row) {
+        (Some(group), Some(row)) => can_commit(group, row).is_ok() && removals_waiting(tx, group)?,
+        _ => false,
+    };
     Ok(ApplyReply {
         applied_through: at.last_seq(),
         results,
         catch_up_due: crate::messages::catch_up_due(tx, at.id, at.row.as_ref())?,
+        commit_due,
     })
 }
 
@@ -383,9 +404,9 @@ impl EntryHandler for Commits {
     }
 }
 
-/// Welcomes: one for this device brings it into a group, after it holds that group to the rules.
-/// One refused only for what this device knows of its leaves' users first asks to observe them
-/// anew, as a commit does.
+/// Welcomes: one for this device brings it into a group, after it holds that group to the rules,
+/// and to the API's key as its one external sender when the client gives it. One refused only for
+/// what this device knows of its leaves' users first asks to observe them anew, as a commit does.
 struct Welcomes;
 
 impl EntryHandler for Welcomes {
@@ -444,6 +465,11 @@ impl EntryHandler for Welcomes {
             Err(WelcomeError::StorageError(error)) => return Err(storage_error(error)),
             Err(_) => return Ok(rejected("invalid_welcome")),
         };
+        if let Some(key) = &at.external_sender
+            && !external_sender_is(staged.group_context(), key)
+        {
+            return Ok(rejected(EXTERNAL_SENDER_MISMATCH));
+        }
         let mut leaves = match leaves(staged.members()) {
             Ok(leaves) => leaves,
             Err(violation) => return Ok(rejected(violation.name())),

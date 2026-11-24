@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use super::deviceless;
 use super::{File, Record, RecordKind};
-use crate::identity::stored_uuid;
+use crate::identity::{invalid, stored_uuid};
 use crate::{Attachment, Envelope, Error, Tx};
 
 /// The columns `Row::read` takes, in its order.
@@ -570,7 +570,12 @@ pub(crate) struct ListMessages {
     /// The page ends before the message of this number.
     #[serde(default)]
     before: Option<u64>,
-    limit: u32,
+    /// How many messages the page has: a page needs it.
+    #[serde(default)]
+    limit: Option<u32>,
+    /// The messages asked for by their IDs, in place of a page: 200 at most.
+    #[serde(default)]
+    ids: Option<Vec<Uuid>>,
 }
 
 #[derive(Serialize)]
@@ -623,22 +628,47 @@ impl Shown {
 /// The most messages a page or a search gives at once.
 pub(super) const MAX_PAGE: u32 = 100;
 
+/// The most messages `messages` takes by their IDs.
+const MAX_IDS: usize = 200;
+
 /// A page of the conversation's history, newest first: this device's own still being sent, then the
-/// rest by their number. Deleted messages aren't in it.
+/// rest by their number. Or, by `ids`, the messages of those IDs this device has in the
+/// conversation, in the same order. Deleted messages aren't in either.
 pub(crate) fn messages(tx: &Tx<'_>, request: ListMessages) -> Result<Page, Error> {
-    let before = request
-        .before
-        .map(|seq| i64::try_from(seq).unwrap_or(i64::MAX));
-    let rows = select(
-        tx,
-        "conversation_id = ?1 AND deleted = 0 AND (?2 IS NULL OR seq < ?2) \
-         ORDER BY seq IS NOT NULL, seq DESC, id DESC LIMIT ?3",
-        params![
-            request.conversation_id.as_bytes().as_slice(),
-            before,
-            request.limit.clamp(1, MAX_PAGE)
-        ],
-    )?;
+    let conversation = request.conversation_id.as_bytes().as_slice();
+    let rows = match (request.ids, request.before, request.limit) {
+        (Some(ids), None, None) => {
+            if ids.len() > MAX_IDS {
+                return Err(Error::TooLarge {
+                    limit: MAX_IDS as u64,
+                });
+            }
+            let marks = vec!["?"; ids.len()].join(", ");
+            select(
+                tx,
+                &format!(
+                    "conversation_id = ? AND deleted = 0 AND message_id IN ({marks}) \
+                     ORDER BY seq IS NOT NULL, seq DESC, id DESC"
+                ),
+                rusqlite::params_from_iter(
+                    std::iter::once(conversation)
+                        .chain(ids.iter().map(|id| id.as_bytes().as_slice())),
+                ),
+            )?
+        }
+        (Some(_), ..) => return Err(invalid("ids", "messages by IDs take no page")),
+        (None, _, None) => return Err(invalid("limit", "a page has a limit")),
+        (None, before, Some(limit)) => select(
+            tx,
+            "conversation_id = ?1 AND deleted = 0 AND (?2 IS NULL OR seq < ?2) \
+             ORDER BY seq IS NOT NULL, seq DESC, id DESC LIMIT ?3",
+            params![
+                conversation,
+                before.map(|seq| i64::try_from(seq).unwrap_or(i64::MAX)),
+                limit.clamp(1, MAX_PAGE)
+            ],
+        )?,
+    };
     Ok(Page {
         messages: rows.into_iter().map(Shown::of).collect::<Result<_, _>>()?,
     })

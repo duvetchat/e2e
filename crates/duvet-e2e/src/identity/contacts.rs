@@ -39,6 +39,9 @@ pub(crate) struct Observation {
     state: State,
     /// Whether the person verified the identity now pinned.
     verified: bool,
+    /// With `changed`: whether the person had verified the identity it replaced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    was_verified: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'static str>,
 }
@@ -120,6 +123,7 @@ pub(crate) fn observe_user(
         Ok(Observation {
             state: State::Rejected,
             verified,
+            was_verified: None,
             reason: Some(reason),
         })
     };
@@ -147,6 +151,7 @@ pub(crate) fn observe_user(
         return Ok(Observation {
             state: State::New,
             verified: false,
+            was_verified: None,
             reason: None,
         });
     };
@@ -179,6 +184,7 @@ pub(crate) fn observe_user(
         return Ok(Observation {
             state: State::Same,
             verified,
+            was_verified: None,
             reason: None,
         });
     }
@@ -216,6 +222,7 @@ pub(crate) fn observe_user(
     Ok(Observation {
         state: State::Changed,
         verified: false,
+        was_verified: Some(pinned.verified),
         reason: None,
     })
 }

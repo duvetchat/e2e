@@ -253,6 +253,7 @@ fn envelope_needs_exactly_one_form() {
     let message_id = id(new_id());
 
     let forms = [
+        vec![v1()],
         vec![v1(), ("text", text("hi"))],
         vec![v1(), ("attachments", files())],
         vec![v1(), ("text", text("hi")), ("attachments", files())],
@@ -264,7 +265,6 @@ fn envelope_needs_exactly_one_form() {
     }
 
     let none = [
-        vec![v1()],
         vec![v1(), ("attachments", Cbor::Array(vec![]))],
         vec![v1(), ("text", text(""))],
         vec![v1(), ("edit", message_id.clone())],
@@ -303,18 +303,49 @@ fn envelope_needs_exactly_one_form() {
     }
 
     // The core never writes one either.
-    let empty = Envelope::Message {
-        text: None,
-        attachments: vec![],
-    };
     let blank = Envelope::Message {
         text: Some(String::new()),
         attachments: vec![],
     };
-    for envelope in [empty, blank] {
-        let error = error_of(&envelope.encode().unwrap_err());
-        assert_eq!(error["code"], "bad_command", "{error}");
-        assert_eq!(error["field"], "envelope");
+    let error = error_of(&blank.encode().unwrap_err());
+    assert_eq!(error["code"], "bad_command", "{error}");
+    assert_eq!(error["field"], "envelope");
+}
+
+/// A message with neither text nor files is the body of one that carries only what goes in the
+/// clear, a sticker: `{v: 1}`, which decodes and encodes as itself.
+#[test]
+fn an_empty_message_is_a_message() {
+    let bytes = to_cbor(&map(vec![("v", uint(1))]));
+    let empty = Envelope::Message {
+        text: None,
+        attachments: vec![],
+    };
+    assert_eq!(Envelope::decode(&bytes).unwrap(), empty);
+    assert_eq!(empty.encode().unwrap(), bytes);
+}
+
+/// A message without text leaves the text out: an empty text is refused, with files or without.
+#[test]
+fn empty_text_is_still_refused() {
+    let files = || Cbor::Array(vec![map(attachment_entries())]);
+    let blanks = [
+        vec![("v", uint(1)), ("text", text(""))],
+        vec![("v", uint(1)), ("text", text("")), ("attachments", files())],
+    ];
+    for (case, entries) in blanks.into_iter().enumerate() {
+        assert_unreadable(&to_cbor(&map(entries)), &format!("empty text {case}"));
+    }
+    for attachments in [vec![], vec![attachment(1)]] {
+        let blank = Envelope::Message {
+            text: Some(String::new()),
+            attachments,
+        };
+        let error = error_of(&blank.encode().unwrap_err());
+        assert_eq!(
+            (&error["code"], &error["field"]),
+            (&json!("bad_command"), &json!("envelope"))
+        );
     }
 }
 
