@@ -44,7 +44,8 @@ pub(crate) fn run(conn: &mut Connection) -> Result<(), Error> {
 /// Schema 4: when the client marked each key package spent (`key_packages`' `spent`): a single-use
 /// one the API says it handed out. A spent one counts no more and isn't handed out again, and its
 /// private keys stay, for the welcome its hand-out may bring, until 45 days after that or after its
-/// end, whichever comes first. The rows schema 3 left aren't spent (NULL).
+/// end, whichever comes first, or until 1000 newer marks push it out. The rows schema 3 left aren't
+/// spent (NULL).
 const V4: &str = "ALTER TABLE key_packages ADD COLUMN spent_at INTEGER;";
 
 /// Schema 3: the devices each conversation's group took out as this device saw it, at any of its

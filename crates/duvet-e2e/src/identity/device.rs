@@ -26,6 +26,10 @@ const LIVE_FOR_MS: i64 = 14 * DAY_MS;
 const QUEUE_KEEPS_MS: i64 = 45 * DAY_MS;
 /// The most key packages one `key_packages` call takes as spent.
 const MAX_SPENT: usize = 200;
+/// The most spent key packages a device keeps, keys and row: past it, the ones marked longest ago go
+/// as the 45 days take them. Ten whole sets: a welcome uses an honest hand-out up within minutes, so
+/// only churn reaches it.
+const MAX_SPENT_KEPT: i64 = 1000;
 
 #[derive(Serialize)]
 pub(crate) struct CreatedDevice {
@@ -127,8 +131,9 @@ struct Published {
 /// default, 84 days.
 ///
 /// `spent` names single-use ones the API says it handed out, 200 at most: they count no more, so
-/// new ones take their place, and their private keys stay for the welcome a hand-out may bring. An
-/// ID the device doesn't hold, the last resort's, or one marked before changes nothing.
+/// new ones take their place, and their private keys stay for the welcome a hand-out may bring, as
+/// long as no 1000 were marked since. An ID the device doesn't hold, the last resort's, or one marked
+/// before changes nothing.
 pub(crate) fn key_packages(tx: &mut Tx<'_>, spent: &[Vec<u8>]) -> Result<KeyPackages, Error> {
     if spent.len() > MAX_SPENT {
         return Err(Error::TooLarge {
@@ -172,17 +177,28 @@ pub(crate) fn key_packages(tx: &mut Tx<'_>, spent: &[Vec<u8>]) -> Result<KeyPack
         let key_package = bundle.key_package();
         let expires_at = expires_at(key_package)?;
         if past(expires_at) || spent_at.is_some_and(past) {
-            provider
-                .storage()
-                .delete_key_package(&key_ref)
-                .map_err(storage)?;
-            forget(tx, &hash_ref)?;
+            delete(tx, &hash_ref)?;
         } else if spent_at.is_none()
             && expires_at.saturating_sub(now) > LIVE_FOR_MS
             && key_package.leaf_node().credential() == &credential.credential
         {
             published.push(publish(hash_ref, key_package, expires_at)?);
         }
+    }
+    // Past MAX_SPENT_KEPT spent ones, those marked longest ago go.
+    let mut oldest: Vec<Vec<u8>> = Vec::new();
+    for hash_ref in tx
+        .conn()
+        .prepare(
+            "SELECT hash_ref FROM key_packages WHERE spent_at IS NOT NULL \
+             ORDER BY spent_at DESC, rowid DESC LIMIT -1 OFFSET ?1",
+        )?
+        .query_map([MAX_SPENT_KEPT], |row| row.get(0))?
+    {
+        oldest.push(hash_ref?);
+    }
+    for hash_ref in oldest {
+        delete(tx, &hash_ref)?;
     }
 
     let single_use = published.iter().filter(|kp| !kp.last_resort).count();
@@ -251,6 +267,15 @@ fn forget(tx: &Tx<'_>, hash_ref: &[u8]) -> Result<(), Error> {
     tx.conn()
         .execute("DELETE FROM key_packages WHERE hash_ref = ?1", [hash_ref])?;
     Ok(())
+}
+
+/// Deletes a key package's private keys from OpenMLS's storage, then its row.
+fn delete(tx: &Tx<'_>, hash_ref: &[u8]) -> Result<(), Error> {
+    tx.provider()
+        .storage()
+        .delete_key_package(&key_package_ref(hash_ref)?)
+        .map_err(storage)?;
+    forget(tx, hash_ref)
 }
 
 fn storage(error: SqlStorageError) -> Error {

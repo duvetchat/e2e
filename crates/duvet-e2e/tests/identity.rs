@@ -272,6 +272,18 @@ fn key_package_rows(core: &mut Core) -> i64 {
     .unwrap()
 }
 
+/// The key packages the device keeps a row of as spent.
+fn spent_rows(core: &mut Core) -> i64 {
+    core.transaction(|tx| {
+        Ok(tx.conn().query_row(
+            "SELECT count(*) FROM key_packages WHERE spent_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?)
+    })
+    .unwrap()
+}
+
 /// Whether OpenMLS's storage still holds the key package, with its private keys.
 fn stored(core: &mut Core, key_package: &KeyPackage) -> bool {
     let hash_ref = key_package.hash_ref(&RustCrypto::default()).unwrap();
@@ -925,6 +937,55 @@ fn spent_takes_200_at_most() {
         (&json!("too_large"), &json!(200))
     );
     assert_eq!(by_id(&key_packages(&mut alice.core)), by_id(&marked));
+}
+
+#[test]
+fn a_device_keeps_1000_spent_key_packages_at_most() {
+    let clock = FakeClock::now();
+    let mut alice = Person::new(new_id(), &clock);
+    let mut live = key_packages(&mut alice.core);
+    let oldest = live.iter().find(|kp| !kp.last_resort).unwrap().id.clone();
+
+    // An API that names every single-use one it was sent, 11 rounds a minute apart. Round 1 names
+    // all but the oldest, which round 2 names: it's marked after round 1's, though its row is older.
+    let mut rounds: Vec<Vec<Published>> = Vec::new();
+    for round in 0..11 {
+        let mut named: Vec<Published> = live.into_iter().filter(|kp| !kp.last_resort).collect();
+        if round == 0 {
+            named.retain(|kp| kp.id != oldest);
+        }
+        let ids: Vec<&[u8]> = named.iter().map(|kp| kp.id.as_slice()).collect();
+        live = spending(&mut alice.core, &ids);
+        rounds.push(named);
+        clock.advance(60 * 1000);
+    }
+    assert!(rounds[1].iter().any(|kp| kp.id == oldest));
+
+    // 1099 marked: the 99 marked first lose their keys and rows, and the 1000 since stay.
+    assert_eq!(spent_rows(&mut alice.core), 1000);
+    assert!(
+        rounds[0]
+            .iter()
+            .all(|kp| !stored(&mut alice.core, &kp.key_package))
+    );
+    assert!(
+        rounds[1..]
+            .iter()
+            .flatten()
+            .all(|kp| stored(&mut alice.core, &kp.key_package))
+    );
+    assert_eq!(key_package_rows(&mut alice.core), 1101);
+
+    // The reply's own keep their keys: the cap takes spent ones alone.
+    assert_eq!(live.len(), 101);
+    assert!(
+        live.iter()
+            .all(|kp| stored(&mut alice.core, &kp.key_package))
+    );
+
+    // The newest marked one still takes its welcome.
+    let newest = rounds[10].last().unwrap();
+    join(&mut alice.core, welcome_to(newest.key_package.clone()));
 }
 
 #[test]

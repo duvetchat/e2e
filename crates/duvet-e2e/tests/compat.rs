@@ -33,6 +33,7 @@ use openmls::prelude::{
 };
 use openmls::treesync::LeafNodeSource;
 use openmls_traits::storage::StorageProvider as _;
+use rusqlite::OptionalExtension as _;
 use serde_json::{Value, json};
 use support::*;
 use uuid::Uuid;
@@ -260,6 +261,21 @@ fn holds_key_package(core: &mut Core, id: &[u8]) -> bool {
     .unwrap()
 }
 
+/// When `core` marked the key package whose reference is `id` spent: `None` without its row.
+fn spent_at(core: &mut Core, id: &[u8]) -> Option<Option<i64>> {
+    core.transaction(|tx| {
+        Ok(tx
+            .conn()
+            .query_row(
+                "SELECT spent_at FROM key_packages WHERE hash_ref = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    })
+    .unwrap()
+}
+
 /// The single-use key packages of a `key_packages` reply.
 fn single_use(reply: &Value) -> Vec<Value> {
     reply["key_packages"]
@@ -329,19 +345,26 @@ fn opens(name: &str, newest: u32, fixture: &Value) {
         assert_eq!(version, newest, "{name}");
     }
     // And takes schema 4's spent key packages: one A1 marks leaves its reply, a new one takes its
-    // place, and its keys stay for the welcome it may still bring. From schema 4 on, A1's database
-    // holds one it marked before, which stays out too.
+    // place, and its keys and its marked row stay for the welcome it may still bring. From schema 4
+    // on, A1's database holds one it marked by the time the fixtures were made, which stays so too:
+    // a migration that dropped its row would leave its keys for good, and one that marked it anew
+    // would date it later.
     let spent = single_use(&ok(&mut a1, json!({"cmd": "key_packages"})))[0]["id"].clone();
     let marked = ok(&mut a1, json!({"cmd": "key_packages", "spent": [spent]}));
     let marked = single_use(&marked);
     assert_eq!(marked.len(), 100, "{name}");
-    let mut out = vec![spent];
+    let mut out = vec![(spent, clock.now_ms())];
     if schema >= 4 {
-        out.push(fixture["spent"].clone());
+        out.push((fixture["spent"].clone(), fixture["made"].as_i64().unwrap()));
     }
-    for id in &out {
+    for (id, by) in &out {
         assert!(marked.iter().all(|kp| &kp["id"] != id), "{name}: {id}");
         assert!(holds_key_package(&mut a1, &bytes(id)), "{name}: {id}");
+        let at = spent_at(&mut a1, &bytes(id));
+        assert!(
+            matches!(at, Some(Some(when)) if when <= *by),
+            "{name}: {id}: {at:?}"
+        );
     }
     let conversations = fixture["conversations"].as_array().unwrap();
     for conversation in conversations {
