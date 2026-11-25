@@ -211,7 +211,18 @@ struct Published {
 
 /// `key_packages`, each one checked as the device that receives it checks it.
 fn key_packages(core: &mut Core) -> Vec<Published> {
-    let reply = ok(core, json!({"cmd": "key_packages"}));
+    read_key_packages(ok(core, json!({"cmd": "key_packages"})))
+}
+
+/// `key_packages` with `spent`: the IDs of key packages the API says it handed out.
+fn spending(core: &mut Core, spent: &[&[u8]]) -> Vec<Published> {
+    let spent: Vec<String> = spent.iter().map(|id| b64(id)).collect();
+    read_key_packages(ok(core, json!({"cmd": "key_packages", "spent": spent})))
+}
+
+/// A `key_packages` reply's key packages, each one checked as the device that receives it checks
+/// it.
+fn read_key_packages(reply: Value) -> Vec<Published> {
     let crypto = RustCrypto::default();
     reply["key_packages"]
         .as_array()
@@ -257,6 +268,18 @@ fn key_package_rows(core: &mut Core) -> i64 {
         Ok(tx
             .conn()
             .query_row("SELECT count(*) FROM key_packages", [], |row| row.get(0))?)
+    })
+    .unwrap()
+}
+
+/// The key packages the device keeps a row of as spent.
+fn spent_rows(core: &mut Core) -> i64 {
+    core.transaction(|tx| {
+        Ok(tx.conn().query_row(
+            "SELECT count(*) FROM key_packages WHERE spent_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?)
     })
     .unwrap()
 }
@@ -779,6 +802,190 @@ fn key_packages_are_deleted_once_no_welcome_can_use_them() {
             .all(|kp| stored(&mut alice.core, &kp.key_package))
     );
     assert_eq!(key_package_rows(&mut alice.core), 101);
+}
+
+#[test]
+fn spent_key_packages_make_room() {
+    let clock = FakeClock::now();
+    let mut alice = Person::new(new_id(), &clock);
+    let first = key_packages(&mut alice.core);
+
+    // The API handed out 10 of the single-use ones: they stop counting and leave the reply, 10 new
+    // ones take their place, and the rest stay as they were.
+    let spent: Vec<&Published> = first.iter().filter(|kp| !kp.last_resort).take(10).collect();
+    let ids: Vec<&[u8]> = spent.iter().map(|kp| kp.id.as_slice()).collect();
+    let marked = spending(&mut alice.core, &ids);
+    assert_eq!(marked.len(), 101);
+    assert_eq!(last_resorts(&marked), 1);
+    assert!(marked.iter().all(|kp| !ids.contains(&kp.id.as_slice())));
+    let before = by_id(&first);
+    let made: Vec<&Published> = marked
+        .iter()
+        .filter(|kp| !before.contains_key(kp.id.as_slice()))
+        .collect();
+    assert_eq!(made.len(), 10);
+    assert!(made.iter().all(|kp| !kp.last_resort));
+
+    // Their keys stay, with their rows, for a welcome the API's hand-out may bring.
+    assert!(
+        spent
+            .iter()
+            .all(|kp| stored(&mut alice.core, &kp.key_package))
+    );
+    assert_eq!(key_package_rows(&mut alice.core), 111);
+
+    // They stay out: the next call gives the same set, and naming them again changes nothing.
+    assert_eq!(by_id(&key_packages(&mut alice.core)), by_id(&marked));
+    assert_eq!(by_id(&spending(&mut alice.core, &ids)), by_id(&marked));
+}
+
+#[test]
+fn a_spent_key_packages_keys_go_45_days_after() {
+    let clock = FakeClock::now();
+    let mut alice = Person::new(new_id(), &clock);
+    let first = key_packages(&mut alice.core);
+    let mut singles = first.iter().filter(|kp| !kp.last_resort);
+    let (spent, late) = (singles.next().unwrap(), singles.next().unwrap());
+    spending(&mut alice.core, &[&spent.id]);
+
+    // Named again 30 days on, it keeps the day it was first spent.
+    clock.advance(30 * DAY_MS);
+    spending(&mut alice.core, &[&spent.id]);
+
+    // On the last of its 45 days its keys stay, for the welcome of whoever the API handed it to.
+    clock.advance(15 * DAY_MS);
+    key_packages(&mut alice.core);
+    assert!(stored(&mut alice.core, &spent.key_package));
+    assert_eq!(key_package_rows(&mut alice.core), 102);
+
+    // A moment later no welcome can come for it: its keys go, and its row.
+    clock.advance(1);
+    key_packages(&mut alice.core);
+    assert!(!stored(&mut alice.core, &spent.key_package));
+    assert_eq!(key_package_rows(&mut alice.core), 101);
+
+    // Spent after its end, a key package still goes 45 days after its end: being spent never keeps
+    // keys longer. On day 100 the first ones ended 16 days ago; on day 130, 46 days ago, and only
+    // 30 since `late` was spent.
+    clock.advance(55 * DAY_MS - 1);
+    spending(&mut alice.core, &[&late.id]);
+    assert!(stored(&mut alice.core, &late.key_package));
+    clock.advance(30 * DAY_MS);
+    key_packages(&mut alice.core);
+    assert!(!stored(&mut alice.core, &late.key_package));
+}
+
+#[test]
+fn spent_ignores_what_it_does_not_hold() {
+    let clock = FakeClock::now();
+    let mut alice = Person::new(new_id(), &clock);
+    let first = key_packages(&mut alice.core);
+    let mut singles = first.iter().filter(|kp| !kp.last_resort);
+    let (used, live) = (singles.next().unwrap(), singles.next().unwrap());
+    let last_resort = first.iter().find(|kp| kp.last_resort).unwrap();
+
+    // One a welcome used up, which the next call forgets and replaces.
+    join(&mut alice.core, welcome_to(used.key_package.clone()));
+    let topped_up = key_packages(&mut alice.core);
+
+    // Named with a live single-use one: an ID the device never had, the last resort's and the
+    // used-up one's change nothing. Only the live one is spent, and only it is replaced.
+    let unknown = [7; 32];
+    let named: [&[u8]; 4] = [&unknown, &last_resort.id, &used.id, &live.id];
+    let marked = spending(&mut alice.core, &named);
+    assert!(marked.iter().all(|kp| kp.id != live.id));
+    let mut kept = by_id(&topped_up);
+    kept.remove(live.id.as_slice());
+    let mut made = by_id(&marked);
+    made.retain(|id, kp| kept.get(id) != Some(kp));
+    assert_eq!(made.len(), 1);
+    assert!(made.values().all(|(_, _, last_resort)| !last_resort));
+    assert_eq!(marked.len(), kept.len() + 1);
+
+    // The last resort still goes out, its keys stay, and naming it again changes nothing.
+    assert!(marked.iter().any(|kp| kp.id == last_resort.id));
+    assert!(stored(&mut alice.core, &last_resort.key_package));
+    let again = spending(&mut alice.core, &[&unknown, &last_resort.id]);
+    assert_eq!(by_id(&again), by_id(&marked));
+    assert_eq!(key_package_rows(&mut alice.core), 102);
+}
+
+#[test]
+fn spent_takes_200_at_most() {
+    let clock = FakeClock::now();
+    let mut alice = Person::new(new_id(), &clock);
+    let first = key_packages(&mut alice.core);
+    let mut singles = first.iter().filter(|kp| !kp.last_resort);
+    let (taken, refused) = (singles.next().unwrap(), singles.next().unwrap());
+    let unknown: Vec<Vec<u8>> = (0..200u8).map(|byte| vec![byte; 32]).collect();
+
+    // 200 IDs: 199 the device never had, and one it holds, which is spent.
+    let mut most: Vec<&[u8]> = unknown[..199].iter().map(Vec::as_slice).collect();
+    most.push(&taken.id);
+    let marked = spending(&mut alice.core, &most);
+    assert!(marked.iter().all(|kp| kp.id != taken.id));
+
+    // 201 are too many, and none is spent, the one it holds included.
+    let mut many: Vec<String> = unknown.iter().map(|id| b64(id)).collect();
+    many.push(b64(&refused.id));
+    let too_many = error(
+        &mut alice.core,
+        json!({"cmd": "key_packages", "spent": many}),
+    );
+    assert_eq!(
+        (&too_many["code"], &too_many["limit"]),
+        (&json!("too_large"), &json!(200))
+    );
+    assert_eq!(by_id(&key_packages(&mut alice.core)), by_id(&marked));
+}
+
+#[test]
+fn a_device_keeps_1000_spent_key_packages_at_most() {
+    let clock = FakeClock::now();
+    let mut alice = Person::new(new_id(), &clock);
+    let mut live = key_packages(&mut alice.core);
+    let oldest = live.iter().find(|kp| !kp.last_resort).unwrap().id.clone();
+
+    // An API that names every single-use one it was sent, 11 rounds a minute apart. Round 1 names
+    // all but the oldest, which round 2 names: it's marked after round 1's, though its row is older.
+    let mut rounds: Vec<Vec<Published>> = Vec::new();
+    for round in 0..11 {
+        let mut named: Vec<Published> = live.into_iter().filter(|kp| !kp.last_resort).collect();
+        if round == 0 {
+            named.retain(|kp| kp.id != oldest);
+        }
+        let ids: Vec<&[u8]> = named.iter().map(|kp| kp.id.as_slice()).collect();
+        live = spending(&mut alice.core, &ids);
+        rounds.push(named);
+        clock.advance(60 * 1000);
+    }
+    assert!(rounds[1].iter().any(|kp| kp.id == oldest));
+
+    // 1099 marked: the 99 marked first lose their keys and rows, and the 1000 since stay.
+    assert_eq!(spent_rows(&mut alice.core), 1000);
+    assert!(
+        rounds[0]
+            .iter()
+            .all(|kp| !stored(&mut alice.core, &kp.key_package))
+    );
+    assert!(
+        rounds[1..]
+            .iter()
+            .flatten()
+            .all(|kp| stored(&mut alice.core, &kp.key_package))
+    );
+    assert_eq!(key_package_rows(&mut alice.core), 1101);
+
+    // The reply's own keep their keys: the cap takes spent ones alone.
+    assert_eq!(live.len(), 101);
+    assert!(
+        live.iter()
+            .all(|kp| stored(&mut alice.core, &kp.key_package))
+    );
+
+    // The newest marked one still takes its welcome.
+    let newest = rounds[10].last().unwrap();
+    join(&mut alice.core, welcome_to(newest.key_package.clone()));
 }
 
 #[test]

@@ -21,8 +21,15 @@ const SINGLE_USE: usize = 100;
 /// A key package is live, handed out and counted, while it has more than this left.
 const LIVE_FOR_MS: i64 = 14 * DAY_MS;
 /// The server's queue keeps a welcome this long, so a key package's private keys stay this long
-/// after its end, for a welcome sent just before it.
+/// after its end, for a welcome sent just before it, and this long after the client marks it spent,
+/// for the welcome of whoever the API handed it out to: whichever comes first.
 const QUEUE_KEEPS_MS: i64 = 45 * DAY_MS;
+/// The most key packages one `key_packages` call takes as spent.
+const MAX_SPENT: usize = 200;
+/// The most spent key packages a device keeps, keys and row: past it, the ones marked longest ago go
+/// as the 45 days take them. Ten whole sets: a welcome uses an honest hand-out up within minutes, so
+/// only churn reaches it.
+const MAX_SPENT_KEPT: i64 = 1000;
 
 #[derive(Serialize)]
 pub(crate) struct CreatedDevice {
@@ -118,25 +125,47 @@ struct Published {
 
 /// Every live key package of the device, after making enough new ones that 100 single-use ones and
 /// one of last resort are live. A key package is live while OpenMLS's storage holds it (a welcome
-/// uses up a single-use one, and OpenMLS deletes it), with more than 14 days left, and with the
-/// device's current certificate. The client uploads the whole set each time, so a reply it loses
-/// costs nothing. Their lifetime is OpenMLS's default, 84 days.
-pub(crate) fn key_packages(tx: &mut Tx<'_>) -> Result<KeyPackages, Error> {
+/// uses up a single-use one, and OpenMLS deletes it), with more than 14 days left, with the
+/// device's current certificate, and, a single-use one, until the client marks it spent. The client
+/// uploads the whole set each time, so a reply it loses costs nothing. Their lifetime is OpenMLS's
+/// default, 84 days.
+///
+/// `spent` names single-use ones the API says it handed out, 200 at most: they count no more, so
+/// new ones take their place, and their private keys stay for the welcome a hand-out may bring, as
+/// long as no 1000 were marked since. An ID the device doesn't hold, the last resort's, or one marked
+/// before changes nothing.
+pub(crate) fn key_packages(tx: &mut Tx<'_>, spent: &[Vec<u8>]) -> Result<KeyPackages, Error> {
+    if spent.len() > MAX_SPENT {
+        return Err(Error::TooLarge {
+            limit: MAX_SPENT as u64,
+        });
+    }
     let own = tx.own_device()?;
     let credential = own.credential()?;
     let now = tx.now();
     let provider = tx.provider();
 
-    let mut stored: Vec<Vec<u8>> = Vec::new();
-    for hash_ref in tx
-        .conn()
-        .prepare("SELECT hash_ref FROM key_packages ORDER BY rowid")?
-        .query_map([], |row| row.get(0))?
-    {
-        stored.push(hash_ref?);
+    // The first mark counts: the API had handed it out by then.
+    for hash_ref in spent {
+        tx.conn().execute(
+            "UPDATE key_packages SET spent_at = ?1 \
+             WHERE hash_ref = ?2 AND last_resort = 0 AND spent_at IS NULL",
+            params![now, hash_ref],
+        )?;
     }
+
+    let mut stored: Vec<(Vec<u8>, Option<i64>)> = Vec::new();
+    for row in tx
+        .conn()
+        .prepare("SELECT hash_ref, spent_at FROM key_packages ORDER BY rowid")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+    {
+        stored.push(row?);
+    }
+    // Whether the server's queue no longer keeps a welcome sent at `since`.
+    let past = |since: i64| since.saturating_add(QUEUE_KEEPS_MS) < now;
     let mut published = Vec::new();
-    for hash_ref in stored {
+    for (hash_ref, spent_at) in stored {
         let key_ref = key_package_ref(&hash_ref)?;
         let bundle: Option<KeyPackageBundle> =
             provider.storage().key_package(&key_ref).map_err(storage)?;
@@ -147,17 +176,29 @@ pub(crate) fn key_packages(tx: &mut Tx<'_>) -> Result<KeyPackages, Error> {
         };
         let key_package = bundle.key_package();
         let expires_at = expires_at(key_package)?;
-        if expires_at.saturating_add(QUEUE_KEEPS_MS) < now {
-            provider
-                .storage()
-                .delete_key_package(&key_ref)
-                .map_err(storage)?;
-            forget(tx, &hash_ref)?;
-        } else if expires_at.saturating_sub(now) > LIVE_FOR_MS
+        if past(expires_at) || spent_at.is_some_and(past) {
+            delete(tx, &hash_ref)?;
+        } else if spent_at.is_none()
+            && expires_at.saturating_sub(now) > LIVE_FOR_MS
             && key_package.leaf_node().credential() == &credential.credential
         {
             published.push(publish(hash_ref, key_package, expires_at)?);
         }
+    }
+    // Past MAX_SPENT_KEPT spent ones, those marked longest ago go.
+    let mut oldest: Vec<Vec<u8>> = Vec::new();
+    for hash_ref in tx
+        .conn()
+        .prepare(
+            "SELECT hash_ref FROM key_packages WHERE spent_at IS NOT NULL \
+             ORDER BY spent_at DESC, rowid DESC LIMIT -1 OFFSET ?1",
+        )?
+        .query_map([MAX_SPENT_KEPT], |row| row.get(0))?
+    {
+        oldest.push(hash_ref?);
+    }
+    for hash_ref in oldest {
+        delete(tx, &hash_ref)?;
     }
 
     let single_use = published.iter().filter(|kp| !kp.last_resort).count();
@@ -226,6 +267,15 @@ fn forget(tx: &Tx<'_>, hash_ref: &[u8]) -> Result<(), Error> {
     tx.conn()
         .execute("DELETE FROM key_packages WHERE hash_ref = ?1", [hash_ref])?;
     Ok(())
+}
+
+/// Deletes a key package's private keys from OpenMLS's storage, then its row.
+fn delete(tx: &Tx<'_>, hash_ref: &[u8]) -> Result<(), Error> {
+    tx.provider()
+        .storage()
+        .delete_key_package(&key_package_ref(hash_ref)?)
+        .map_err(storage)?;
+    forget(tx, hash_ref)
 }
 
 fn storage(error: SqlStorageError) -> Error {

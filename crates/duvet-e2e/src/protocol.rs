@@ -38,7 +38,11 @@ pub(crate) enum Command {
         #[serde(default, with = "b64::option")]
         qr: Option<Vec<u8>>,
     },
-    KeyPackages,
+    KeyPackages {
+        /// The single-use key packages the API says it handed out, by their IDs.
+        #[serde(default, with = "b64::list")]
+        spent: Vec<Vec<u8>>,
+    },
     /// This device's proof that a session is its own: the session's challenge, signed.
     BindProof {
         #[serde(with = "b64")]
@@ -153,7 +157,7 @@ pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error
         Command::VerifyUser { user_id, qr } => {
             reply(identity::verify_user(tx, user_id, qr.as_deref())?)
         }
-        Command::KeyPackages => reply(identity::key_packages(tx)?),
+        Command::KeyPackages { spent } => reply(identity::key_packages(tx, &spent)?),
         Command::BindProof { challenge } => reply(identity::bind_proof(tx, &challenge)?),
         Command::IdentityUploaded => reply(identity::identity_uploaded(tx)?),
         Command::DeviceListUploaded { version } => {

@@ -1,0 +1,142 @@
+{
+  "a": {
+    "device": "01930000-0000-7000-0000-000000000003",
+    "user": "01930000-0000-7000-0000-000000000001"
+  },
+  "approval": {
+    "reveal": "o2F2AWNrZXlYIPFuWRlrGHzztswROtuOIMIvETN7V5AXyU1SkY3T4Y1oZW5vbmNlWCDOIh2XIjOapedEgfLx1vbPbnes0v83qkDbDqwprSm2Gw=="
+  },
+  "b": {
+    "certificate": "omRib2R5WJ6mYXYBZHVzZXJQAZMAAAAAcAAAAAAAAAAAAmZkZXZpY2VQAZMAAAAAcAAAAAAAAAAABG1zaWduYXR1cmVfa2V5WCAsbY9N9gdT/IYNBlh/MAeN6jgImMt/G7+dB68z7Dgy6GhocGtlX2tleVggi9e23BzVUueO6iLqRiujlGsr/r78NpNmXlfPxs8+kGFnY3JlYXRlZBsAAAGiD+5ViGNzaWdYQNqffIImhJ5svJANOfEBK47jKecR5uAyx/Ix5mYZ/srN0PgwJfr4mWn/NJcW4comU4jg5NjAmJYnJ/hzWMkhnAU=",
+    "device": "01930000-0000-7000-0000-000000000004",
+    "user": "01930000-0000-7000-0000-000000000002"
+  },
+  "backup_due": [
+    {
+      "complete": false,
+      "conversation_id": "01930000-0000-7000-0000-000000000006",
+      "day": "2026-11-24"
+    }
+  ],
+  "commit": {
+    "conversation": "01930000-0000-7000-0000-000000000006",
+    "seq": 12
+  },
+  "conversations": [
+    {
+      "id": "01930000-0000-7000-0000-000000000005",
+      "missed": "are you there?",
+      "next": 13,
+      "pending": [
+        {
+          "data": "AAEAAhQBkwAAAABwAAAAAAAAAAAFAAAAAAAAAAAAAAADAQAczADfoOvkT8Zf+WtIKNIC9tdpaD2qCYFN67gPokBsfvdPCmx+y0ljAajmsjMYEn3t2VH0jcZb0pwM6qH0URzG5hR18OO22mZZ7O21QcVcaeI7cDX60v9LfrM94/risUvknFPM0/ujRqAOT6eWZ61JABt0aTUrdVlIzV9gJDfZgCpOUiRbZiNvd1zH",
+          "kind": "message",
+          "message_id": "01930000-0000-7000-0000-00000000001c",
+          "sender_device": "01930000-0000-7000-0000-000000000003",
+          "sender_user": "01930000-0000-7000-0000-000000000001",
+          "sent_at": 1795650007432,
+          "seq": 11
+        },
+        {
+          "data": "AAEAAhQBkwAAAABwAAAAAAAAAAAFAAAAAAAAAAAAAAADAQAcp4Lxgl1gWXHkZDiE6KRWbTZ006uJ0ZUi5vRUlEBrB3sP2GWFI2ZT+OqYOGF8phEvTklW+PuJXR+S60UaJHc3ULqR+YD5hDdasdDHNtCdmTVvExfnHEhwFPilxpDQyT+8YfvGx9DQJTBdsvlxbZwuE6KrQUuaO8Jo+DOGV3uTbQkf+ZbEIwoywM0=",
+          "kind": "message",
+          "message_id": "01930000-0000-7000-0000-00000000001e",
+          "sender_device": "01930000-0000-7000-0000-000000000004",
+          "sender_user": "01930000-0000-7000-0000-000000000002",
+          "sent_at": 1795650007432,
+          "seq": 12
+        }
+      ],
+      "shown": [
+        [
+          null,
+          "sent as it fell"
+        ],
+        [
+          "01930000-0000-7000-0000-000000000017",
+          null
+        ],
+        [
+          "01930000-0000-7000-0000-00000000000f",
+          "hi there"
+        ],
+        [
+          "01930000-0000-7000-0000-00000000000d",
+          "hello, how are you?"
+        ]
+      ],
+      "word": "how"
+    },
+    {
+      "id": "01930000-0000-7000-0000-000000000006",
+      "missed": "ping after your renewal",
+      "next": 15,
+      "pending": [
+        {
+          "data": "AAEAARQBkwAAAABwAAAAAAAAAAAGAAAAAAAAAAAAAAAHAQAAAAAEoWF2AQMAASCvtYjYeRzWQGIeFLfDuAwlMXEaCXdEE5GfUctUNYS0OCAqBhztY+2W2DU0gMTn39Zna8rE1Ffk2mb/0lYkAWspCQABQOyiZGJvZHlYnqZhdgFkdXNlclABkwAAAABwAAAAAAAAAAABZmRldmljZVABkwAAAABwAAAAAAAAAAADbXNpZ25hdHVyZV9rZXlYICoGHO1j7ZbYNTSAxOff1mdrysTUV+TaZv/SViQBaykJaGhwa2Vfa2V5WCDaJb3tBWLtnIITN1xddPNIk62iv4LUMETibhkF/yPHDmdjcmVhdGVkGwAAAaIP7lWIY3NpZ1hAsVQMC2EAqtjC9O/8cpKRRWkO+yTE9R8kBkMrlbmsaH+SYks81KwCIi5tRqdRUGtwUB8R/pntr4GNg6QjsMgtBAIAAQIAAQTw0QAKAAIAAQMguvsOJjwi4W1YVb3V5EezJHRQLaHgVSHb2LMJqpXHdvAAQEBjoq9aSitqdAQjOv8UGDRzdnzoKbzbAPYPrs4wKECCfsOJePjNdzd4mvfnENmf0cW4kk0kqMNNLJBZHoEmnocPQOogMf6riaEuuf+7V1pbAyoplnpvYl7X1brO/vhFuixpoRVAUiDH7swRzByN3ZbocPm/CrJAVnF3rAHpQk2/VloUG+gUOTDMz7Ghtqt0JXZe2se8JU+b12t5761A2o2pCxL/GhsDZoETsy8/1/YXOfRTaFUFXw0gp/19IHeZCsWMniB4cvvbRwlY2chEvJPjguTbFLOiB1hAUiCpRv5+jW4ovhlet6PT0FsZ6xvlQ7wK3UDNQUjjjlOJeDCmf3bk9yRVBbBoIocu0rO9gsZXSbhSqaHPzhujJfHWTHzJQOmYTVxrjFzPaqCbaQNAQB1mrPzHdJx3jAto0A7ygjqPLlOk08FFEUfmnMrWR7RmukojwUCsdETinTS4OCyDjx88Z74vsV8jTkmrshIPbQogwjlATa5WDR6U2abFWvkDAwxhHhIYh41HtMrRy23hnesg8CqIB9k1Fy5rmmdYMjmVx/43eXtZKXSpYCcr31joN6Q=",
+          "kind": "commit",
+          "sent_at": 1795650007432,
+          "seq": 12
+        },
+        {
+          "data": "AAEAAhQBkwAAAABwAAAAAAAAAAAGAAAAAAAAAAAAAAAIAQAcLEMFtfkyhdVhbTx727spgaetnAYeqTRwg1xOH0B0m+RRoMheafVcRhy1Y6qn0rlDZQE/QI1loShg/m8ASBKlBdvDbXYe1roJrGWP6qYEVQq59Kz4hPc2kZbBRd7EtgjcB69Eps+dA6J5S/bjA5vo/UXh1P87kja+7IXCbS7LygUK6dsWZFEzbFMskkNaAeuSc2c=",
+          "kind": "message",
+          "mentions": [
+            "01930000-0000-7000-0000-000000000001"
+          ],
+          "message_id": "01930000-0000-7000-0000-000000000020",
+          "sender_device": "01930000-0000-7000-0000-000000000004",
+          "sender_user": "01930000-0000-7000-0000-000000000002",
+          "sent_at": 1795650007432,
+          "seq": 13
+        },
+        {
+          "data": "AAEAARQBkwAAAABwAAAAAAAAAAAGAAAAAAAAAAAAAAAIAgAAAAAAAgADAAAAAkBARWo57+zL+LlrYBhVjtLhaH6T17NfcUzKsoDle+d1jBsCQuf0XvOqvnW1SB6NFKgHpZWIlq11xgRpr7j3lDkxCg==",
+          "kind": "proposal",
+          "sent_at": 1795650007432,
+          "seq": 14
+        }
+      ],
+      "shown": [
+        [
+          "01930000-0000-7000-0000-000000000019",
+          "for later"
+        ],
+        [
+          "01930000-0000-7000-0000-000000000016",
+          "looks good"
+        ],
+        [
+          "01930000-0000-7000-0000-000000000014",
+          "the plan"
+        ]
+      ],
+      "word": "plan"
+    }
+  ],
+  "deviceless": {
+    "conversation": "01930000-0000-7000-0000-000000000006",
+    "user": "01930000-0000-7000-0000-000000000002"
+  },
+  "made": 1795650007432,
+  "outbox": {
+    "conversation": "01930000-0000-7000-0000-000000000005",
+    "message_id": "01930000-0000-7000-0000-00000000001c",
+    "nonce": "01930000-0000-7000-0000-00000000001b",
+    "seq": 11
+  },
+  "proposal": {
+    "conversation": "01930000-0000-7000-0000-000000000006"
+  },
+  "share": {
+    "parts": [
+      "mOgnlHM8Sx0EEWe9pHW5H+7iNX2NHodj6ASqPWAXvi6b16kP/iNlpEpDypUDOKSO50zyS+qWsjpUfuBIhA1IlDDsvQTl97i1E6yr5iI4Ut4mV3lzXr7GC1jxTviprQldPXloXTRbzDjJvrp86fabz9xAakFY3SDA9L9ReGfQMA4ydd6J+wnUQjHv1Vsq9Ua476336G6iyrYZs4LmgM+pF9MWV0GcAzWf+ctbd/u6aFK/x/eClGAe/ZzGcgjFin/+RBbYiZb31A8uSlSx6tNz2UTFGiqFm1xghtvW+fDRFiAaX7kREK2AvtP+P+ObHXQXOe5/BG8I6r3O/pbDwmh62ToPjrLW6AjRnW+P+Z1/QqxYH8H6PlGhSPZ+AHBOc9yhhFvPd8TmpbwlDYVfF9wOU6iJCcMJBsxO+NeE103hi/6Xx+CgrLS/e7GL17FCtRUXhE8U7SuWDXME/AS3z5/JvjEk0F3hHTnjnYVKBGS4UEpTUtCy+KzdjXjMssrq+bv93xZjQpQ="
+    ],
+    "share_id": "01a21514-b188-7712-a774-19cc3c65d80d"
+  },
+  "spent": "CxWyR93h2fqMEI/pzBnc5RQ8ZPpbnQ2VZ3V5BTHWUjs=",
+  "waiting": {
+    "conversation": "01930000-0000-7000-0000-000000000005",
+    "message_id": "01930000-0000-7000-0000-000000000017"
+  }
+}

@@ -1975,6 +1975,40 @@ fn devices_without_key_packages_are_skipped() {
     }
 }
 
+#[test]
+fn a_spent_key_package_still_takes_its_welcome() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut b1] = new_devices(&mut server, [a, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Dm, None, &[a, b], false);
+
+    // The API hands one of B1's key packages out for A's group, and tells B1 so as it takes B1's
+    // next upload: B1 marks it spent, and hands it out no more.
+    let create = server.create_group(conversation);
+    let claimed = &create["key_packages"][b.to_string().as_str()][0];
+    let published = ok(&mut b1.core, json!({"cmd": "key_packages"}));
+    let id = published["key_packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|kp| &kp["data"] == claimed)
+        .unwrap()["id"]
+        .clone();
+    let marked = ok(&mut b1.core, json!({"cmd": "key_packages", "spent": [id]}));
+    let shown = marked["key_packages"].as_array().unwrap();
+    assert!(shown.iter().all(|kp| kp["id"] != id));
+
+    // On the last of its 45 days B1 tops up again, which keeps its keys, and A's welcome comes:
+    // B1 joins with it.
+    server.clock.advance(45 * DAY_MS);
+    server.publish(&mut b1);
+    server.commit(&mut a1, conversation, create).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    let state = same_group(&mut [&mut a1, &mut b1], conversation);
+    assert_eq!(device_set(&state), BTreeSet::from([a1.id, b1.id]));
+}
+
 /// `observe_user` for `user` with an identity the test makes up, listing `devices`: what a device
 /// sees once the user started over with a new identity.
 fn another_identity(user: Uuid, devices: &[Uuid]) -> Value {
