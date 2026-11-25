@@ -1,7 +1,7 @@
 //! A conversation's group from its start: epoch 0 and the first commit, for a new conversation or
 //! for the conversation's next generation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use duvet_e2e_rules::{Entry, Kind, MemberList, RuleViolation, group_config, group_id, is_record};
 use openmls::prelude::{BasicCredential, ExternalSender, MlsGroup, OpenMlsProvider};
@@ -140,10 +140,11 @@ pub(crate) fn create_group(tx: &Tx<'_>, request: CreateGroup) -> Result<Created,
 /// as an epoch 0 with their list, without whoever left. A user can leave while a commit that would
 /// take their leaf out can't come (a blocked group takes none), and the API, which took them off
 /// at once, holds epoch 0 to its members: so a reset goes by those, and the owner the API named
-/// when the owner left. It brings no one in: the members must be what [`founds_reset`] takes from
-/// the group's, or the reset is `rule_violation` `member_list_mismatch`. The current generation's
-/// group stays until the server takes the new one. A device without the group can't reset it
-/// (`not_found`): it has no members to hold the API's to.
+/// when the owner left. It brings no one in, and leaves the owner out only on the leave statements
+/// this device holds: the members must be what [`founds_reset`] takes from the group's, or the
+/// reset is `rule_violation` `member_list_mismatch`. The current generation's group stays until
+/// the server takes the new one. A device without the group can't reset it (`not_found`): it has
+/// no members to hold the API's to.
 pub(crate) fn reset_group(tx: &Tx<'_>, request: ResetGroup) -> Result<Created, Error> {
     let conversation = request.conversation_id;
     let (group, mut row) = load_group(tx, conversation)?;
@@ -172,7 +173,7 @@ pub(crate) fn reset_group(tx: &Tx<'_>, request: ResetGroup) -> Result<Created, E
         })
         .collect();
     let list = MemberList::new(current.kind, request.owner, entries);
-    if !founds_reset(&current, &list) {
+    if !founds_reset(&current, &list, &row.leavers()) {
         return Err(violation(RuleViolation::MemberListMismatch));
     }
     let first = start(
@@ -189,14 +190,24 @@ pub(crate) fn reset_group(tx: &Tx<'_>, request: ResetGroup) -> Result<Created, E
     Ok(first.reply(generation))
 }
 
-/// Whether a reset may found the next generation of a group whose list is `current` with `next`:
-/// the same kind, and the group's users in the order they entered without those who left, so it
-/// brings no one in (only the owner's commit adds a user); a DM's two users; and a group's owner,
-/// the one it has while they stay, else the first of those who stay, as when an owner leaves (the
-/// API's choice too: who joined first). Who left is the API's word, which the validator holds
-/// epoch 0 to: no statement shows it, as a blocked group takes no commit to carry one. What the
-/// owner makes this way, the members that hold the group take (`apply`'s welcomes).
-pub(crate) fn founds_reset(current: &MemberList, next: &MemberList) -> bool {
+/// Whether a reset may found the next generation of a group whose list is `current` with `next`,
+/// on a device that holds the leave statements of `left` (`GroupRow::leavers`): the same kind, and
+/// the group's users in the order they entered, without those it leaves out, so it brings no one
+/// in (only the owner's commit adds a user); a DM's two users; and a group's owner:
+/// - the one it has, while they stay: their reset may leave out anyone, as their commits could
+///   remove them;
+/// - else, only on the statement of that owner and of everyone who entered before the one it names,
+///   who must be the first of the group's users the device holds no statement for, as when an
+///   owner leaves (`owner_not_successor`, and the API's choice: who joined first). That one may
+///   leave out others, as the owner they are.
+///
+/// Who a reset leaves out, and the owner it names, are the API's word: the statements keep the
+/// server from naming an owner, as each device keeps those that come, a blocked group's too
+/// (`apply`'s proposals). What's left: the server can still have the real owner's restart, or the
+/// proven successor's, leave out users who didn't leave, whom the client names to its person
+/// before the restart. The maker's core and the members that hold the group (`apply`'s welcomes)
+/// go by this one rule.
+pub(crate) fn founds_reset(current: &MemberList, next: &MemberList, left: &BTreeSet<Uuid>) -> bool {
     let users: Vec<Uuid> = next.users.iter().map(|entry| entry.user).collect();
     let staying: Vec<Uuid> = current
         .users
@@ -204,15 +215,20 @@ pub(crate) fn founds_reset(current: &MemberList, next: &MemberList) -> bool {
         .map(|entry| entry.user)
         .filter(|&user| next.contains(user))
         .collect();
-    let owned = match next.kind {
-        Kind::Dm => next.owner.is_none() && users.len() == current.users.len(),
-        Kind::Group => {
-            let successor = match current.owner {
-                Some(owner) if next.contains(owner) => Some(owner),
-                _ => users.first().copied(),
-            };
-            next.owner.is_some() && next.owner == successor
+    let owned = match (next.kind, current.owner) {
+        (Kind::Dm, _) => next.owner.is_none() && users.len() == current.users.len(),
+        (Kind::Group, Some(owner)) if next.contains(owner) => next.owner == Some(owner),
+        (Kind::Group, Some(owner)) => {
+            let successor = current
+                .users
+                .iter()
+                .map(|entry| entry.user)
+                .find(|user| !left.contains(user));
+            left.contains(&owner)
+                && successor.is_some_and(|successor| next.contains(successor))
+                && next.owner == successor
         }
+        (Kind::Group, None) => false,
     };
     next.kind == current.kind && users == staying && owned
 }
@@ -297,31 +313,47 @@ mod tests {
     fn a_reset_founds_the_group_without_those_who_left() {
         let [a, b, c, d] = [1, 2, 3, 4].map(Uuid::from_u128);
         let group = list(Kind::Group, Some(a), &[a, b, c]);
-        let founds = |owner, users: &[Uuid]| founds_reset(&group, &list(Kind::Group, owner, users));
-        // The users who stay, in the order they entered, with the owner while they stay, else the
-        // first of those who stay.
-        assert!(founds(Some(a), &[a, b, c]));
-        assert!(founds(Some(a), &[a, c]));
-        assert!(founds(Some(b), &[b, c]));
-        assert!(founds(Some(c), &[c]));
+        let founds = |owner, users: &[Uuid], left: &[Uuid]| {
+            let left: BTreeSet<Uuid> = left.iter().copied().collect();
+            founds_reset(&group, &list(Kind::Group, owner, users), &left)
+        };
+        // The owner stays: the users who stay, in the order they entered, whoever is left out.
+        assert!(founds(Some(a), &[a, b, c], &[]));
+        assert!(founds(Some(a), &[a, c], &[]));
+        assert!(founds(Some(a), &[a], &[]));
+        // The owner is left out: on their statement, and the owner is then the first of the
+        // group's users without one, who may leave out those after them.
+        assert!(founds(Some(b), &[b, c], &[a]));
+        assert!(founds(Some(b), &[b], &[a]));
+        assert!(founds(Some(c), &[c], &[a, b]));
+        assert!(!founds(Some(b), &[b, c], &[]));
+        assert!(!founds(Some(c), &[c], &[b]));
+        assert!(!founds(Some(c), &[c], &[a]));
+        assert!(!founds(Some(c), &[b, c], &[a]));
+        assert!(!founds(None, &[b, c], &[a]));
+        assert!(!founds(None, &[], &[a, b, c]));
         // No one new, no one twice, no other order, no other owner, and a group has one.
-        assert!(!founds(Some(a), &[a, b, c, d]));
-        assert!(!founds(Some(a), &[a, b, b]));
-        assert!(!founds(Some(a), &[a, c, b]));
-        assert!(!founds(Some(b), &[a, b]));
-        assert!(!founds(Some(c), &[b, c]));
-        assert!(!founds(Some(d), &[a, b]));
-        assert!(!founds(None, &[a, b]));
-        assert!(!founds(None, &[]));
-        assert!(!founds_reset(&group, &list(Kind::Dm, None, &[a, b])));
+        assert!(!founds(Some(a), &[a, b, c, d], &[]));
+        assert!(!founds(Some(a), &[a, b, b], &[]));
+        assert!(!founds(Some(a), &[a, c, b], &[]));
+        assert!(!founds(Some(b), &[a, b], &[a]));
+        assert!(!founds(Some(d), &[a, b], &[]));
+        assert!(!founds(None, &[a, b], &[]));
+        assert!(!founds(None, &[], &[]));
+        let none = BTreeSet::new();
+        assert!(!founds_reset(&group, &list(Kind::Dm, None, &[a, b]), &none));
 
         // A DM keeps its two users, and has no owner.
         let dm = list(Kind::Dm, None, &[a, b]);
-        assert!(founds_reset(&dm, &list(Kind::Dm, None, &[a, b])));
-        assert!(!founds_reset(&dm, &list(Kind::Dm, None, &[a])));
-        assert!(!founds_reset(&dm, &list(Kind::Dm, None, &[a, c])));
-        assert!(!founds_reset(&dm, &list(Kind::Dm, None, &[b, a])));
-        assert!(!founds_reset(&dm, &list(Kind::Dm, Some(a), &[a, b])));
-        assert!(!founds_reset(&dm, &list(Kind::Group, Some(a), &[a, b])));
+        assert!(founds_reset(&dm, &list(Kind::Dm, None, &[a, b]), &none));
+        assert!(!founds_reset(&dm, &list(Kind::Dm, None, &[a]), &none));
+        assert!(!founds_reset(&dm, &list(Kind::Dm, None, &[a, c]), &none));
+        assert!(!founds_reset(&dm, &list(Kind::Dm, None, &[b, a]), &none));
+        assert!(!founds_reset(&dm, &list(Kind::Dm, Some(a), &[a, b]), &none));
+        assert!(!founds_reset(
+            &dm,
+            &list(Kind::Group, Some(a), &[a, b]),
+            &none
+        ));
     }
 }

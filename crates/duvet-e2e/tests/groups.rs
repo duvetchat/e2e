@@ -1883,6 +1883,15 @@ fn a_reset_refuses_a_user_the_group_doesnt_have() {
     start(&mut server, &mut a1, dm);
     server.deliver_all(&mut [&mut a1, &mut b1]);
 
+    // A reset without the API's members is a command the core can't read.
+    let missing = error(
+        &mut a1.core,
+        json!({"cmd": "reset_group", "conversation_id": group, "owner": a}),
+    );
+    assert_eq!(
+        (&missing["code"], &missing["field"]),
+        (&json!("bad_command"), &json!("members"))
+    );
     let reset = |conversation: Uuid, owner: Option<Uuid>, members: &[Uuid]| {
         json!({
             "cmd": "reset_group",
@@ -1923,7 +1932,8 @@ fn a_reset_refuses_an_owner_outside_its_members() {
     start(&mut server, &mut a1, conversation);
     server.deliver_all(&mut [&mut a1, &mut b1, &mut c1]);
 
-    // C outside the members; none; B while A, the owner, stays; and without A, C, who entered after B.
+    // C outside the members; none; B while A, the owner, stays; and without A, C, who entered
+    // after B.
     for (owner, members) in [
         (Some(c), vec![a, b]),
         (None, vec![a, b, c]),
@@ -2026,6 +2036,148 @@ fn a_reset_welcome_is_held_to_the_members_the_group_had() {
     let state = b1.group(conversation);
     assert_eq!(state["generation"], 0);
     assert_eq!(members(&state), [a, b, c]);
+}
+
+/// The API takes A, the owner, off the conversation and names B its owner, though A never left: no
+/// device holds a statement of A's. B's own core refuses B's reset without A, and C1 refuses it
+/// made past B's core, keeping its group as it was: the server can't make anyone the owner.
+#[test]
+fn a_successors_reset_without_the_owners_statement_is_refused() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1, mut b1, mut c1] = new_devices(&mut server, [a, b, c]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b, c], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1]);
+
+    let chat = server.chats.get_mut(&conversation).unwrap();
+    chat.users.retain(|&user| user != a);
+    chat.owner = Some(b);
+    let reset = server.reset_group(conversation, &[b, c]);
+    let refused = error(&mut b1.core, reset);
+    assert_eq!(
+        (&refused["code"], &refused["rule"]),
+        (&json!("rule_violation"), &json!("member_list_mismatch"))
+    );
+
+    let list = MemberList::new(Kind::Group, Some(b), at_start(&[b, c], 1));
+    let key_package = json!(server.last_resort(c1.id));
+    let (commit, welcome) = reset_by_hand(&mut b1, conversation, &list, &[key_package]);
+    let commit_seq = server.force(conversation, "commit", commit);
+    let welcome_seq = server.force(conversation, "welcome", welcome);
+    assert_eq!(
+        results(&server.deliver(&mut c1)),
+        [
+            json!([commit_seq, "commit", "ignored", null]),
+            json!([welcome_seq, "welcome", "rejected", "member_list_mismatch"]),
+        ]
+    );
+    let state = c1.group(conversation);
+    assert_eq!(
+        (&state["generation"], &state["owner"], &state["blocked"]),
+        (&json!(0), &json!(a), &json!(false))
+    );
+    assert_eq!(members(&state), [a, b, c]);
+}
+
+/// A, the owner, leaves with a statement every device keeps. The API then takes B off too, though B
+/// never left, and names C the owner. C's core refuses C's reset, as B, who entered before C, left
+/// no statement; and D1 refuses it made past C's core, keeping its group as it was.
+#[test]
+fn a_reset_that_skips_an_earlier_member_without_their_statement_is_refused() {
+    let mut server = FakeServer::new();
+    let (a, b, c, d) = (new_id(), new_id(), new_id(), new_id());
+    let [mut a1, mut b1, mut c1, mut d1] = new_devices(&mut server, [a, b, c, d]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b, c, d], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1, &mut d1]);
+
+    server.leave(&mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1, &mut d1]);
+    let chat = server.chats.get_mut(&conversation).unwrap();
+    chat.users.retain(|&user| user != b);
+    chat.owner = Some(c);
+    let reset = server.reset_group(conversation, &[c, d]);
+    let refused = error(&mut c1.core, reset);
+    assert_eq!(
+        (&refused["code"], &refused["rule"]),
+        (&json!("rule_violation"), &json!("member_list_mismatch"))
+    );
+
+    let list = MemberList::new(Kind::Group, Some(c), at_start(&[c, d], 1));
+    let key_package = json!(server.last_resort(d1.id));
+    let (commit, welcome) = reset_by_hand(&mut c1, conversation, &list, &[key_package]);
+    let commit_seq = server.force(conversation, "commit", commit);
+    let welcome_seq = server.force(conversation, "welcome", welcome);
+    assert_eq!(
+        results(&server.deliver(&mut d1)),
+        [
+            json!([commit_seq, "commit", "ignored", null]),
+            json!([welcome_seq, "welcome", "rejected", "member_list_mismatch"]),
+        ]
+    );
+    let state = d1.group(conversation);
+    assert_eq!(
+        (&state["generation"], &state["owner"]),
+        (&json!(0), &json!(a))
+    );
+    assert_eq!(members(&state), [a, b, c, d]);
+}
+
+/// A's group is blocked before A leaves: each device keeps A's statement all the same, though its
+/// blocked group takes no proposal. Until it has it, B's core refuses B's reset without A; with it,
+/// B's reset goes through, and C1, which keeps A's statement too, takes its welcome.
+#[test]
+fn an_owner_who_leaves_after_the_block_lets_the_successor_reset() {
+    let mut server = FakeServer::new();
+    let (a, b, c, d) = (new_id(), new_id(), new_id(), new_id());
+    let [mut a1, mut b1, mut c1, d1] = new_devices(&mut server, [a, b, c, d]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b, c], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1]);
+    let key_package = json!(server.last_resort(d1.id));
+    block(
+        &mut server,
+        &mut c1,
+        conversation,
+        d,
+        &key_package,
+        &mut [&mut a1, &mut b1],
+    );
+
+    // A leaves, from the blocked group: the API names B the owner and proposes the removal of A's
+    // leaf, with A's statement. B's core, which hasn't had it yet, refuses B's reset without A.
+    server.leave(&mut a1, conversation);
+    assert_eq!(server.chats[&conversation].owner, Some(b));
+    let proposal_seq = server.chats[&conversation].queue.len() as u64;
+    let reset = server.reset_group(conversation, &[b, c]);
+    let refused = error(&mut b1.core, reset);
+    assert_eq!(
+        (&refused["code"], &refused["rule"]),
+        (&json!("rule_violation"), &json!("member_list_mismatch"))
+    );
+
+    // The proposal comes: the blocked group ignores it, and keeps A's statement.
+    assert_eq!(
+        results(&server.deliver(&mut b1)),
+        [json!([proposal_seq, "proposal", "ignored", null])]
+    );
+    server.deliver(&mut c1);
+    assert_eq!(b1.group(conversation)["blocked"], true);
+    let reset = server.reset_group(conversation, &[b, c]);
+    server
+        .commit(&mut b1, conversation, reset)
+        .expect("the API takes the reset of the owner it named");
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1]);
+    let state = same_group(&mut [&mut b1, &mut c1], conversation);
+    assert_eq!(
+        (&state["generation"], &state["owner"], &state["blocked"]),
+        (&json!(1), &json!(b), &json!(false))
+    );
+    assert_eq!(members(&state), [b, c]);
 }
 
 #[test]
