@@ -18,6 +18,7 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::create::founds_reset;
 use super::{
     EXTERNAL_SENDER_MISMATCH, Extra, GroupRow, api_key, brings_back_removed, can_commit,
     certify_by_pinned, certify_leaves_by_pinned, check, check_applied, commit_asks_first,
@@ -50,7 +51,7 @@ pub(crate) struct Entry {
     /// device's client showed them then, from the client's own record (the API never gives it).
     /// The founding welcome must have its users, in any order, kind and owner, and any other join
     /// keep to it ([`Expected::hold`]), but a reset's welcome to a device that holds the group,
-    /// which goes by the members it had.
+    /// which goes by the members it had, without those who left.
     #[serde(default)]
     pub(crate) expected: Option<Expected>,
     /// On the server's proposal to remove a leaf of a user who leaves: their signed statement, for
@@ -433,13 +434,12 @@ impl EntryHandler for Welcomes {
             return Ok(rejected("wrong_group"));
         }
         // A welcome to a later generation is a reset, which keeps the members the group had, as
-        // this device has them while it's in the group.
+        // this device has them while it's in the group, without those who left.
         let reset = match &at.row {
             None => None,
-            Some(row) if generation > row.generation => at.group.is_some().then(|| {
-                let users: Vec<Uuid> = row.members.users.iter().map(|entry| entry.user).collect();
-                entered_at_start(row.members.kind, row.members.owner, &users, generation)
-            }),
+            Some(row) if generation > row.generation => {
+                at.group.is_some().then(|| row.members.clone())
+            }
             Some(row) if generation == row.generation && at.group.is_none() && !row.blocked => {
                 // A welcome to an epoch this device held or saw pass is an old one, handed out
                 // again: in it, members removed since still hold the keys.
@@ -478,10 +478,20 @@ impl EntryHandler for Welcomes {
         let context = staged.group_context();
         let epoch = context.epoch().as_u64();
         let mut ctx = rule_context(tx, leaves.values().map(|leaf| leaf.user))?;
-        match (reset, &entry.expected) {
-            // A reset's welcome to a device that holds the group goes by the members it had: they
-            // carry the legitimate changes since the cutover, which the record doesn't.
-            (Some(members), _) => ctx.expected_initial = Some(members),
+        match (&reset, &entry.expected) {
+            // A reset's welcome to a device that holds the group goes by the members it had,
+            // without those who left (`founds_reset`): they carry the legitimate changes since the
+            // cutover, which the record doesn't. Any other list is held to the members it had, and
+            // refused for not being them.
+            (Some(had), _) => {
+                let next = MemberList::from_group_context(context)
+                    .ok()
+                    .filter(|next| founds_reset(had, next));
+                ctx.expected_initial = Some(next.unwrap_or_else(|| {
+                    let users: Vec<Uuid> = had.users.iter().map(|entry| entry.user).collect();
+                    entered_at_start(had.kind, had.owner, &users, generation)
+                }));
+            }
             (None, Some(record)) => {
                 // The founding welcome is the first commit's, at generation 0.
                 let founding = (generation, epoch) == (0, 1);
@@ -496,7 +506,9 @@ impl EntryHandler for Welcomes {
         let list = MemberList::from_group_context(context).map_err(|_| stored_state())?;
         // Only the owner adds a user to a group, and a welcome's group info is signed by the
         // commit's maker: the welcome of the commit that added this device's user must be the
-        // owner's. Who made a group's epoch 0 the validator checked, as no welcome shows it.
+        // owner's, and so must a reset's, which may leave users out: only the owner makes a
+        // group's next generation, as the validator holds its epoch 0. Who made a new
+        // conversation's epoch 0 the validator checked.
         let own_user = tx.own_user()?.ok_or_else(|| not_found("device"))?;
         let added_now = list
             .entry(own_user)
@@ -504,7 +516,7 @@ impl EntryHandler for Welcomes {
         let signer = leaves
             .get(&staged.welcome_sender_index().u32())
             .map(|leaf| leaf.user);
-        if list.kind == Kind::Group && added_now && signer != list.owner {
+        if list.kind == Kind::Group && (added_now || reset.is_some()) && signer != list.owner {
             return Ok(rejected(RuleViolation::MembersChangedByNonOwner.name()));
         }
 

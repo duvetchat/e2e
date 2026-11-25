@@ -45,6 +45,12 @@ pub(crate) struct CreateGroup {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ResetGroup {
     conversation_id: Uuid,
+    /// The group's owner as the API has it; a DM has none.
+    #[serde(default)]
+    owner: Option<Uuid>,
+    /// The conversation's members as the API has them, in the order they entered.
+    members: Vec<Uuid>,
+    /// Key packages of the members' devices, by user.
     #[serde(default)]
     key_packages: BTreeMap<Uuid, Vec<b64::Bytes>>,
 }
@@ -128,11 +134,16 @@ pub(crate) fn create_group(tx: &Tx<'_>, request: CreateGroup) -> Result<Created,
     Ok(first.reply(0))
 }
 
-/// The conversation's group again, at its next generation: epoch 0 with the members it has, and a
-/// first commit, as a new conversation's. The way out of a group a commit that broke the rules
-/// blocked: its owner makes it (in a DM, either member), and the members take it as an epoch 0
-/// with their list. The current generation's group stays until the server takes the new one. A
-/// device without the group can't reset it (`not_found`): it has no members to found it with.
+/// The conversation's group again, at its next generation: epoch 0 with the members and owner the
+/// API gives, and a first commit, as a new conversation's. The way out of a group a commit that
+/// broke the rules blocked: its owner makes it (in a DM, either member), and the members take it
+/// as an epoch 0 with their list, without whoever left. A user can leave while a commit that would
+/// take their leaf out can't come (a blocked group takes none), and the API, which took them off
+/// at once, holds epoch 0 to its members: so a reset goes by those, and the owner the API named
+/// when the owner left. It brings no one in: the members must be what [`founds_reset`] takes from
+/// the group's, or the reset is `rule_violation` `member_list_mismatch`. The current generation's
+/// group stays until the server takes the new one. A device without the group can't reset it
+/// (`not_found`): it has no members to hold the API's to.
 pub(crate) fn reset_group(tx: &Tx<'_>, request: ResetGroup) -> Result<Created, Error> {
     let conversation = request.conversation_id;
     let (group, mut row) = load_group(tx, conversation)?;
@@ -151,16 +162,19 @@ pub(crate) fn reset_group(tx: &Tx<'_>, request: ResetGroup) -> Result<Created, E
         .ok_or_else(|| Error::Internal("the conversation's generations ran out".into()))?;
     let current = MemberList::from_group_context(group.public_group().group_context())
         .map_err(|_| super::stored_state())?;
-    let entries = current
-        .users
+    let entries = request
+        .members
         .iter()
-        .map(|entry| Entry {
-            user: entry.user,
+        .map(|&user| Entry {
+            user,
             generation,
             epoch: 0,
         })
         .collect();
-    let list = MemberList::new(current.kind, current.owner, entries);
+    let list = MemberList::new(current.kind, request.owner, entries);
+    if !founds_reset(&current, &list) {
+        return Err(violation(RuleViolation::MemberListMismatch));
+    }
     let first = start(
         tx,
         conversation,
@@ -173,6 +187,34 @@ pub(crate) fn reset_group(tx: &Tx<'_>, request: ResetGroup) -> Result<Created, E
     row.staged(Pending::Reset, &first.staged);
     row.write(tx)?;
     Ok(first.reply(generation))
+}
+
+/// Whether a reset may found the next generation of a group whose list is `current` with `next`:
+/// the same kind, and the group's users in the order they entered without those who left, so it
+/// brings no one in (only the owner's commit adds a user); a DM's two users; and a group's owner,
+/// the one it has while they stay, else the first of those who stay, as when an owner leaves (the
+/// API's choice too: who joined first). Who left is the API's word, which the validator holds
+/// epoch 0 to: no statement shows it, as a blocked group takes no commit to carry one. What the
+/// owner makes this way, the members that hold the group take (`apply`'s welcomes).
+pub(crate) fn founds_reset(current: &MemberList, next: &MemberList) -> bool {
+    let users: Vec<Uuid> = next.users.iter().map(|entry| entry.user).collect();
+    let staying: Vec<Uuid> = current
+        .users
+        .iter()
+        .map(|entry| entry.user)
+        .filter(|&user| next.contains(user))
+        .collect();
+    let owned = match next.kind {
+        Kind::Dm => next.owner.is_none() && users.len() == current.users.len(),
+        Kind::Group => {
+            let successor = match current.owner {
+                Some(owner) if next.contains(owner) => Some(owner),
+                _ => users.first().copied(),
+            };
+            next.owner.is_some() && next.owner == successor
+        }
+    };
+    next.kind == current.kind && users == staying && owned
 }
 
 /// Epoch 0 and the first commit, staged.
@@ -233,4 +275,53 @@ fn start(
         staged,
         skipped,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn list(kind: Kind, owner: Option<Uuid>, users: &[Uuid]) -> MemberList {
+        let entries = users
+            .iter()
+            .map(|&user| Entry {
+                user,
+                generation: 1,
+                epoch: 0,
+            })
+            .collect();
+        MemberList::new(kind, owner, entries)
+    }
+
+    #[test]
+    fn a_reset_founds_the_group_without_those_who_left() {
+        let [a, b, c, d] = [1, 2, 3, 4].map(Uuid::from_u128);
+        let group = list(Kind::Group, Some(a), &[a, b, c]);
+        let founds = |owner, users: &[Uuid]| founds_reset(&group, &list(Kind::Group, owner, users));
+        // The users who stay, in the order they entered, with the owner while they stay, else the
+        // first of those who stay.
+        assert!(founds(Some(a), &[a, b, c]));
+        assert!(founds(Some(a), &[a, c]));
+        assert!(founds(Some(b), &[b, c]));
+        assert!(founds(Some(c), &[c]));
+        // No one new, no one twice, no other order, no other owner, and a group has one.
+        assert!(!founds(Some(a), &[a, b, c, d]));
+        assert!(!founds(Some(a), &[a, b, b]));
+        assert!(!founds(Some(a), &[a, c, b]));
+        assert!(!founds(Some(b), &[a, b]));
+        assert!(!founds(Some(c), &[b, c]));
+        assert!(!founds(Some(d), &[a, b]));
+        assert!(!founds(None, &[a, b]));
+        assert!(!founds(None, &[]));
+        assert!(!founds_reset(&group, &list(Kind::Dm, None, &[a, b])));
+
+        // A DM keeps its two users, and has no owner.
+        let dm = list(Kind::Dm, None, &[a, b]);
+        assert!(founds_reset(&dm, &list(Kind::Dm, None, &[a, b])));
+        assert!(!founds_reset(&dm, &list(Kind::Dm, None, &[a])));
+        assert!(!founds_reset(&dm, &list(Kind::Dm, None, &[a, c])));
+        assert!(!founds_reset(&dm, &list(Kind::Dm, None, &[b, a])));
+        assert!(!founds_reset(&dm, &list(Kind::Dm, Some(a), &[a, b])));
+        assert!(!founds_reset(&dm, &list(Kind::Group, Some(a), &[a, b])));
+    }
 }
