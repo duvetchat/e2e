@@ -10,8 +10,9 @@
 //! `commit_result`, a waiting message, a member noted as without devices, backup days uploaded and
 //! due, an approval under way, and its queues half applied; in B1's, a kept proposal and a share's
 //! key not yet imported. From schema 3 on, both hold a device their group took out, and an identity
-//! it no longer takes there. The test checks each survives the open and, where a command completes
-//! it, completes.
+//! it no longer takes there; from schema 4 on, A1's holds a key package it marked spent. The test
+//! checks each survives the open and, where a command completes it, completes, and that every
+//! database opens at the newest schema.
 //!
 //! Nothing here depends on the date it runs. The core's clock is set to a minute after the fixtures
 //! were made. OpenMLS checks lifetimes against the system's clock, but only a key package's (as a
@@ -26,8 +27,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use duvet_e2e::{Clock, Core, FakeClock, OpenConfig};
 use duvet_e2e_rules::{DeviceCertificate, Kind, group_id};
-use openmls::prelude::{BasicCredential, MlsGroup, OpenMlsProvider, Proposal, Sender};
+use openmls::prelude::tls_codec::{DeserializeBytes as _, Serialize as _, VLBytes};
+use openmls::prelude::{
+    BasicCredential, KeyPackageBundle, KeyPackageRef, MlsGroup, OpenMlsProvider, Proposal, Sender,
+};
 use openmls::treesync::LeafNodeSource;
+use openmls_traits::storage::StorageProvider as _;
 use serde_json::{Value, json};
 use support::*;
 use uuid::Uuid;
@@ -222,17 +227,53 @@ fn opens_the_previous_version_db() {
         .collect();
     versions.sort();
     assert!(!versions.is_empty(), "no fixtures");
+    let newest = versions.iter().map(|path| schema_of(path)).max().unwrap();
     for version in versions {
         let name = version.file_stem().unwrap().to_str().unwrap().to_owned();
         opens(
             &name,
+            newest,
             &serde_json::from_str(&std::fs::read_to_string(&version).unwrap()).unwrap(),
         );
     }
 }
 
-/// Opens the fixtures of `name` (`db-vN`), which `fixture` describes, and goes on with them.
-fn opens(name: &str, fixture: &Value) {
+/// The schema of the fixtures `path` (`db-vN.json`, or `db-vN`) names.
+fn schema_of(path: &std::path::Path) -> u32 {
+    let name = path.file_stem().unwrap().to_str().unwrap();
+    name.trim_start_matches("db-v").parse().unwrap()
+}
+
+/// Whether OpenMLS's storage in `core` holds the key package whose reference is `id`, with its
+/// private keys.
+fn holds_key_package(core: &mut Core, id: &[u8]) -> bool {
+    let encoded = VLBytes::new(id.to_vec()).tls_serialize_detached().unwrap();
+    let reference = KeyPackageRef::tls_deserialize_exact_bytes(&encoded).unwrap();
+    core.transaction(|tx| {
+        Ok(tx
+            .provider()
+            .storage()
+            .key_package::<KeyPackageRef, KeyPackageBundle>(&reference)
+            .map_err(|error| duvet_e2e::Error::Internal(error.to_string()))?
+            .is_some())
+    })
+    .unwrap()
+}
+
+/// The single-use key packages of a `key_packages` reply.
+fn single_use(reply: &Value) -> Vec<Value> {
+    reply["key_packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|kp| kp["last_resort"] == false)
+        .cloned()
+        .collect()
+}
+
+/// Opens the fixtures of `name` (`db-vN`), which `fixture` describes, and goes on with them. Each
+/// database opens at schema `newest`, the newest fixtures'.
+fn opens(name: &str, newest: u32, fixture: &Value) {
     let (a, a1_id) = (id(&fixture["a"]["user"]), id(&fixture["a"]["device"]));
     let (b, b1_id) = (id(&fixture["b"]["user"]), id(&fixture["b"]["device"]));
     let clock = FakeClock::at(fixture["made"].as_i64().unwrap() + MINUTE);
@@ -259,7 +300,7 @@ fn opens(name: &str, fixture: &Value) {
     }
     // From schema 3 on, each database holds a device its group took out, and an identity it no
     // longer takes there, for the migrations after it to carry.
-    let schema: u32 = name.trim_start_matches("db-v").parse().unwrap();
+    let schema = schema_of(std::path::Path::new(name));
     if schema >= 3 {
         for core in [&mut a1, &mut b1] {
             for table in ["removed_devices", "removed_identities"] {
@@ -275,6 +316,32 @@ fn opens(name: &str, fixture: &Value) {
                 assert!(rows > 0, "{name}: no row in {table}");
             }
         }
+    }
+    // Every database opens at the newest schema, whichever wrote it.
+    for core in [&mut a1, &mut b1] {
+        let version: u32 = core
+            .transaction(|tx| {
+                Ok(tx
+                    .conn()
+                    .query_row("PRAGMA user_version", [], |row| row.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(version, newest, "{name}");
+    }
+    // And takes schema 4's spent key packages: one A1 marks leaves its reply, a new one takes its
+    // place, and its keys stay for the welcome it may still bring. From schema 4 on, A1's database
+    // holds one it marked before, which stays out too.
+    let spent = single_use(&ok(&mut a1, json!({"cmd": "key_packages"})))[0]["id"].clone();
+    let marked = ok(&mut a1, json!({"cmd": "key_packages", "spent": [spent]}));
+    let marked = single_use(&marked);
+    assert_eq!(marked.len(), 100, "{name}");
+    let mut out = vec![spent];
+    if schema >= 4 {
+        out.push(fixture["spent"].clone());
+    }
+    for id in &out {
+        assert!(marked.iter().all(|kp| &kp["id"] != id), "{name}: {id}");
+        assert!(holds_key_package(&mut a1, &bytes(id)), "{name}: {id}");
     }
     let conversations = fixture["conversations"].as_array().unwrap();
     for conversation in conversations {
@@ -661,6 +728,15 @@ fn write_db() {
     server.deliver(&mut b1);
     let shown_now = [dm, group].map(|conversation| shown(&mut a1.core, conversation));
 
+    // The API said it handed out one of A1's key packages, which A1 marks spent (schema 4): its row
+    // keeps when, and its keys stay.
+    let published = ok(&mut a1.core, json!({"cmd": "key_packages"}));
+    let spent = single_use(&published)[0]["id"].clone();
+    ok(
+        &mut a1.core,
+        json!({"cmd": "key_packages", "spent": [spent]}),
+    );
+
     // No leaf keeps a key package's lifetime, on either device: each one a commit brought.
     for device in [&mut a1, &mut b1] {
         for conversation in [dm, group] {
@@ -711,6 +787,7 @@ fn write_db() {
         "backup_due": backup_due,
         "share": {"share_id": shared["share_id"], "parts": shared["parts"]},
         "approval": {"reveal": revealed["reveal"]},
+        "spent": spent,
     });
     std::fs::create_dir_all(fixtures()).unwrap();
     let write = |name: String, bytes: &[u8]| {
