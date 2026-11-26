@@ -63,6 +63,9 @@ pub(crate) enum Command {
         /// The user's devices' certificates as the server serves them, for the devices that stay.
         #[serde(default, with = "b64::list")]
         certificates: Vec<Vec<u8>>,
+        /// Run again while the rotation waits: devices it keeps that the server no longer has.
+        #[serde(default)]
+        gone: Vec<Uuid>,
     },
 
     // Attachments' parts.
@@ -168,7 +171,8 @@ pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error
         Command::RotateKeys {
             remove,
             certificates,
-        } => reply(identity::rotate_keys(tx, &remove, &certificates)?),
+            gone,
+        } => reply(identity::rotate_keys(tx, &remove, &certificates, &gone)?),
 
         Command::AttachmentKey => reply(parts::attachment_key(tx)?),
         Command::AttachmentEncrypt(part) => reply(parts::attachment_encrypt(part)?),
@@ -246,6 +250,9 @@ struct Status {
     /// reply out again.
     #[serde(skip_serializing_if = "Option::is_none")]
     waiting_upload: Option<&'static str>,
+    /// While that's `rotate_keys`: the devices the rotation removes, which it takes run again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waiting_remove: Option<Vec<Uuid>>,
     has_identity: bool,
     key_storage: KeyStorage,
 }
@@ -273,6 +280,7 @@ fn cmd_status(tx: &mut Tx<'_>) -> Result<Status, Error> {
     let identity_key = meta("identity_key")?;
     let device_list = meta("device_list")?;
     let waiting_upload = identity::waiting_upload(tx)?;
+    let waiting_remove = identity::waiting_remove(tx)?;
     let uuid =
         |bytes: &[u8]| Uuid::from_slice(bytes).map_err(|error| Error::Internal(error.to_string()));
     Ok(Status {
@@ -286,6 +294,7 @@ fn cmd_status(tx: &mut Tx<'_>) -> Result<Status, Error> {
         certificate,
         device_list,
         waiting_upload,
+        waiting_remove,
         has_identity: identity_key.is_some(),
         identity_key,
         key_storage: tx.key_storage(),

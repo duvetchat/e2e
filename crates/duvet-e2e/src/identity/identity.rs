@@ -120,6 +120,14 @@ pub(crate) fn waiting_upload(tx: &Tx<'_>) -> Result<Option<&'static str>, Error>
     }))
 }
 
+/// The devices a rotation that waits for `identity_uploaded` removes, in order, which it takes
+/// run again.
+pub(crate) fn waiting_remove(tx: &Tx<'_>) -> Result<Option<Vec<Uuid>>, Error> {
+    Ok(kept(tx)?
+        .and_then(|kept| kept.rotation)
+        .map(|rotation| rotation.removed))
+}
+
 /// Drops what the last identity command kept for its upload, if anything: whether it did.
 pub(super) fn drop_kept(tx: &Tx<'_>) -> Result<bool, Error> {
     let deleted = tx
