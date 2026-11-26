@@ -59,10 +59,18 @@ const TRANSFER_FIXED: usize = 256;
 #[serde(deny_unknown_fields)]
 struct Transfer {
     v: u32,
-    #[serde(with = "secret")]
-    identity: Zeroizing<[u8; 32]>,
-    #[serde(with = "secret")]
-    backup_key: Zeroizing<[u8; 32]>,
+    // Boxed: held by value across the derived visitor's loop, the two secrets were 64 loose bytes,
+    // on which LLVM 23's SLP vectorizer never ended for x86-64 without SSE4.1 (#48).
+    #[serde(
+        serialize_with = "secret::serialize",
+        deserialize_with = "secret::boxed"
+    )]
+    identity: Box<Zeroizing<[u8; 32]>>,
+    #[serde(
+        serialize_with = "secret::serialize",
+        deserialize_with = "secret::boxed"
+    )]
+    backup_key: Box<Zeroizing<[u8; 32]>>,
     previous_backup_keys: Vec<EarlierKey>,
     #[serde(with = "serde_bytes")]
     certificate: Vec<u8>,
@@ -535,8 +543,8 @@ fn hand_over(
             .map_err(|_| Error::Internal("the identity couldn't sign".into()))?;
             let transfer = Transfer {
                 v: 1,
-                identity: secret_array(&secret)?,
-                backup_key: secret_array(backup_key)?,
+                identity: Box::new(secret_array(&secret)?),
+                backup_key: Box::new(secret_array(backup_key)?),
                 previous_backup_keys: previous.to_vec(),
                 certificate: certificate.clone(),
                 device_list: list.clone(),
@@ -758,13 +766,13 @@ pub(crate) fn receive_rotation(
         [&transfer.certificate],
     )?;
     meta_put(tx, IDENTITY_KEY, &identity.public)?;
-    meta_put(tx, IDENTITY_SECRET, &*transfer.identity)?;
+    meta_put(tx, IDENTITY_SECRET, &**transfer.identity)?;
     meta_put(tx, DEVICE_LIST, &transfer.device_list)?;
-    meta_put(tx, BACKUP_KEY, &*transfer.backup_key)?;
+    meta_put(tx, BACKUP_KEY, &**transfer.backup_key)?;
     // What an identity command of this device kept for its upload was made for the identity
     // replaced now: run again, it would hand that one out.
     drop_kept(tx)?;
-    keep_previous(tx, own.user, &*transfer.backup_key, &kept)?;
+    keep_previous(tx, own.user, &**transfer.backup_key, &kept)?;
     keep_earlier_identity(tx, own.user, &before)?;
     keep_certificates(
         tx,
@@ -840,6 +848,13 @@ mod secret {
         T: serde_bytes::Deserialize<'de> + Zeroize,
     {
         serde_bytes::deserialize(deserializer).map(Zeroizing::new)
+    }
+
+    /// [`deserialize`], on the heap.
+    pub(super) fn boxed<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Box<Zeroizing<[u8; 32]>>, D::Error> {
+        deserialize(deserializer).map(Box::new)
     }
 }
 

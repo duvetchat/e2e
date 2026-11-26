@@ -73,10 +73,3 @@ openmls = { path = "vendor/openmls" }
 # to a second, which this leaves to Duvet's own code, on a loaded runner too.
 [profile.dev.package."*"]
 opt-level = 3
-
-# LLVM's SLP vectorizer never ends on duvet-e2e in the ThinLTO pass that joins its codegen units, since #46's
-# round 2 (x86_64; gdb: SLPVectorizerPass::vectorizeInsertElementInst → BoUpSLP::getReorderingData). Built as one
-# unit, the crate takes no ThinLTO pass, and its release build ends.
-# shortcut: one unit builds slower; drop it once #48 finds the code that trips the pass.
-[profile.release.package.duvet-e2e]
-codegen-units = 1
