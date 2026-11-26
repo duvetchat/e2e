@@ -163,8 +163,10 @@ struct Reveal {
 #[serde(deny_unknown_fields)]
 struct Transfer {
     v: u32,
-    identity: Secret,
-    backup_key: Secret,
+    // Boxed, as rotate.rs's is: held by value across the derived visitor's loop, two secrets become
+    // loose bytes, on which LLVM 23's SLP vectorizer can loop for x86-64 without SSE4.1 (#48).
+    identity: Box<Secret>,
+    backup_key: Box<Secret>,
     #[serde(with = "serde_bytes")]
     certificate: Vec<u8>,
     #[serde(with = "serde_bytes")]
@@ -191,8 +193,10 @@ struct Bytes32(#[serde(with = "serde_bytes")] [u8; 32]);
 /// whether the person typed here that approver's code.
 #[derive(Serialize, Deserialize)]
 struct Attempt {
-    qr: Secret,
-    secret: Secret,
+    // Boxed, as the transfers' are: held by value across the derived visitor's loop, two secrets
+    // become loose bytes, where LLVM 23's SLP vectorizer can loop for x86-64 without SSE4.1 (#48).
+    qr: Box<Secret>,
+    secret: Box<Secret>,
     #[serde(with = "serde_bytes")]
     key: [u8; 32],
     #[serde(with = "serde_bytes")]
@@ -358,8 +362,8 @@ pub(crate) fn approval_begin(tx: &mut Tx<'_>) -> Result<Begun, Error> {
         hash,
     })?;
     let attempt = Attempt {
-        qr: qr_secret,
-        secret,
+        qr: Box::new(qr_secret),
+        secret: Box::new(secret),
         key,
         nonce,
         answer: None,
@@ -759,8 +763,8 @@ fn approve(tx: &Tx<'_>, asked: &Asked, key: &[u8; 32]) -> Result<Approved, Error
     let payload = to_secret_cbor(
         &Transfer {
             v: 1,
-            identity: Secret::copy(&secret)?,
-            backup_key: Secret::copy(&backup_key)?,
+            identity: Box::new(Secret::copy(&secret)?),
+            backup_key: Box::new(Secret::copy(&backup_key)?),
             certificate: certificate.clone(),
             device_list: device_list.clone(),
             approver: approver.certificate.clone(),
