@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use super::{
     DEVICE_LIST, from_cbor, invalid, keep_certificates, meta_get, meta_put, not_found, stored_key,
-    to_cbor,
+    to_cbor, waiting_upload,
 };
 use crate::messages::Empty;
 use crate::protocol::b64;
@@ -19,7 +19,7 @@ const SAFETY_NUMBER_LABEL: &[u8] = b"duvet safety number v1";
 
 /// `meta`'s row for this device's own user's list as the server is known to hold it: the client
 /// confirmed its upload (`device_list_uploaded`), or the server served it.
-const LIST_ON_SERVER: &str = "device_list_on_server";
+pub(super) const LIST_ON_SERVER: &str = "device_list_on_server";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -163,10 +163,13 @@ pub(crate) fn observe_user(
         // This device's own list, of a version the server holds another of, which the identity
         // signed: the server's compare-and-set chose that one, and this one's upload never landed.
         // Once the server is known to hold this device's list (the client confirmed its upload, or
-        // the server served it), another of that version is a conflict.
+        // the server served it), another of that version is a conflict; and so it is while a
+        // rotation of this device's own waits, as the server could serve back that rotation's first
+        // upload, whose list and certificates name a device `gone` took off since.
         let lost = own
             && list.version == pinned.list.version
-            && !on_server(tx, &identity_key, &pinned.list)?;
+            && !on_server(tx, &identity_key, &pinned.list)?
+            && waiting_upload(tx)? != Some("rotate_keys");
         if !list.accepts_after(Some(&pinned.list)) && !lost {
             return rejected("conflicting_list");
         }

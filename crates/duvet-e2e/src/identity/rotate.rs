@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use super::contacts::LIST_ON_SERVER;
 use super::identity::{
     CreatedIdentity, Kept, KeptRotation, create_identity, drop_kept, keep, kept, new_identity,
 };
@@ -174,7 +175,8 @@ pub(crate) fn reset_identity(tx: &mut Tx<'_>) -> Result<CreatedIdentity, Error> 
 ///
 /// The reply is kept until the client confirms its upload (`identity_uploaded`): run again until
 /// then, it's the same rotation ([`rotate_again`]), and only then does it take `gone`, with the
-/// user's list as the server serves it (`served_list`).
+/// user's list as the server serves it (`served_list`). `gone` doesn't shut its devices out against
+/// a server that works with whoever holds them ([`rotate_again`]).
 pub(crate) fn rotate_keys(
     tx: &mut Tx<'_>,
     remove: &[Uuid],
@@ -228,6 +230,8 @@ pub(crate) fn rotate_keys(
     let kept = kept_keys(tx, own.user, 0)?;
     let previous_list = meta_get(tx, DEVICE_LIST)?
         .ok_or_else(|| Error::Internal("the identity has no device list".into()))?;
+    let on_server =
+        meta_get(tx, LIST_ON_SERVER)?.filter(|list| DeviceList::verify(list, &held).is_ok());
     keep_earlier_identity(tx, own.user, &held)?;
     let (created, backup_key) = new_identity(tx, &own, staying)?;
     keep_previous(tx, own.user, &backup_key, &kept)?;
@@ -252,6 +256,7 @@ pub(crate) fn rotate_keys(
                 removed,
                 sender,
                 previous_list,
+                on_server,
             }),
         },
     )?;
@@ -274,9 +279,17 @@ pub(crate) fn rotate_keys(
 /// identity, still at version 1, as the list it replaces never went up and the API takes a new
 /// identity's list only at 1. The server could have this device sign a list without a device that's
 /// there by not serving its certificate, so the client names them to its person first, and the
-/// core takes `gone` only with the proof that case always has, which a server alone can't sign:
-/// `served_list`, the user's list as the server serves it, signed by the identity the rotation
-/// replaced, newer than the list the rotation was made on, and without the devices gone.
+/// core takes `gone` only with the proof that case has while the server never took the rotation,
+/// which a server alone can't sign: `served_list`, the user's list as the server serves it, signed
+/// by the identity the rotation replaced, newer than the newest list the server was known to hold
+/// as the rotation was made (or than the list it was made on, without one), and without the
+/// devices gone.
+///
+/// What `gone` doesn't do is shut out the devices it drops against a server that works with
+/// whoever holds them: the first run sealed the rotation's identity to them, which `gone` keeps,
+/// and such a server can deliver that transfer though its upload was refused. An honest one
+/// doesn't, so against it they're shut out. Only a new identity closes it: once the upload with
+/// `gone` landed, the client offers its person a new key change.
 ///
 /// A device of `gone` that's this one, that the rotation didn't keep as it was made, or that has a
 /// certificate among `certificates` is `bad_command` (`gone`), and so is a served list that names
@@ -348,10 +361,10 @@ fn rotate_again(
         if served.user != own.user {
             return Err(rule("wrong_user"));
         }
-        if served.version <= made_on.version {
+        if served.version <= held_then(rotation, &before, &made_on).version {
             return Err(invalid(
                 "served_list",
-                "the served list isn't newer than the one the key change was made on",
+                "the served list isn't newer than the one the server held when the key change was made",
             ));
         }
         if gone.iter().any(|device| served.contains(*device)) {
@@ -569,14 +582,22 @@ fn hand_over(
 ///   of this device's own keys.
 ///
 /// The identity it replaces is the one this device holds; while a rotation of this device's own
-/// waits for its upload, the one that rotation replaced: the waiting rotation's identity signed
-/// nothing the server has (another device's rotation landed first). Its sender must then be a
-/// device that rotation keeps, with the keys it certified for it, as whoever holds the identity
-/// before (a lost device's holder among them) signs a certificate for any device, on any list. Its
-/// new list may keep no device that rotation removes (`removed_device_listed`), and it may not bring
-/// back the identity it replaces. That holds against whoever holds only devices this device's
-/// person named lost; one who also holds a device the person kept can still send a transfer that
-/// passes, once the server serves their identity.
+/// waits for its upload, the one that rotation replaced. A transfer whose list before the held
+/// identity signed is the exception: the rotation's upload landed, its answer lost, and the
+/// transfer is taken as when none waits. Otherwise another device's rotation landed first, and the
+/// waiting one's identity is one the server never took. Then:
+/// - its sender must be a device that rotation keeps, with the keys it certified for it, as whoever
+///   holds the identity before (a lost device's holder among them) signs a certificate for any
+///   device, on any list;
+/// - its new list may keep no device this device's person took off (`removed_device_listed`): with
+///   that rotation's removal, or with a list of this device's the server never took, which the
+///   rotation was made on;
+/// - and it may not bring back the identity it replaces.
+///
+/// That shuts out whoever holds only devices the rotation removed. It doesn't shut out whoever
+/// also holds a device the person kept, once the server serves their identity, nor a device a
+/// `gone` dropped, against a server that delivers it the rotation's first transfers
+/// ([`rotate_again`]).
 ///
 /// Then this device has the new identity, its certificate, the list and the backup key, keeps its
 /// own backup keys from before with the transfer's, and every group of it is due for `refresh`.
@@ -602,11 +623,6 @@ pub(crate) fn receive_rotation(
         })?
         .try_into()
         .map_err(|_| invalid("identity_key", "the identity key isn't 32 bytes"))?;
-    let waiting = kept(tx)?.and_then(|kept| kept.rotation);
-    let before = match &waiting {
-        Some(rotation) => replaced_by(tx, own.user, rotation)?.0,
-        None => held,
-    };
     let provider = tx.provider();
 
     // The sender's certificate is inside: read it, then open the message as every direct message
@@ -618,6 +634,16 @@ pub(crate) fn receive_rotation(
         own.device,
         message,
     )?)?;
+    // A rotation of its own that waits, with the identity it replaced and the list it was made on,
+    // unless the list before is the held identity's: then its upload landed, its answer lost.
+    let waiting = match kept(tx)?.and_then(|kept| kept.rotation) {
+        Some(rotation) if DeviceList::verify(&claimed.previous_list, &held).is_err() => {
+            let (identity, made_on) = replaced_by(tx, own.user, &rotation)?;
+            Some((rotation, identity, made_on))
+        }
+        _ => None,
+    };
+    let before = waiting.as_ref().map_or(held, |(_, identity, _)| *identity);
     let brought = Identity::from_secret(&claimed.identity).public;
     if brought == held || brought == before {
         return Err(Error::Exists {
@@ -681,12 +707,17 @@ pub(crate) fn receive_rotation(
     if !list.contains(own.device) || !list.contains(sender.device) {
         return Err(rule("device_not_listed"));
     }
-    // Taken, it would put back on this device's list a device its person named lost.
-    let keeps_removed = waiting
-        .as_ref()
-        .is_some_and(|rotation| rotation.removed.iter().any(|device| list.contains(*device)));
-    if keeps_removed {
-        return Err(rule("removed_device_listed"));
+    // Taken, it would put back on this device's list a device its person took off: with the
+    // rotation's removal, or with the list of its own the rotation was made on.
+    if let Some((rotation, _, made_on)) = &waiting {
+        let on_server = held_then(rotation, &before, made_on);
+        let taken_off = |device: &Uuid| {
+            rotation.removed.contains(device)
+                || (on_server.contains(*device) && !made_on.contains(*device))
+        };
+        if list.devices.iter().any(taken_off) {
+            return Err(rule("removed_device_listed"));
+        }
     }
     let certificate = DeviceCertificate::verify(&transfer.certificate, &identity.public)
         .map_err(|_| signature("certificate"))?;
@@ -766,6 +797,17 @@ fn replaced_by(
         .ok_or_else(|| {
             Error::Internal("the identity a waiting rotation replaced isn't kept".into())
         })
+}
+
+/// The newest of the user's lists the server was known to hold as `rotation` was made, under the
+/// identity it replaced (`before`): the one it kept, or the one it was made on, `made_on`, when it
+/// kept none (one made before it kept them, or on a device that never knew the server's).
+fn held_then(rotation: &KeptRotation, before: &[u8; 32], made_on: &DeviceList) -> DeviceList {
+    rotation
+        .on_server
+        .as_deref()
+        .and_then(|list| DeviceList::verify(list, before).ok())
+        .unwrap_or_else(|| made_on.clone())
 }
 
 /// A transfer's payload, read through a scratch buffer that's wiped after.
