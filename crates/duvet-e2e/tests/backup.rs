@@ -2016,3 +2016,73 @@ fn a_message_imported_first_is_the_devices_own_once_its_queue_brings_it() {
     );
     assert_eq!(shown_ids(&mut a2, conversation), [later, first]);
 }
+
+/// A2 changes A's keys on the day, and its change lands. The next day A1, which hasn't taken A2's
+/// transfer, backs the day up under the key from before, then changes the keys itself, and its change
+/// waits. Taking A2's transfer then, A1 builds the day again: the key from before opens only the days
+/// before A2's change, which came a day before A1's own.
+#[test]
+fn a_waiting_change_builds_again_from_the_day_the_earlier_one_replaced_the_key() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let (mut a1, identity) = server.first_device(a);
+    let mut a2 = server.device(a);
+    let mut b1 = server.device(b);
+    for device in [&mut a1, &mut a2, &mut b1] {
+        server.publish(device);
+    }
+    for device in [&mut a1, &mut a2, &mut b1] {
+        server.introduce(device);
+    }
+    ok(&mut a1.core, json!({"cmd": "identity_uploaded"}));
+    let old_key = backup_key_of(a, &identity);
+    a2.core
+        .transaction(|tx| {
+            tx.conn().execute(
+                "INSERT INTO meta (key, value) VALUES ('backup_key', ?1)",
+                [old_key.as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let day = test_day();
+    server.clock.set(day - 12 * HOUR);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Dm, None, &[a, b], false);
+    let command = server.create_group(conversation);
+    server.commit(&mut a1, conversation, command).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut a2, &mut b1]);
+
+    server.clock.set(day + HOUR);
+    say(&mut server, &mut a1, conversation, "antes de los cambios");
+    let certificates = server.observed(a)["certificates"].clone();
+    server.clock.set(day + 2 * HOUR);
+    let theirs = ok(
+        &mut a2.core,
+        json!({"cmd": "rotate_keys", "remove": [], "certificates": certificates}),
+    );
+    server.take_identity(a, &theirs);
+
+    server.clock.set(day + DAY_MS + HOUR);
+    let the_day = utc_day(day);
+    back_up(&mut a1, conversation, &the_day);
+    assert_eq!(due(&mut a1), []);
+    ok(
+        &mut a1.core,
+        json!({"cmd": "rotate_keys", "remove": [], "certificates": certificates}),
+    );
+    let inbox = server.inbox(a1.id);
+    ok(
+        &mut a1.core,
+        json!({
+            "cmd": "receive_direct",
+            "message": b64(&inbox[0]),
+            "identity_key": theirs["identity_key"],
+        }),
+    );
+    let due_days: Vec<(Uuid, String)> = due(&mut a1)
+        .into_iter()
+        .map(|(conversation, day, _)| (conversation, day))
+        .collect();
+    assert_eq!(due_days, [(conversation, the_day)]);
+}

@@ -57,7 +57,9 @@ pub(super) struct Kept {
 }
 
 /// A rotation's devices it removed, in order, and what its transfers carry of the identity
-/// before: the rotating device's certificate and the user's list.
+/// before: the rotating device's certificate and the user's list, which the rotation was made on.
+/// And the user's list the server was known to hold then, when this device knew one: the rotation
+/// may have been made on a newer list of this device's, which the server never took.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct KeptRotation {
@@ -66,12 +68,17 @@ pub(super) struct KeptRotation {
     pub(super) sender: Vec<u8>,
     #[serde(with = "b64")]
     pub(super) previous_list: Vec<u8>,
+    #[serde(default, with = "b64::option", skip_serializing_if = "Option::is_none")]
+    pub(super) on_server: Option<Vec<u8>>,
 }
 
 /// Keeps what an identity command made for the server, in place of anything kept before.
 pub(super) fn keep(tx: &Tx<'_>, kept: &Kept) -> Result<(), Error> {
     let rotation = kept.rotation.as_ref().map_or(0, |rotation| {
-        rotation.sender.len() + rotation.previous_list.len() + rotation.removed.len() * 40
+        rotation.sender.len()
+            + rotation.previous_list.len()
+            + rotation.on_server.as_ref().map_or(0, Vec::len)
+            + rotation.removed.len() * 40
     });
     let blobs = kept.created.certificate.len()
         + kept.created.device_list.len()
@@ -118,6 +125,14 @@ pub(crate) fn waiting_upload(tx: &Tx<'_>) -> Result<Option<&'static str>, Error>
             "create_identity"
         }
     }))
+}
+
+/// The devices a rotation that waits for `identity_uploaded` removes, in order, which it takes
+/// run again.
+pub(crate) fn waiting_remove(tx: &Tx<'_>) -> Result<Option<Vec<Uuid>>, Error> {
+    Ok(kept(tx)?
+        .and_then(|kept| kept.rotation)
+        .map(|rotation| rotation.removed))
 }
 
 /// Drops what the last identity command kept for its upload, if anything: whether it did.

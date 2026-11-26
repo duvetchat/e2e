@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use super::contacts::LIST_ON_SERVER;
 use super::identity::{
     CreatedIdentity, Kept, KeptRotation, create_identity, drop_kept, keep, kept, new_identity,
 };
@@ -173,11 +174,15 @@ pub(crate) fn reset_identity(tx: &mut Tx<'_>) -> Result<CreatedIdentity, Error> 
 /// on its keys, is `bad_command` (`certificates`).
 ///
 /// The reply is kept until the client confirms its upload (`identity_uploaded`): run again until
-/// then, it's the same rotation ([`rotate_again`]).
+/// then, it's the same rotation ([`rotate_again`]), and only then does it take `gone`, with the
+/// user's list as the server serves it (`served_list`). `gone` doesn't shut its devices out against
+/// a server that works with whoever holds them ([`rotate_again`]).
 pub(crate) fn rotate_keys(
     tx: &mut Tx<'_>,
     remove: &[Uuid],
     certificates: &[Vec<u8>],
+    gone: &[Uuid],
+    served_list: Option<&[u8]>,
 ) -> Result<Rotated, Error> {
     let own = tx.own_device()?;
     let Some(held) = tx.own_identity_key()? else {
@@ -194,7 +199,13 @@ pub(crate) fn rotate_keys(
     if let Some(waiting) = kept(tx)?
         && waiting.rotation.is_some()
     {
-        return rotate_again(tx, &own, &held, remove, certificates, waiting);
+        return rotate_again(tx, &own, remove, certificates, gone, served_list, waiting);
+    }
+    if !gone.is_empty() {
+        return Err(invalid(
+            "gone",
+            "only a key change that waits for its upload takes gone",
+        ));
     }
     if remove.iter().any(|device| !current.contains(*device)) {
         return Err(not_found("device"));
@@ -219,6 +230,8 @@ pub(crate) fn rotate_keys(
     let kept = kept_keys(tx, own.user, 0)?;
     let previous_list = meta_get(tx, DEVICE_LIST)?
         .ok_or_else(|| Error::Internal("the identity has no device list".into()))?;
+    let on_server =
+        meta_get(tx, LIST_ON_SERVER)?.filter(|list| DeviceList::verify(list, &held).is_ok());
     keep_earlier_identity(tx, own.user, &held)?;
     let (created, backup_key) = new_identity(tx, &own, staying)?;
     keep_previous(tx, own.user, &backup_key, &kept)?;
@@ -243,6 +256,7 @@ pub(crate) fn rotate_keys(
                 removed,
                 sender,
                 previous_list,
+                on_server,
             }),
         },
     )?;
@@ -259,14 +273,41 @@ pub(crate) fn rotate_keys(
 /// certificates the server serves have them, signed by the identity this device holds or, the
 /// upload never having landed, by one it kept from before. Run with other devices to remove, it's
 /// `bad_command` (`remove`): the rotation made is the one that waits.
+///
+/// `gone` are devices its list keeps that the server no longer has, as another device took them
+/// off the list and the API took that: it signs its list again without them, under the same
+/// identity, still at version 1, as the list it replaces never went up and the API takes a new
+/// identity's list only at 1. The server could have this device sign a list without a device that's
+/// there by not serving its certificate, so the client names them to its person first, and the
+/// core takes `gone` only with the proof that case has while the server never took the rotation,
+/// which a server alone can't sign: `served_list`, the user's list as the server serves it, signed
+/// by the identity the rotation replaced, newer than the newest list the server was known to hold
+/// as the rotation was made (or than the list it was made on, without one), and without the
+/// devices gone.
+///
+/// What `gone` doesn't do is shut out the devices it drops against a server that works with
+/// whoever holds them: the first run sealed the rotation's identity to them, which `gone` keeps,
+/// and such a server can deliver that transfer though its upload was refused. An honest one
+/// doesn't, so against it they're shut out. Only a new identity closes it: once the upload with
+/// `gone` landed, the client offers its person a new key change.
+///
+/// A device of `gone` that's this one, that the rotation didn't keep as it was made, or that has a
+/// certificate among `certificates` is `bad_command` (`gone`), and so is a served list that names
+/// one; a missing or older served list is `bad_command` (`served_list`), and one the identity
+/// before didn't sign `invalid_signature` (`device_list`). Run again after its answer was lost, a
+/// `gone` whose devices are off the rotation's list already answers as its first run did.
 fn rotate_again(
     tx: &Tx<'_>,
     own: &OwnDevice,
-    held: &[u8; 32],
     remove: &[Uuid],
     certificates: &[Vec<u8>],
-    waiting: Kept,
+    gone: &[Uuid],
+    served_list: Option<&[u8]>,
+    mut waiting: Kept,
 ) -> Result<Rotated, Error> {
+    let held = &tx
+        .own_identity_key()?
+        .ok_or_else(|| not_found("identity"))?;
     let rotation = waiting
         .rotation
         .as_ref()
@@ -280,9 +321,71 @@ fn rotate_again(
             "a rotation waits for its upload: run it again as it was, or confirm its upload first",
         ));
     }
-    let staying = DeviceList::verify(&waiting.created.device_list, held)
+    let mut staying = DeviceList::verify(&waiting.created.device_list, held)
         .map_err(|_| Error::Internal("the kept rotation's list doesn't verify".into()))?
         .devices;
+    if !gone.is_empty() {
+        let (before, made_on) = replaced_by(tx, own.user, rotation)?;
+        for device in gone {
+            let served = certificates.iter().any(|signed| {
+                DeviceCertificate::read_unverified(signed)
+                    .is_ok_and(|certificate| certificate.device == *device)
+            });
+            if *device == own.device {
+                return Err(invalid(
+                    "gone",
+                    "the device that changes the keys stays on the list",
+                ));
+            }
+            // As the rotation was made: a run after one whose answer was lost finds it off already.
+            if !made_on.contains(*device) || rotation.removed.contains(device) {
+                return Err(invalid(
+                    "gone",
+                    "a device that's gone is one the waiting key change keeps",
+                ));
+            }
+            if served {
+                return Err(invalid(
+                    "gone",
+                    "a device whose certificate the server serves isn't gone",
+                ));
+            }
+        }
+        let served = served_list.ok_or_else(|| {
+            invalid(
+                "served_list",
+                "a key change run again with gone takes the user's list as the server serves it",
+            )
+        })?;
+        let served = DeviceList::verify(served, &before).map_err(|_| signature("device_list"))?;
+        if served.user != own.user {
+            return Err(rule("wrong_user"));
+        }
+        if served.version <= held_then(rotation, &before, &made_on).version {
+            return Err(invalid(
+                "served_list",
+                "the served list isn't newer than the one the server held when the key change was made",
+            ));
+        }
+        if gone.iter().any(|device| served.contains(*device)) {
+            return Err(invalid(
+                "gone",
+                "a device that's gone isn't on the user's list as the server serves it",
+            ));
+        }
+        if staying.iter().any(|device| gone.contains(device)) {
+            staying.retain(|device| !gone.contains(device));
+            let identity = tx
+                .own_identity()?
+                .ok_or_else(|| Error::Internal("the new identity isn't stored".into()))?;
+            let list = DeviceList::new(own.user, identity.public, 1, staying.clone())
+                .sign(&identity.signer)
+                .map_err(|_| Error::Internal("the identity couldn't sign".into()))?;
+            meta_put(tx, DEVICE_LIST, &list)?;
+            waiting.created.device_list = list;
+            keep(tx, &waiting)?;
+        }
+    }
     let mut signers = vec![*held];
     signers.extend(tx.earlier_identities_of(own.user)?);
     let keys = staying_keys(own, &signers, &staying, certificates)?;
@@ -469,18 +572,39 @@ fn hand_over(
 
 /// A rotation's transfer, which another device of the user sent this one as it changed the keys,
 /// as `receive_direct` takes it. It counts only if it holds up:
-/// - its sender's certificate, which rides in it, is one the identity this device holds signed,
-///   for a device this device's list names, and the sender signed the message with its key;
+/// - its sender's certificate, which rides in it, is one the identity it replaces signed, for a
+///   device the user's list under that identity names (while a rotation waits, see below), and the
+///   sender signed the message with its key;
 /// - the new identity is the one the server serves for the user now, `served`: a thief holding a
 ///   lost device holds the identity before too, and could make a rotation of its own, and the
 ///   server, which ends the lost device's sessions, decides which one counts;
 /// - the new identity signs its list, which names this device and the sender, and a certificate
 ///   of this device's own keys.
 ///
+/// The identity it replaces is the one this device holds; while a rotation of this device's own
+/// waits for its upload, the one that rotation replaced. A transfer whose list before the held
+/// identity signed is the exception: the rotation's upload landed, its answer lost, and the
+/// transfer is taken as when none waits. Otherwise another device's rotation landed first, and the
+/// waiting one's identity is one the server never took. Then:
+/// - its sender must be a device that rotation keeps, with the keys it certified for it, as whoever
+///   holds the identity before (a lost device's holder among them) signs a certificate for any
+///   device, on any list;
+/// - its new list may keep no device this device's person took off (`removed_device_listed`): with
+///   that rotation's removal, or with a list of this device's the server never took, which the
+///   rotation was made on;
+/// - and it may not bring back the identity it replaces.
+///
+/// That shuts out whoever holds only devices the rotation removed. It doesn't shut out whoever
+/// also holds a device the person kept, once the server serves their identity, nor a device a
+/// `gone` dropped, against a server that delivers it the rotation's first transfers
+/// ([`rotate_again`]).
+///
 /// Then this device has the new identity, its certificate, the list and the backup key, keeps its
 /// own backup keys from before with the transfer's, and every group of it is due for `refresh`.
 /// What an identity command of its own kept for its upload goes: it was made for the identity
-/// replaced. A transfer it took already is `exists`.
+/// replaced. A waiting rotation's identity isn't kept as one the user had before, but its backup
+/// key is, with the one before it: what this device sealed under either moves to the new key. A
+/// transfer it took already is `exists`.
 pub(crate) fn receive_rotation(
     tx: &Tx<'_>,
     message: &[u8],
@@ -510,36 +634,54 @@ pub(crate) fn receive_rotation(
         own.device,
         message,
     )?)?;
-    if Identity::from_secret(&claimed.identity).public == held {
+    // A rotation of its own that waits, with the identity it replaced and the list it was made on,
+    // unless the list before is the held identity's: then its upload landed, its answer lost.
+    let waiting = match kept(tx)?.and_then(|kept| kept.rotation) {
+        Some(rotation) if DeviceList::verify(&claimed.previous_list, &held).is_err() => {
+            let (identity, made_on) = replaced_by(tx, own.user, &rotation)?;
+            Some((rotation, identity, made_on))
+        }
+        _ => None,
+    };
+    let before = waiting.as_ref().map_or(held, |(_, identity, _)| *identity);
+    let brought = Identity::from_secret(&claimed.identity).public;
+    if brought == held || brought == before {
         return Err(Error::Exists {
             what: "identity".into(),
         });
     }
-    // The user's list before the change, as the sending device had it: newer than this device's,
-    // it's taken as `observe_user` takes one (a device set up while this one was away). The
-    // identity this device holds signed it; a refusal further on undoes it with the rest.
-    let carried =
-        DeviceList::verify(&claimed.previous_list, &held).map_err(|_| signature("device_list"))?;
+    // The user's list before the change, as the sending device had it.
+    let carried = DeviceList::verify(&claimed.previous_list, &before)
+        .map_err(|_| signature("device_list"))?;
     if carried.user != own.user {
         return Err(rule("wrong_user"));
     }
-    let newer = tx
-        .device_list_of(own.user)?
-        .is_none_or(|current| carried.version > current.version);
-    if newer {
-        meta_put(tx, DEVICE_LIST, &claimed.previous_list)?;
-    }
-    let sender =
-        DeviceCertificate::verify(&claimed.sender, &held).map_err(|_| signature("certificate"))?;
+    let sender = DeviceCertificate::verify(&claimed.sender, &before)
+        .map_err(|_| signature("certificate"))?;
     if sender.user != own.user {
         return Err(rule("wrong_user"));
     }
     if sender.device != from || sender.device == own.device {
         return Err(rule("wrong_device"));
     }
-    let listed = tx
-        .device_list_of(own.user)?
-        .is_some_and(|list| list.contains(sender.device));
+    let listed = match &waiting {
+        // A device the waiting rotation keeps, with the keys it certified: whoever holds the
+        // identity before signs a certificate for any device.
+        Some(_) => tx
+            .certificate_of(own.user, sender.device)?
+            .and_then(|signed| DeviceCertificate::verify(&signed, &held).ok())
+            .is_some_and(|certified| {
+                certified.signature_key == sender.signature_key
+                    && certified.hpke_key == sender.hpke_key
+            }),
+        // On this device's list, or the sending device's when newer (a device set up while this one
+        // was away).
+        None => match tx.device_list_of(own.user)? {
+            Some(list) if carried.version <= list.version => list,
+            _ => carried,
+        }
+        .contains(sender.device),
+    };
     if !listed {
         return Err(rule("device_not_listed"));
     }
@@ -565,6 +707,18 @@ pub(crate) fn receive_rotation(
     if !list.contains(own.device) || !list.contains(sender.device) {
         return Err(rule("device_not_listed"));
     }
+    // Taken, it would put back on this device's list a device its person took off: with the
+    // rotation's removal, or with the list of its own the rotation was made on.
+    if let Some((rotation, _, made_on)) = &waiting {
+        let on_server = held_then(rotation, &before, made_on);
+        let taken_off = |device: &Uuid| {
+            rotation.removed.contains(device)
+                || (on_server.contains(*device) && !made_on.contains(*device))
+        };
+        if list.devices.iter().any(taken_off) {
+            return Err(rule("removed_device_listed"));
+        }
+    }
     let certificate = DeviceCertificate::verify(&transfer.certificate, &identity.public)
         .map_err(|_| signature("certificate"))?;
     if certificate.user != own.user {
@@ -578,9 +732,14 @@ pub(crate) fn receive_rotation(
 
     // The backup keys from before: this device's own, then the transfer's it hasn't, each once, with
     // the earliest day either says it was replaced on (this device's current key, replaced now as it
-    // takes the transfer, was replaced when the rotation was made).
+    // takes the transfer, was replaced when the rotation was made). While a rotation of its own
+    // waits, the key the server knew it to hold is the one before that rotation's: it sealed under
+    // it until then, and under the rotation's after.
     let mut kept = kept_keys(tx, own.user, transfer.previous_backup_keys.len())?;
-    let replaced = kept.len().checked_sub(1);
+    let replaced = match kept.len() {
+        len if waiting.is_some() && len > 1 => Some(len - 2),
+        len => len.checked_sub(1),
+    };
     for earlier in &transfer.previous_backup_keys {
         match kept.iter_mut().find(|kept| *kept.key == *earlier.key) {
             Some(kept) => kept.until = kept.until.min(earlier.until),
@@ -606,7 +765,7 @@ pub(crate) fn receive_rotation(
     // replaced now: run again, it would hand that one out.
     drop_kept(tx)?;
     keep_previous(tx, own.user, &*transfer.backup_key, &kept)?;
-    keep_earlier_identity(tx, own.user, &held)?;
+    keep_earlier_identity(tx, own.user, &before)?;
     keep_certificates(
         tx,
         own.user,
@@ -618,6 +777,37 @@ pub(crate) fn receive_rotation(
         identity_key: identity.public.to_vec(),
         certificate: transfer.certificate,
     })
+}
+
+/// The identity that `rotation`, this device's own waiting for its upload, replaced, which
+/// `keep_earlier_identity` kept as it was made, with the user's list under it as this device had it
+/// then: the earlier identity that signs the rotation's `previous_list`.
+fn replaced_by(
+    tx: &Tx<'_>,
+    user: Uuid,
+    rotation: &KeptRotation,
+) -> Result<([u8; 32], DeviceList), Error> {
+    tx.earlier_identities_of(user)?
+        .into_iter()
+        .find_map(|identity| {
+            DeviceList::verify(&rotation.previous_list, &identity)
+                .ok()
+                .map(|list| (identity, list))
+        })
+        .ok_or_else(|| {
+            Error::Internal("the identity a waiting rotation replaced isn't kept".into())
+        })
+}
+
+/// The newest of the user's lists the server was known to hold as `rotation` was made, under the
+/// identity it replaced (`before`): the one it kept, or the one it was made on, `made_on`, when it
+/// kept none (one made before it kept them, or on a device that never knew the server's).
+fn held_then(rotation: &KeptRotation, before: &[u8; 32], made_on: &DeviceList) -> DeviceList {
+    rotation
+        .on_server
+        .as_deref()
+        .and_then(|list| DeviceList::verify(list, before).ok())
+        .unwrap_or_else(|| made_on.clone())
 }
 
 /// A transfer's payload, read through a scratch buffer that's wiped after.
