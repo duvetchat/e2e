@@ -193,8 +193,10 @@ struct Bytes32(#[serde(with = "serde_bytes")] [u8; 32]);
 /// whether the person typed here that approver's code.
 #[derive(Serialize, Deserialize)]
 struct Attempt {
-    qr: Secret,
-    secret: Secret,
+    // Boxed, as the transfers' are: held by value across the derived visitor's loop, two secrets
+    // become loose bytes, where LLVM 23's SLP vectorizer can loop for x86-64 without SSE4.1 (#48).
+    qr: Box<Secret>,
+    secret: Box<Secret>,
     #[serde(with = "serde_bytes")]
     key: [u8; 32],
     #[serde(with = "serde_bytes")]
@@ -360,8 +362,8 @@ pub(crate) fn approval_begin(tx: &mut Tx<'_>) -> Result<Begun, Error> {
         hash,
     })?;
     let attempt = Attempt {
-        qr: qr_secret,
-        secret,
+        qr: Box::new(qr_secret),
+        secret: Box::new(secret),
         key,
         nonce,
         answer: None,
