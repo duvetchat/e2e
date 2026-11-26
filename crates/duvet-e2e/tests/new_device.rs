@@ -527,6 +527,7 @@ fn approval_by_code() {
     // device's certificate and the next list, and the transfer for the new device's inbox. On the
     // new device, they type the code the approver shows.
     let approved = ok(&mut a1.core, confirm(code));
+    assert_eq!(approved["device_id"], json!(n.id));
     server.take_device(a, &approved["certificate"], &approved["device_list"]);
     server.post(n.id, bytes(&approved["transfer"]));
     let inbox = server.inbox(n.id);
@@ -946,8 +947,9 @@ fn approval_by_qr() {
     assert!(!commitment.windows(32).any(|window| window == qr.key));
 
     // The approver scans it: the new device's certificate and the next list for the server, and
-    // the transfer for the new device.
+    // the transfer for the new device, which the reply names: the client can't read the QR.
     let approved = ok(&mut a1.core, from_qr(&begun["qr"]));
+    assert_eq!(approved["device_id"], json!(n.id));
     let identity_key = key32(&bytes(&identity["identity_key"]));
     let certificate =
         DeviceCertificate::verify(&bytes(&approved["certificate"]), &identity_key).unwrap();

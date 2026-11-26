@@ -607,8 +607,11 @@ pub(crate) fn approval_check(tx: &mut Tx<'_>, request: ApprovalCheck) -> Result<
     Ok(Checked { code })
 }
 
+/// What an approval answers: the device it approved, whose inbox the transfer goes to (a client
+/// can't read a QR's encoding), its certificate and the user's next list for the server.
 #[derive(Serialize)]
 pub(crate) struct Approved {
+    device_id: Uuid,
     #[serde(with = "b64")]
     certificate: Vec<u8>,
     #[serde(with = "b64")]
@@ -774,6 +777,7 @@ fn approve(tx: &Tx<'_>, asked: &Asked, key: &[u8; 32]) -> Result<Approved, Error
         &payload,
     )?;
     Ok(Approved {
+        device_id: asked.device,
         certificate,
         device_list,
         transfer,
