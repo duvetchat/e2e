@@ -40,6 +40,40 @@ void main() {
     await (await DuvetE2e.open(config, key)).close();
   });
 
+  test('destroy deletes a closed database and the files beside it, and leaves its lock', () async {
+    final path = database();
+    final config = jsonEncode({'path': path});
+    final core = await DuvetE2e.open(config, key);
+    await expectLater(
+      DuvetE2e.destroy(config),
+      throwsA(isA<DuvetE2eException>().having((error) => error.code, 'code', 'locked')),
+    );
+    expect(File(path).existsSync(), isTrue);
+    await core.close();
+
+    const beside = ['', '-journal', '-wal', '-shm'];
+    for (final suffix in beside.skip(1)) {
+      File('$path$suffix').writeAsStringSync("a crash's $suffix");
+    }
+    await DuvetE2e.destroy(config);
+    for (final suffix in beside) {
+      expect(File('$path$suffix').existsSync(), isFalse, reason: 'core.db$suffix');
+    }
+    expect(File('$path.lock').existsSync(), isTrue);
+
+    // Nothing is left to delete, and an open makes a new database.
+    await DuvetE2e.destroy(config);
+    final fresh = await DuvetE2e.open(config, key);
+    final reply = jsonDecode(await fresh.handle(status)) as Map<String, dynamic>;
+    expect(reply['ok']['device_id'], isNull);
+    await fresh.close();
+
+    await expectLater(
+      DuvetE2e.destroy('{}'),
+      throwsA(isA<DuvetE2eException>().having((error) => error.code, 'code', 'bad_command')),
+    );
+  });
+
   test('a key that is not 32 bytes is bad_command', () async {
     await expectLater(
       DuvetE2e.open(jsonEncode({'path': database()}), Uint8List(31)),
