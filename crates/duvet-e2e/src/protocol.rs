@@ -66,6 +66,9 @@ pub(crate) enum Command {
         /// Run again while the rotation waits: devices it keeps that the server no longer has.
         #[serde(default)]
         gone: Vec<Uuid>,
+        /// With `gone`: the user's list as the server serves it, which proves them gone.
+        #[serde(default, with = "b64::option")]
+        served_list: Option<Vec<u8>>,
     },
 
     // Attachments' parts.
@@ -172,7 +175,14 @@ pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error
             remove,
             certificates,
             gone,
-        } => reply(identity::rotate_keys(tx, &remove, &certificates, &gone)?),
+            served_list,
+        } => reply(identity::rotate_keys(
+            tx,
+            &remove,
+            &certificates,
+            &gone,
+            served_list.as_deref(),
+        )?),
 
         Command::AttachmentKey => reply(parts::attachment_key(tx)?),
         Command::AttachmentEncrypt(part) => reply(parts::attachment_encrypt(part)?),

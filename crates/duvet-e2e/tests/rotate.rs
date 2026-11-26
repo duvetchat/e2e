@@ -1747,37 +1747,186 @@ fn a_waiting_key_change_takes_no_transfer_from_a_device_set_up_meanwhile() {
     assert_eq!(identity_key(&mut a3.core), served);
 }
 
-/// A1's change without A4, which keeps A2 and A3, waits for its upload. Meanwhile A3, still on the
-/// identity before, takes A2 off A's list, and the server deletes A2's certificates: every run of
-/// A1's change is refused, and its upload would be too. Run again with A2 gone, it signs its list
-/// again without A2, under the same identity, with the same recovery key and blobs: an upload the
-/// server takes, whose list names only devices the server has. A3 takes its transfer.
+/// While A1's change without A2 waits, whoever holds A2 changes the keys, keeping A1, and its change
+/// lands. It sends A1 a transfer that says it's A3's, with a certificate for A3 that it signs under
+/// the identity before with A2's own keys: anyone who holds that identity signs one for any device.
+/// A1 takes a sender only with the keys its change certified for it, and refuses this one. Its change
+/// still waits.
 #[test]
-fn a_waiting_key_change_runs_again_without_the_devices_gone() {
+fn a_waiting_key_change_takes_no_sender_with_keys_it_did_not_certify() {
     let mut server = FakeServer::new();
     let a = new_id();
     let mut a1 = server.device(a);
-    let a2 = server.device(a);
-    let mut a3 = server.device(a);
-    let a4 = server.device(a);
-    meet(&mut server, &mut [&mut a1, &mut a3]);
-    let old_key = identity_key(&mut a1.core);
-    let made = ok(&mut a1.core, rotating(&server, a, &[a4.id]));
+    let mut a2 = server.device(a);
+    let a3 = server.device(a);
+    meet(&mut server, &mut [&mut a1, &mut a2]);
+    let served = server.observed(a);
+    let old_identity = signer(&held_secret(&mut a2));
+    let mine = ok(&mut a1.core, rotating(&server, a, &[a2.id]));
+    let theirs = ok(&mut a2.core, rotating(&server, a, &[]));
+    server.take_identity(a, &theirs);
+    let new_key = key(&theirs["identity_key"]);
 
+    let a1_certificate = theirs["transfers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|handed| handed["device_id"] == json!(a1.id))
+        .map(|handed| bytes(&handed["certificate"]))
+        .unwrap();
+    let a1_keys = DeviceCertificate::read_unverified(&served_certificate(&served, a1.id)).unwrap();
+    let a1_hpke: [u8; 32] = a1_keys.hpke_key.as_slice().try_into().unwrap();
+    let a2_device = a2.rolled_back(|tx| tx.own_device());
+    let posing = DeviceCertificate::new(
+        a,
+        a3.id,
+        a2_device.signer.public().try_into().unwrap(),
+        a2_device.hpke.public.as_slice().try_into().unwrap(),
+        1,
+    )
+    .sign(&old_identity)
+    .unwrap();
+    let payload = TransferPayload {
+        v: 1,
+        identity: opened(a, &theirs).1.to_vec(),
+        backup_key: vec![3; 32],
+        previous_backup_keys: Vec::new(),
+        certificate: a1_certificate,
+        device_list: bytes(&theirs["device_list"]),
+        previous_list: bytes(&served["device_list"]),
+        sender: posing,
+    };
+    let mut encoded = Vec::new();
+    ciborium::into_writer(&payload, &mut encoded).unwrap();
+    let forged = a2.rolled_back(|tx| {
+        let own = tx.own_device()?;
+        DirectMessage::seal(
+            tx.provider(),
+            &own.signer,
+            a3.id,
+            a1.id,
+            &a1_hpke,
+            "rotation.transfer",
+            &encoded,
+        )
+    });
+    let refused = error(&mut a1.core, receiving(&forged, &new_key));
+    assert_eq!(
+        (&refused["code"], &refused["rule"]),
+        (&json!("rule_violation"), &json!("device_not_listed"))
+    );
+    assert_eq!(identity_key(&mut a1.core), key(&mine["identity_key"]));
+    assert_eq!(
+        ok(&mut a1.core, json!({"cmd": "status"}))["waiting_upload"],
+        "rotate_keys"
+    );
+}
+
+/// While A1's change without A3 waits, A2 changes the keys keeping everyone, and its change lands.
+/// A1 takes no transfer whose new list keeps a device its own change removes: it would be back on a
+/// list with the device its person named lost (`removed_device_listed`). Its change still waits.
+#[test]
+fn a_waiting_key_change_takes_no_list_that_keeps_a_device_it_removes() {
+    let mut server = FakeServer::new();
+    let a = new_id();
+    let mut a1 = server.device(a);
+    let mut a2 = server.device(a);
+    let a3 = server.device(a);
+    meet(&mut server, &mut [&mut a1, &mut a2]);
+    let mine = ok(&mut a1.core, rotating(&server, a, &[a3.id]));
+    let theirs = ok(&mut a2.core, rotating(&server, a, &[]));
+    server.take_identity(a, &theirs);
+    let transfer = server.inbox(a1.id).remove(0);
+    let refused = error(
+        &mut a1.core,
+        receiving(&transfer, &key(&theirs["identity_key"])),
+    );
+    assert_eq!(
+        (&refused["code"], &refused["rule"]),
+        (&json!("rule_violation"), &json!("removed_device_listed"))
+    );
+    assert_eq!(identity_key(&mut a1.core), key(&mine["identity_key"]));
+    assert_eq!(
+        ok(&mut a1.core, json!({"cmd": "status"}))["waiting_upload"],
+        "rotate_keys"
+    );
+}
+
+/// A1's change without A4, which keeps A2 and A3, waiting for its upload, after A3, still on the
+/// identity before, took A2 off A's list, which the server took and deleted A2's certificates.
+struct Gone {
+    server: FakeServer,
+    a: Uuid,
+    a1: TestDevice,
+    a3: TestDevice,
+    a2: Uuid,
+    a4: Uuid,
+    /// A1's change as it was made.
+    made: Value,
+    /// A's list as the server served it when A1 made its change.
+    list_then: Value,
+}
+
+fn a_device_gone_meanwhile() -> Gone {
+    let mut server = FakeServer::new();
+    let a = new_id();
+    let mut a1 = server.device(a);
+    let a2 = server.device(a).id;
+    let mut a3 = server.device(a);
+    let a4 = server.device(a).id;
+    meet(&mut server, &mut [&mut a1, &mut a3]);
+    let list_then = server.observed(a)["device_list"].clone();
+    let made = ok(&mut a1.core, rotating(&server, a, &[a4]));
     let list = ok(
         &mut a3.core,
-        json!({"cmd": "sign_device_list", "remove": [a2.id]}),
+        json!({"cmd": "sign_device_list", "remove": [a2]}),
     );
     server.take_list(a, &list["device_list"]);
-    let stuck = error(&mut a1.core, rotating(&server, a, &[a4.id]));
+    Gone {
+        server,
+        a,
+        a1,
+        a3,
+        a2,
+        a4,
+        made,
+        list_then,
+    }
+}
+
+/// `rotate_keys` run again with `gone`, with the certificates and the list of `user` the server
+/// serves.
+fn rotating_without(server: &FakeServer, user: Uuid, remove: &[Uuid], gone: &[Uuid]) -> Value {
+    let mut command = rotating(server, user, remove);
+    command["gone"] = json!(gone);
+    command["served_list"] = server.observed(user)["device_list"].clone();
+    command
+}
+
+/// A1's change waits after A2 was taken off elsewhere (`a_device_gone_meanwhile`): every run of it is
+/// refused, and its upload would be too. Run again with A2 gone, it signs its list again without A2,
+/// under the same identity, with the same recovery key and blobs: an upload the server takes, whose
+/// list names only devices the server has. A3 takes its transfer.
+#[test]
+fn a_waiting_key_change_runs_again_without_the_devices_gone() {
+    let Gone {
+        mut server,
+        a,
+        mut a1,
+        mut a3,
+        a2,
+        a4,
+        made,
+        ..
+    } = a_device_gone_meanwhile();
+    let old_key = identity_key(&mut a3.core);
+    let stuck = error(&mut a1.core, rotating(&server, a, &[a4]));
     assert_eq!(
         (&stuck["code"], &stuck["field"]),
         (&json!("bad_command"), &json!("certificates"))
     );
 
-    let mut again = rotating(&server, a, &[a4.id]);
-    again["gone"] = json!([a2.id]);
-    let rotated = ok(&mut a1.core, again);
+    let rotated = ok(&mut a1.core, rotating_without(&server, a, &[a4], &[a2]));
     for field in [
         "identity_key",
         "certificate",
@@ -1807,7 +1956,7 @@ fn a_waiting_key_change_runs_again_without_the_devices_gone() {
     assert_eq!(status["device_list"], rotated["device_list"]);
 
     // Run again as it was, it's that change.
-    let plain = ok(&mut a1.core, rotating(&server, a, &[a4.id]));
+    let plain = ok(&mut a1.core, rotating(&server, a, &[a4]));
     assert_eq!(plain["device_list"], rotated["device_list"]);
 
     server.take_identity(a, &rotated);
@@ -1815,6 +1964,88 @@ fn a_waiting_key_change_runs_again_without_the_devices_gone() {
     let transfer = server.inbox(a3.id).pop().expect("A3's transfer");
     ok(&mut a3.core, receiving(&transfer, &new_key));
     assert_eq!(identity_key(&mut a3.core), new_key);
+}
+
+/// `gone` comes with its proof: A's list as the server serves it, under the identity A1's change
+/// replaced, newer than the list that change was made on, and without the devices gone. The case
+/// `gone` is for always has one, as another device took them off with such a list, and a server
+/// alone can't sign one. Without it, or with one that doesn't hold, A1's change stays as it was.
+#[test]
+fn gone_takes_the_served_list_that_proves_it() {
+    let Gone {
+        server,
+        a,
+        mut a1,
+        mut a3,
+        a2,
+        a4,
+        made,
+        list_then,
+    } = a_device_gone_meanwhile();
+    let mut unproved = rotating_without(&server, a, &[a4], &[a2]);
+    unproved.as_object_mut().unwrap().remove("served_list");
+    let mut older = rotating_without(&server, a, &[a4], &[a2]);
+    older["served_list"] = list_then;
+    for command in [unproved, older] {
+        let refused = error(&mut a1.core, command);
+        assert_eq!(
+            (&refused["code"], &refused["field"]),
+            (&json!("bad_command"), &json!("served_list"))
+        );
+    }
+
+    let mut other_identity = rotating_without(&server, a, &[a4], &[a2]);
+    other_identity["served_list"] = made["device_list"].clone();
+    let refused = error(&mut a1.core, other_identity);
+    assert_eq!(
+        (&refused["code"], &refused["what"]),
+        (&json!("invalid_signature"), &json!("device_list"))
+    );
+
+    // Newer and under the identity before, but naming A2: whoever holds that identity signs any.
+    let old_key = identity_key(&mut a3.core);
+    let still_there = DeviceList::new(a, old_key, 9, vec![a1.id, a2, a3.id, a4])
+        .sign(&signer(&held_secret(&mut a3)))
+        .unwrap();
+    let mut naming = rotating_without(&server, a, &[a4], &[a2]);
+    naming["served_list"] = json!(b64(&still_there));
+    let refused = error(&mut a1.core, naming);
+    assert_eq!(
+        (&refused["code"], &refused["field"]),
+        (&json!("bad_command"), &json!("gone"))
+    );
+
+    let status = ok(&mut a1.core, json!({"cmd": "status"}));
+    assert_eq!(status["device_list"], made["device_list"]);
+    let rotated = ok(&mut a1.core, rotating_without(&server, a, &[a4], &[a2]));
+    assert_ne!(rotated["device_list"], made["device_list"]);
+}
+
+/// `gone` run again after its answer was lost answers as its first run did: the change's list lacks
+/// those devices already, and isn't signed again.
+#[test]
+fn gone_run_again_answers_as_its_first_run() {
+    let Gone {
+        server,
+        a,
+        mut a1,
+        a2,
+        a4,
+        ..
+    } = a_device_gone_meanwhile();
+    let first = ok(&mut a1.core, rotating_without(&server, a, &[a4], &[a2]));
+    let again = ok(&mut a1.core, rotating_without(&server, a, &[a4], &[a2]));
+    for field in [
+        "identity_key",
+        "certificate",
+        "device_list",
+        "recovery_key",
+        "wrapped_backup_key",
+        "encrypted_identity",
+        "wrapped_previous_backup_keys",
+    ] {
+        assert_eq!(again[field], first[field], "{field}");
+    }
 }
 
 /// `gone` names only devices a waiting change keeps that the server no longer has: not this
@@ -1849,6 +2080,17 @@ fn gone_names_only_devices_a_waiting_change_keeps_that_the_server_lost() {
             "{gone}"
         );
     }
+    let mut itself = rotating(&server, a, &[a2.id]);
+    itself["certificates"] = json!([certificate(&server, a, a3.id)]);
+    itself["gone"] = json!([a1.id]);
+    let refused = error(&mut a1.core, itself);
+    assert_eq!(
+        (&refused["field"], &refused["message"]),
+        (
+            &json!("gone"),
+            &json!("the device that changes the keys stays on the list")
+        )
+    );
     let mut other = rotating(&server, a, &[]);
     other["gone"] = json!([a3.id]);
     let refused = error(&mut a1.core, other);

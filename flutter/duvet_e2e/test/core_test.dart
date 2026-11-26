@@ -74,6 +74,12 @@ void main() {
     );
   });
 
+  test('destroy without its folder has nothing to delete', () async {
+    final missing = '${Directory.systemTemp.createTempSync('duvet-e2e-').path}/gone';
+    await DuvetE2e.destroy(jsonEncode({'path': '$missing/core.db'}));
+    expect(Directory(missing).existsSync(), isFalse);
+  });
+
   test('a key that is not 32 bytes is bad_command', () async {
     await expectLater(
       DuvetE2e.open(jsonEncode({'path': database()}), Uint8List(31)),
