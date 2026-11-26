@@ -577,6 +577,20 @@ impl FakeServer {
         })
     }
 
+    /// `reset_group` for `conversation`, with its members and owner as the API has them, and a key
+    /// package for each device of `users`.
+    pub fn reset_group(&mut self, conversation: Uuid, users: &[Uuid]) -> Value {
+        let chat = &self.chats[&conversation];
+        let (owner, members) = (chat.owner, chat.users.clone());
+        json!({
+            "cmd": "reset_group",
+            "conversation_id": conversation,
+            "owner": owner,
+            "members": members,
+            "key_packages": self.claim(users),
+        })
+    }
+
     /// The group info of `conversation`'s latest epoch, in base64, for `join_external`.
     pub fn group_info(&self, conversation: Uuid) -> String {
         b64(self.chats[&conversation].group_info.as_ref().unwrap())
@@ -804,8 +818,10 @@ impl FakeServer {
         self.propose_removal(conversation, device);
     }
 
-    /// `device`'s user leaves `conversation` with their statement: the API proposes the removal of
-    /// each of the user's leaves, with the statement for the commit that takes them out.
+    /// `device`'s user leaves `conversation` with their statement: the API takes them off the
+    /// conversation at once, a group's owner handing it on to the first of those who stay, and
+    /// proposes the removal of each of the user's leaves, with the statement for the commit that
+    /// takes them out.
     pub fn leave(&mut self, device: &mut TestDevice, conversation: Uuid) {
         let left = ok(
             &mut device.core,
@@ -814,6 +830,12 @@ impl FakeServer {
         let statement = bytes(&left["statement"]);
         let devices = self.users[&device.user].devices.clone();
         let chat = self.chats.get_mut(&conversation).unwrap();
+        chat.users.retain(|&user| user != device.user);
+        if chat.owner == Some(device.user)
+            && let Some(&first) = chat.users.first()
+        {
+            chat.owner = Some(first);
+        }
         let leaving: Vec<Uuid> = devices
             .into_iter()
             .filter(|device| chat.leaves.contains_key(device))

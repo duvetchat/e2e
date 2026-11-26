@@ -887,11 +887,7 @@ fn a_retry_no_one_could_open_is_stale() {
         &mut a1.core,
         encrypt(conversation, "reset", envelope.clone()),
     );
-    let reset = json!({
-        "cmd": "reset_group",
-        "conversation_id": conversation,
-        "key_packages": server.claim(&[a, b]),
-    });
+    let reset = server.reset_group(conversation, &[a, b]);
     server.commit(&mut a1, conversation, reset).unwrap();
     let stale = error(&mut a1.core, encrypt(conversation, "reset", envelope));
     assert_eq!(stale["rule"], "stale_message");

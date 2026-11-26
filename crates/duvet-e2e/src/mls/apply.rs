@@ -18,6 +18,7 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::create::founds_reset;
 use super::{
     EXTERNAL_SENDER_MISMATCH, Extra, GroupRow, api_key, brings_back_removed, can_commit,
     certify_by_pinned, certify_leaves_by_pinned, check, check_applied, commit_asks_first,
@@ -50,7 +51,7 @@ pub(crate) struct Entry {
     /// device's client showed them then, from the client's own record (the API never gives it).
     /// The founding welcome must have its users, in any order, kind and owner, and any other join
     /// keep to it ([`Expected::hold`]), but a reset's welcome to a device that holds the group,
-    /// which goes by the members it had.
+    /// which goes by the members it had, without those who left.
     #[serde(default)]
     pub(crate) expected: Option<Expected>,
     /// On the server's proposal to remove a leaf of a user who leaves: their signed statement, for
@@ -150,8 +151,9 @@ pub(crate) enum Applied {
     /// commit, and a refused welcome or proposal leave the group as it was.
     Rejected { rule: String },
     /// Not for this device, or not now: a welcome for other devices, an entry of another generation
-    /// or epoch, of a group this device isn't in, or after its group was blocked; a message this
-    /// device has already, or an edit or a deletion of one deleted.
+    /// or epoch, of a group this device isn't in, or after its group was blocked (but for the leave
+    /// statement a proposal brings, kept when it holds); a message this device has already, or an
+    /// edit or a deletion of one deleted.
     Ignored,
 }
 
@@ -433,13 +435,14 @@ impl EntryHandler for Welcomes {
             return Ok(rejected("wrong_group"));
         }
         // A welcome to a later generation is a reset, which keeps the members the group had, as
-        // this device has them while it's in the group.
+        // this device has them while it's in the group, without those who left: it goes by those
+        // and by the leave statements this device holds.
         let reset = match &at.row {
             None => None,
-            Some(row) if generation > row.generation => at.group.is_some().then(|| {
-                let users: Vec<Uuid> = row.members.users.iter().map(|entry| entry.user).collect();
-                entered_at_start(row.members.kind, row.members.owner, &users, generation)
-            }),
+            Some(row) if generation > row.generation => at
+                .group
+                .is_some()
+                .then(|| (row.members.clone(), row.leavers())),
             Some(row) if generation == row.generation && at.group.is_none() && !row.blocked => {
                 // A welcome to an epoch this device held or saw pass is an old one, handed out
                 // again: in it, members removed since still hold the keys.
@@ -478,10 +481,20 @@ impl EntryHandler for Welcomes {
         let context = staged.group_context();
         let epoch = context.epoch().as_u64();
         let mut ctx = rule_context(tx, leaves.values().map(|leaf| leaf.user))?;
-        match (reset, &entry.expected) {
-            // A reset's welcome to a device that holds the group goes by the members it had: they
-            // carry the legitimate changes since the cutover, which the record doesn't.
-            (Some(members), _) => ctx.expected_initial = Some(members),
+        match (&reset, &entry.expected) {
+            // A reset's welcome to a device that holds the group goes by the members it had,
+            // without those who left (`founds_reset`, with the statements this device holds):
+            // they carry the legitimate changes since the cutover, which the record doesn't. Any
+            // other list is held to the members it had, and refused for not being them.
+            (Some((had, left)), _) => {
+                let next = MemberList::from_group_context(context)
+                    .ok()
+                    .filter(|next| founds_reset(had, next, left));
+                ctx.expected_initial = Some(next.unwrap_or_else(|| {
+                    let users: Vec<Uuid> = had.users.iter().map(|entry| entry.user).collect();
+                    entered_at_start(had.kind, had.owner, &users, generation)
+                }));
+            }
             (None, Some(record)) => {
                 // The founding welcome is the first commit's, at generation 0.
                 let founding = (generation, epoch) == (0, 1);
@@ -496,7 +509,9 @@ impl EntryHandler for Welcomes {
         let list = MemberList::from_group_context(context).map_err(|_| stored_state())?;
         // Only the owner adds a user to a group, and a welcome's group info is signed by the
         // commit's maker: the welcome of the commit that added this device's user must be the
-        // owner's. Who made a group's epoch 0 the validator checked, as no welcome shows it.
+        // owner's, and so must a reset's, which may leave users out: only the owner makes a
+        // group's next generation, as the validator holds its epoch 0. Who made a new
+        // conversation's epoch 0 the validator checked.
         let own_user = tx.own_user()?.ok_or_else(|| not_found("device"))?;
         let added_now = list
             .entry(own_user)
@@ -504,7 +519,7 @@ impl EntryHandler for Welcomes {
         let signer = leaves
             .get(&staged.welcome_sender_index().u32())
             .map(|leaf| leaf.user);
-        if list.kind == Kind::Group && added_now && signer != list.owner {
+        if list.kind == Kind::Group && (added_now || reset.is_some()) && signer != list.owner {
             return Ok(rejected(RuleViolation::MembersChangedByNonOwner.name()));
         }
 
@@ -557,7 +572,8 @@ impl EntryHandler for Welcomes {
 /// Proposals: the server's removals of leaves, kept for the next commit, with the statement of a
 /// user who leaves. The rules take nothing else from the server, and members propose nothing. A
 /// removal this device's waiting commit leaves out shows that commit never entered (the validator
-/// holds every member's commit to the removals pending at its epoch), and drops it.
+/// holds every member's commit to the removals pending at its epoch), and drops it. A blocked group
+/// keeps only the statement, for its reset.
 struct Proposals;
 
 impl EntryHandler for Proposals {
@@ -568,12 +584,21 @@ impl EntryHandler for Proposals {
         let Some(message) = protocol_message(&entry.data) else {
             return Ok(rejected("malformed"));
         };
-        if !in_group(&message, at.id, row.generation) || row.blocked {
+        if !in_group(&message, at.id, row.generation) {
             return Ok(Applied::Ignored);
         }
         let Some(group) = at.group.as_mut() else {
             return Ok(Applied::Ignored);
         };
+        // A blocked group takes no proposal, as no commit can carry it, but keeps the statement
+        // one brings when it holds for the group's state, unprocessed: a reset that leaves the
+        // owner out rests on those (`founds_reset`).
+        if row.blocked {
+            if let Some(statement) = &entry.statement {
+                keep_statement(tx, row, group, statement)?;
+            }
+            return Ok(Applied::Ignored);
+        }
         // Proposals last one epoch.
         if message.epoch() != group.epoch() {
             return Ok(Applied::Ignored);

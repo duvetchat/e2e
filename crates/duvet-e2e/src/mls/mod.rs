@@ -258,6 +258,17 @@ impl GroupRow {
         self.pending = Some(pending);
         self.echo = Some(digest(&staged.commit));
     }
+
+    /// The users whose leave statements this device holds for its group's epoch: each verified for
+    /// the group's state as its removal proposal came (`apply`'s `keep_statement`), the only way
+    /// one is kept.
+    pub(crate) fn leavers(&self) -> BTreeSet<Uuid> {
+        self.statements
+            .iter()
+            .filter_map(|statement| LeaveStatement::read_unverified(statement).ok())
+            .map(|statement| statement.user)
+            .collect()
+    }
 }
 
 /// The group this device holds of `conversation`, at the generation its row names, with that
