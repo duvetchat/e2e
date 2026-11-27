@@ -679,6 +679,19 @@ impl FakeServer {
             .expect("the server takes it")
     }
 
+    /// `device` founds `conversation`'s group, and the API answers it as taken at the queue's next
+    /// number but keeps nothing of it, as a lying server does, or a database restored to before the
+    /// founding: the device holds a group the API doesn't. The `create_group` reply.
+    pub fn found_unkept(&mut self, device: &mut TestDevice, conversation: Uuid) -> Value {
+        let created = ok(&mut device.core, self.create_group(conversation));
+        let seq = self.chats[&conversation].queue.len() + 1;
+        ok(
+            &mut device.core,
+            json!({"cmd": "commit_result", "conversation_id": conversation, "accepted": true, "seq": seq}),
+        );
+        created
+    }
+
     /// The validator's word on a commit, without keeping it.
     pub fn check(&self, conversation: Uuid, commit: &[u8], group_info: &[u8]) -> Response {
         let chat = &self.chats[&conversation];

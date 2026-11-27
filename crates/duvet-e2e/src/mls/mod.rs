@@ -38,8 +38,8 @@ use crate::{Error, OwnDevice, SqlStorageError, Tx};
 
 pub(crate) use apply::{ApplyRequest, apply};
 pub(crate) use commits::{
-    CommitResult, JoinExternal, commit_pending, commit_result, group, join_external, refresh,
-    refresh_due,
+    CommitResult, JoinExternal, commit_pending, commit_result, forget_group, group, join_external,
+    refresh, refresh_due,
 };
 pub(crate) use create::{CreateGroup, ResetGroup, create_group, reset_group};
 pub(crate) use members::{AddMembers, RemoveMembers, add_members, leave, remove_members};

@@ -89,16 +89,25 @@ pub(crate) enum EntryKind {
     Delete,
 }
 
-/// A conversation's members as a device knew them before the cutover.
-#[derive(Debug, Deserialize)]
+/// A conversation's members as a device knew them before the cutover, or as the group it forgot
+/// had them (`forget_group`).
+#[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct Expected {
     /// A group's owner; a DM has none.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     owner: Option<Uuid>,
     members: Vec<Uuid>,
 }
 
 impl Expected {
+    /// The record of `list`: its owner, and its users in its order.
+    pub(crate) fn of(list: &MemberList) -> Expected {
+        Expected {
+            owner: list.owner,
+            members: list.users.iter().map(|entry| entry.user).collect(),
+        }
+    }
+
     /// The record as a list at `generation`'s start: a group's when there's an owner, a DM's when
     /// there isn't.
     pub(crate) fn list(&self, generation: u32) -> MemberList {

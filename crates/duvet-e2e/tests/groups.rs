@@ -3071,3 +3071,200 @@ fn a_commit_never_sent_is_dropped_after_its_answer() {
         .commit(&mut a1, conversation, command("refresh", conversation))
         .unwrap();
 }
+
+/// A device whose group the API doesn't hold: its founding answered as taken and never kept, as a
+/// lying server does, or a database restored to before it. While it holds the group it can't found
+/// it again (`exists`), so it forgets it (`forget_group`), which answers the members the group had
+/// as a record, and founds the group again held to it: a list the API makes up isn't taken.
+#[test]
+fn forget_group_leaves_a_group_the_api_doesnt_hold() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1, mut b1, _c1] = new_devices(&mut server, [a, b, c]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Dm, None, &[a, b], false);
+    let forget = command("forget_group", conversation);
+
+    // Nothing to forget before there's a group.
+    let none = error(&mut a1.core, forget.clone());
+    assert_eq!(
+        (&none["code"], &none["what"]),
+        (&json!("not_found"), &json!("group"))
+    );
+
+    // The API answers A1's founding as taken, keeps nothing of it, and answers A1's message the
+    // same way.
+    server.found_unkept(&mut a1, conversation);
+    let held = a1.group(conversation);
+    assert_eq!(
+        error(&mut a1.core, server.create_group(conversation))["code"],
+        "exists"
+    );
+    let nonce = new_id().to_string();
+    let typed = json!({"cmd": "encrypt", "conversation_id": conversation, "nonce": nonce, "envelope": {"text": "said before"}});
+    ok(&mut a1.core, typed);
+    let message_id = new_id();
+    ok(
+        &mut a1.core,
+        json!({"cmd": "sent", "conversation_id": conversation, "nonce": nonce, "message_id": message_id, "seq": 2}),
+    );
+
+    // Not while a commit of its own waits for the server's word, nor while one the server answered
+    // as refused stays staged for the queue to settle.
+    ok(&mut a1.core, command("refresh", conversation));
+    assert_eq!(
+        error(&mut a1.core, forget.clone())["code"],
+        "pending_commit"
+    );
+    let refused =
+        json!({"cmd": "commit_result", "conversation_id": conversation, "accepted": false});
+    ok(&mut a1.core, refused.clone());
+    assert_eq!(
+        error(&mut a1.core, forget.clone())["code"],
+        "pending_commit"
+    );
+    let mut never_sent = refused;
+    never_sent["invalid"] = json!(true);
+    ok(&mut a1.core, never_sent);
+    server.clock.advance(8 * DAY_MS);
+    assert_eq!(due(&mut a1), json!([conversation]));
+
+    // A1 forgets it: the group goes, with what it held, and its record is the members it had.
+    let record = ok(&mut a1.core, forget.clone());
+    assert_eq!(record, json!({"expected": {"members": [a, b]}}));
+    assert_eq!(a1.no_group(conversation)["what"], "group");
+    let again = error(&mut a1.core, forget);
+    assert_eq!(
+        (&again["code"], &again["what"]),
+        (&json!("not_found"), &json!("group"))
+    );
+    assert_eq!(due(&mut a1), json!([]));
+    // The messages it holds stay.
+    let page = ok(
+        &mut a1.core,
+        json!({"cmd": "messages", "conversation_id": conversation, "limit": 10}),
+    );
+    let shown: Vec<_> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| (message["message_id"].clone(), message["text"].clone()))
+        .collect();
+    assert_eq!(shown, [(json!(message_id), json!("said before"))]);
+
+    // A list the API makes up is refused against the record...
+    let users = |server: &mut FakeServer, users: Vec<Uuid>| {
+        server.chats.get_mut(&conversation).unwrap().users = users;
+    };
+    users(&mut server, vec![a, c]);
+    let mut planted = server.create_group(conversation);
+    planted["expected"] = record["expected"].clone();
+    let mismatch = error(&mut a1.core, planted);
+    assert_eq!(
+        (&mismatch["code"], &mismatch["rule"]),
+        (&json!("rule_violation"), &json!("member_list_mismatch"))
+    );
+
+    // ...and the members it had found the group again, at generation 0, which B1 enters.
+    users(&mut server, vec![a, b]);
+    let mut create = server.create_group(conversation);
+    create["expected"] = record["expected"].clone();
+    server.commit(&mut a1, conversation, create).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    let state = same_group(&mut [&mut a1, &mut b1], conversation);
+    assert_eq!(
+        (&state["generation"], &state["epoch"]),
+        (&json!(0), &json!(1))
+    );
+    assert_ne!(state["authenticator"], held["authenticator"]);
+    server
+        .commit(&mut b1, conversation, command("refresh", conversation))
+        .unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    same_group(&mut [&mut a1, &mut b1], conversation);
+}
+
+/// A device whose own group passed the API's at the same generation (a renewal the API answered as
+/// taken and never kept) can't take the API's group by external commit: its group info is of an
+/// epoch the device saw pass (`stale_group_info`). Once the device forgets its group it can, held
+/// to the record `forget_group` answered.
+#[test]
+fn forget_group_lets_a_device_take_the_apis_group_past_its_own_epoch() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut b1] = new_devices(&mut server, [a, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Dm, None, &[a, b], false);
+    server.found_unkept(&mut a1, conversation);
+    ok(&mut a1.core, command("refresh", conversation));
+    ok(
+        &mut a1.core,
+        json!({"cmd": "commit_result", "conversation_id": conversation, "accepted": true, "seq": 2}),
+    );
+    assert_eq!(a1.group(conversation)["epoch"], 2);
+
+    // B1 founds the group the API holds, at epoch 1.
+    start(&mut server, &mut b1, conversation);
+    let stale = error(&mut a1.core, joining(&server, conversation));
+    assert_eq!(
+        (&stale["code"], &stale["rule"]),
+        (&json!("rule_violation"), &json!("stale_group_info"))
+    );
+
+    let record = ok(&mut a1.core, command("forget_group", conversation));
+    let mut join = joining(&server, conversation);
+    join["expected"] = record["expected"].clone();
+    server.commit(&mut a1, conversation, join).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    let state = same_group(&mut [&mut a1, &mut b1], conversation);
+    assert_eq!(
+        (&state["generation"], &state["epoch"]),
+        (&json!(0), &json!(2))
+    );
+}
+
+/// A device founds a DM alone, with no key package of the other member's, and forgets it: the JSON
+/// each binding sends in its own test (`host-tests/bun`, `duvet-e2e-wasm`'s `web.rs`, the Flutter
+/// plugin's `core_test.dart`), with a key the API never signs with as the external sender.
+#[test]
+fn a_lone_device_forgets_the_group_it_founded() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut core = duvet_e2e::Core::open(duvet_e2e::OpenConfig::new(
+        dir.path().join("core.db"),
+        [1; 32],
+    ))
+    .unwrap();
+    let (user, other, conversation) = (new_id(), new_id(), new_id());
+    let device = new_id();
+    ok(
+        &mut core,
+        json!({"cmd": "create_device", "user_id": user, "device_id": device}),
+    );
+    ok(&mut core, json!({"cmd": "create_identity"}));
+    let create = json!({
+        "cmd": "create_group",
+        "conversation_id": conversation,
+        "kind": "dm",
+        "members": [user, other],
+        "external_sender": b64(&[9; 32]),
+    });
+    assert_eq!(ok(&mut core, create.clone())["generation"], 0);
+    let taken = json!({"cmd": "commit_result", "conversation_id": conversation, "accepted": true, "seq": 1});
+    assert_eq!(ok(&mut core, taken)["epoch"], 1);
+
+    let forget = command("forget_group", conversation);
+    assert_eq!(
+        ok(&mut core, forget.clone()),
+        json!({"expected": {"members": [user, other]}})
+    );
+    let gone = error(&mut core, command("group", conversation));
+    assert_eq!(
+        (&gone["code"], &gone["what"]),
+        (&json!("not_found"), &json!("group"))
+    );
+    assert_eq!(error(&mut core, forget)["what"], "group");
+    // Founded again at generation 0, the group ID the forgotten one had.
+    let mut again = create;
+    again["expected"] = json!({"members": [user, other]});
+    assert_eq!(ok(&mut core, again)["generation"], 0);
+}
