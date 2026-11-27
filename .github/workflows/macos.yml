@@ -2,14 +2,18 @@ name: macOS
 
 # The C ABI on macOS, as the desktop loads it: the binding's own checks and tests, its keyring's
 # Keychain store included, then host-tests/bun under Bun 1.3.9, the one Electrobun 1.15.1 ships. On a
-# pull request that changes the binding or the host tests, against the library it builds; started
-# by hand with a release's tag, against that release's (artifacts.yml).
+# pull request that changes the binding, the host tests, a manifest, the lock file or the toolchain
+# (a dependency's bump is what changes the Keychain store or the macOS build), against the library
+# it builds; started by hand with a release's tag, against that release's (artifacts.yml).
 on:
   pull_request:
     branches: [main]
     paths:
       - "crates/duvet-e2e-ffi/**"
       - "host-tests/bun/**"
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
       - ".github/workflows/macos.yml"
   workflow_dispatch:
     inputs:
