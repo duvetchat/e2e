@@ -153,7 +153,8 @@ describe("the C ABI", () => {
   // other member's, types a message there and forgets it, which leaves the message stale (groups.rs'
   // a_lone_device_forgets_the_group_it_founded).
   test("forget_group answers the group's members, and the group is gone", () => {
-    const core = open({ path: database(), db_key: dbKey() }).ok.handle;
+    const config = { path: database(), db_key: dbKey() };
+    let core = open(config).ok.handle;
     const [user, other, conversation] = [randomUUID(), randomUUID(), randomUUID()];
     const run = (command: object) => handle(core, JSON.stringify(command));
     expect(run({ cmd: "create_device", user_id: user, device_id: randomUUID() }).ok).toBeDefined();
@@ -167,13 +168,56 @@ describe("the C ABI", () => {
     expect(run(typed).ok.epoch).toBe(1);
 
     const forget = { cmd: "forget_group", conversation_id: conversation };
-    expect(run(forget)).toEqual({ ok: { expected: { members, exact: true } } });
+    const expected = { members, exact: true };
+    expect(run(forget)).toEqual({ ok: { expected } });
     expect(run(typed).error).toMatchObject({ code: "rule_violation", rule: "stale_message" });
     const none = { code: "not_found", what: "group" };
     expect(run({ cmd: "group", conversation_id: conversation }).error).toMatchObject(none);
     expect(run(forget).error).toMatchObject(none);
-    // Founded again at generation 0, the group ID the forgotten one had.
-    expect(run({ ...create, expected: { members } }).ok.generation).toBe(0);
+    // The core keeps the record: closed before its client kept it, it gives it back as it opens.
+    const kept = { ok: { records: [{ conversation_id: conversation, expected }] } };
+    expect(run({ cmd: "forgotten" })).toEqual(kept);
+    close(core);
+    core = open(config).ok.handle;
+    expect(run({ cmd: "forgotten" })).toEqual(kept);
+    // Founded again at generation 0, the group ID the forgotten one had. The record stays while the
+    // founding waits for the server's word, and goes once the server took it.
+    expect(run({ ...create, expected }).ok.generation).toBe(0);
+    expect(run({ cmd: "forgotten" })).toEqual(kept);
+    expect(run({ cmd: "commit_result", conversation_id: conversation, accepted: true, seq: 1 }).ok.epoch).toBe(1);
+    expect(run({ cmd: "forgotten" })).toEqual({ ok: { records: [] } });
+    close(core);
+  });
+
+  // The client lets a forgotten group's record go (groups.rs' drop_forgotten_lets_a_forgotten_group_s_record_go):
+  // a lone device founds a DM, forgets it, lets its record go, and founds it again without it.
+  test("drop_forgotten lets a forgotten group's record go", () => {
+    const config = { path: database(), db_key: dbKey() };
+    let core = open(config).ok.handle;
+    const [user, other, conversation] = [randomUUID(), randomUUID(), randomUUID()];
+    const run = (command: object) => handle(core, JSON.stringify(command));
+    expect(run({ cmd: "create_device", user_id: user, device_id: randomUUID() }).ok).toBeDefined();
+    expect(run({ cmd: "create_identity" }).ok).toBeDefined();
+    const external_sender = randomBytes(32).toString("base64");
+    const members = [user, other];
+    const create = { cmd: "create_group", conversation_id: conversation, kind: "dm", members, external_sender };
+    const taken = { cmd: "commit_result", conversation_id: conversation, accepted: true, seq: 1 };
+    expect(run(create).ok.generation).toBe(0);
+    expect(run(taken).ok.epoch).toBe(1);
+    const expected = { members, exact: true };
+    expect(run({ cmd: "forget_group", conversation_id: conversation })).toEqual({ ok: { expected } });
+    expect(run({ cmd: "forgotten" })).toEqual({ ok: { records: [{ conversation_id: conversation, expected }] } });
+
+    const drop = { cmd: "drop_forgotten", conversation_id: conversation };
+    expect(run(drop)).toEqual({ ok: {} });
+    close(core);
+    core = open(config).ok.handle;
+    expect(run({ cmd: "forgotten" })).toEqual({ ok: { records: [] } });
+    // With nothing kept, the same again.
+    expect(run(drop)).toEqual({ ok: {} });
+    // The comeback without the record: founded again, and taken.
+    expect(run(create).ok.generation).toBe(0);
+    expect(run(taken).ok.epoch).toBe(1);
     close(core);
   });
 

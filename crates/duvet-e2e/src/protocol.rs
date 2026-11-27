@@ -101,6 +101,10 @@ pub(crate) enum Command {
     JoinExternal(mls::JoinExternal),
     ResetGroup(mls::ResetGroup),
     ForgetGroup(mls::ConversationId),
+    /// The records of the groups this device forgot, as `forget_group` answered them.
+    Forgotten,
+    /// Lets go of the record of a conversation's forgotten group.
+    DropForgotten(mls::ConversationId),
     Group(mls::ConversationId),
     Apply(mls::ApplyRequest),
 
@@ -211,6 +215,8 @@ pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error
         Command::JoinExternal(request) => reply(mls::join_external(tx, request)?),
         Command::ResetGroup(request) => reply(mls::reset_group(tx, request)?),
         Command::ForgetGroup(request) => reply(mls::forget_group(tx, request)?),
+        Command::Forgotten => reply(mls::forgotten(tx)?),
+        Command::DropForgotten(request) => reply(mls::drop_forgotten(tx, request)?),
         Command::Group(request) => reply(mls::group(tx, request)?),
         Command::Apply(request) => reply(mls::apply(tx, request)?),
 

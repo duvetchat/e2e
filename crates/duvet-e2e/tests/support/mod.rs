@@ -86,6 +86,12 @@ impl TestDevice {
             .insert(conversation, json!({"owner": owner, "members": members}));
     }
 
+    /// The record of `conversation`'s forgotten group as this device's client kept it, as
+    /// `forget_group` answered it (`expected`), which it hands `apply` as a welcome's `expected`.
+    pub fn remember_forgotten(&mut self, conversation: Uuid, expected: &Value) {
+        self.records.insert(conversation, expected.clone());
+    }
+
     /// The `group` command's reply.
     pub fn group(&mut self, conversation: Uuid) -> Value {
         ok(

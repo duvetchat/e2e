@@ -10,6 +10,7 @@ use openmls::prelude::{
     CreationFromExternalError, ExternalCommitBuilderError, LeafNodeParameters, MlsGroup,
     MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, OpenMlsProvider,
 };
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -22,6 +23,7 @@ use super::{
     stored_state, tls, violation,
 };
 use crate::identity::{invalid, not_found, stored_uuid};
+use crate::messages::Empty;
 use crate::protocol::b64;
 use crate::{Error, Tx};
 
@@ -76,6 +78,19 @@ pub(crate) struct Forgotten {
 }
 
 #[derive(Serialize)]
+pub(crate) struct ForgottenGroups {
+    /// The record of each group this device forgot, by conversation.
+    records: Vec<ForgottenGroup>,
+}
+
+#[derive(Serialize)]
+struct ForgottenGroup {
+    conversation_id: Uuid,
+    /// As `forget_group` answered it.
+    expected: Expected,
+}
+
+#[derive(Serialize)]
 pub(crate) struct GroupState {
     generation: u32,
     epoch: u64,
@@ -105,15 +120,17 @@ struct Device {
 }
 
 /// The server's word on this device's waiting commit. Taken, it's merged (an external commit,
-/// merged as it was made, stays). Refused, epoch 0 goes whole with its group, for the winner's
-/// welcome to come through `apply`, and so does a refused external commit or reset. A member's
-/// commit the validator refused (`invalid`) is dropped. One refused otherwise stays staged: the
-/// server may have taken it after all (a lost answer, then a retry's 409), so `apply` settles
-/// it from the queue. It merges it when the queue brings it back, and drops it when another
-/// commit takes its epoch, or a server proposal at its epoch shows it can't have entered. Until
-/// then this device makes no other commit (`pending_commit`). A commit left so is dropped by a
-/// later word that the validator refused it (`invalid`), which a client that knows it never sent
-/// the commit gives too: its bytes are lost, and only another member's commit would settle it.
+/// merged as it was made, stays), and a founding or an external join holds the group again: the
+/// record of a group this device forgot there goes ([`drop_record`]). Refused, epoch 0 goes whole
+/// with its group, for the winner's welcome to come through `apply`, and so does a refused
+/// external commit or reset. A member's commit the validator refused (`invalid`) is dropped. One
+/// refused otherwise stays staged: the server may have taken it after all (a lost answer, then a
+/// retry's 409), so `apply` settles it from the queue. It merges it when the queue brings it back,
+/// and drops it when another commit takes its epoch, or a server proposal at its epoch shows it
+/// can't have entered. Until then this device makes no other commit (`pending_commit`). A commit
+/// left so is dropped by a later word that the validator refused it (`invalid`), which a client
+/// that knows it never sent the commit gives too: its bytes are lost, and only another member's
+/// commit would settle it.
 pub(crate) fn commit_result(tx: &Tx<'_>, request: CommitResult) -> Result<Epoch, Error> {
     let conversation = request.conversation_id;
     match request.seq {
@@ -199,6 +216,7 @@ pub(crate) fn commit_result(tx: &Tx<'_>, request: CommitResult) -> Result<Epoch,
         // joiner's could, so its stay begins at the first time the API gives.
         let at = (pending == Pending::Create).then(|| tx.now());
         crate::backup::entered(tx, conversation, at)?;
+        drop_record(tx, conversation)?;
     }
     row.write(tx)?;
     Ok(Epoch {
@@ -440,11 +458,12 @@ pub(crate) fn join_external(tx: &Tx<'_>, request: JoinExternal) -> Result<Commit
 /// as a group founded again at its generation has its ID. What waits to send there is stale
 /// (`messages::group_forgotten`), and the messages it holds stay. It answers the members the group
 /// had, without those whose leave statements it holds, with its owner in a group, for the client
-/// to hold what brings the group back to
-/// (`expected`: `create_group`, `apply`'s welcomes, `join_external`), so nobody the forgotten group
-/// didn't have comes in on the API's word alone. Not while a commit of this device's waits for the
-/// server's word, or for the queue after a refusal (`pending_commit`); and only a group this device
-/// is in (`not_found`, as [`load_group`] names it).
+/// to hold what brings the group back to (`expected`: `create_group`, `apply`'s welcomes,
+/// `join_external`), so nobody the forgotten group didn't have comes in on the API's word alone.
+/// It keeps that record too ([`keep_record`]): a client that closes before it keeps its own copy
+/// takes it back ([`forgotten`]). Not while a commit of this device's waits for the server's word,
+/// or for the queue after a refusal (`pending_commit`); and only a group this device is in
+/// (`not_found`, as [`load_group`] names it).
 pub(crate) fn forget_group(tx: &Tx<'_>, request: ConversationId) -> Result<Forgotten, Error> {
     let conversation = request.conversation_id;
     let (mut group, row) = load_group(tx, conversation)?;
@@ -472,9 +491,72 @@ pub(crate) fn forget_group(tx: &Tx<'_>, request: ConversationId) -> Result<Forgo
         .map_err(storage_error)?;
     GroupRow::delete(tx, conversation)?;
     crate::messages::group_forgotten(tx, conversation)?;
-    Ok(Forgotten {
-        expected: Expected::of(&list),
-    })
+    let expected = Expected::of(&list);
+    keep_record(tx, conversation, &expected)?;
+    Ok(Forgotten { expected })
+}
+
+/// Keeps `expected`, the record of the group this device forgets of `conversation`, as the forget
+/// answers it, in the forget's own transaction, until the device holds the group again or its
+/// client lets the record go ([`drop_record`]): a client that closes before it keeps its own copy
+/// takes it back ([`forgotten`]). A forget needs the group held, and the device holds it again only
+/// once the conversation's last record went, so a second forget writes the newer group's where
+/// there's none left.
+fn keep_record(tx: &Tx<'_>, conversation: Uuid, expected: &Expected) -> Result<(), Error> {
+    let record = serde_json::to_string(expected)
+        .map_err(|_| Error::Internal("a forgotten group's record couldn't be written".into()))?;
+    // The upsert is a defense: no command leaves a record here, as above. A row anything else left
+    // gives way to the record this forget answers.
+    tx.conn().execute(
+        "INSERT INTO forgotten_groups (conversation_id, record) VALUES (?1, ?2) \
+         ON CONFLICT (conversation_id) DO UPDATE SET record = excluded.record",
+        params![conversation.as_bytes().as_slice(), record],
+    )?;
+    Ok(())
+}
+
+/// The record of `conversation`'s forgotten group goes, in this transaction: this device holds the
+/// group again (a welcome brought it in, `apply`; or the server took its founding or its external
+/// join, `commit_result`), or its client lets the record go ([`drop_forgotten`]). While the device
+/// holds no group of the conversation (a join the server refused, which leaves a row alone; a
+/// founding or a join still waiting for the server's word), the record stays.
+pub(super) fn drop_record(tx: &Tx<'_>, conversation: Uuid) -> Result<(), Error> {
+    tx.conn().execute(
+        "DELETE FROM forgotten_groups WHERE conversation_id = ?1",
+        [conversation.as_bytes().as_slice()],
+    )?;
+    Ok(())
+}
+
+/// Lets go of the record of `conversation`'s forgotten group, which [`forgotten`] then no longer
+/// gives; with nothing kept, it changes nothing. A client calls it on its person's yes
+/// (`members_accept`), before the comeback without `expected` goes, so every record `forgotten`
+/// gives is newer than any yes; and once the API no longer lists the conversation for its user.
+pub(crate) fn drop_forgotten(tx: &Tx<'_>, request: ConversationId) -> Result<Empty, Error> {
+    drop_record(tx, request.conversation_id)?;
+    Ok(Empty {})
+}
+
+/// The record of each group this device forgot (`forget_group`), by conversation, each as the
+/// forget answered it: a client that lost its own copy, by a close before it wrote it or a store
+/// that refused it, takes it again as it starts. It changes nothing.
+pub(crate) fn forgotten(tx: &Tx<'_>) -> Result<ForgottenGroups, Error> {
+    let mut statement = tx
+        .conn()
+        .prepare("SELECT conversation_id, record FROM forgotten_groups ORDER BY conversation_id")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut records = Vec::new();
+    for row in rows {
+        let (conversation, record) = row?;
+        records.push(ForgottenGroup {
+            conversation_id: stored_uuid(&conversation)?,
+            expected: serde_json::from_str(&record)
+                .map_err(|_| Error::Internal("a forgotten group's record is malformed".into()))?,
+        });
+    }
+    Ok(ForgottenGroups { records })
 }
 
 /// The group as this device has it.
