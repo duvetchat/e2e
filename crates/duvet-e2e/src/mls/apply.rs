@@ -152,9 +152,10 @@ pub(crate) enum Applied {
     Removed,
     /// Refused, for the rule it breaks (or `malformed`, `invalid_commit`, `invalid_welcome`,
     /// `invalid_proposal`, `wrong_group` for what isn't a valid message of this group,
-    /// `stale_welcome` for a welcome to an epoch this device held or saw pass, and
-    /// `external_sender_mismatch` for one whose group doesn't have the API's key the client gave as
-    /// its one external sender; `not_author` for an edit or a deletion of another user's message).
+    /// `stale_welcome` for a welcome to an epoch this device held or saw pass, `another_group` for
+    /// one to the generation of a group it holds, and `external_sender_mismatch` for one whose
+    /// group doesn't have the API's key the client gave as its one external sender; `not_author`
+    /// for an edit or a deletion of another user's message).
     /// Another device's commit refused for a rule, or one OpenMLS can't process, also blocks the
     /// group, and nothing goes on it but a reset; a malformed entry, a commit entry that holds no
     /// commit, and a refused welcome or proposal leave the group as it was.
@@ -418,6 +419,8 @@ impl EntryHandler for Commits {
 /// Welcomes: one for this device brings it into a group, after it holds that group to the rules,
 /// and to the API's key as its one external sender when the client gives it. One refused only for
 /// what this device knows of its leaves' users first asks to observe them anew, as a commit does.
+/// One to the generation of a group this device holds is another group (`another_group`), whose
+/// key package it spends all the same.
 struct Welcomes;
 
 impl EntryHandler for Welcomes {
@@ -460,7 +463,13 @@ impl EntryHandler for Welcomes {
                 }
                 None
             }
-            // An older generation's, or this device is in the group, or the group is blocked.
+            // A group at the generation this device holds one of, which it opened with a key
+            // package of its own: the API's group there isn't the one this device holds. That one
+            // stays until the client forgets it (`forget_group`).
+            Some(row) if generation == row.generation && at.group.is_some() && !row.blocked => {
+                return Ok(rejected("another_group"));
+            }
+            // An older generation's, or the group is blocked: only a reset takes it on.
             Some(_) => return Ok(Applied::Ignored),
         };
         let key_package = processed

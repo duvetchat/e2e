@@ -3268,3 +3268,60 @@ fn a_lone_device_forgets_the_group_it_founded() {
     again["expected"] = json!({"members": [user, other]});
     assert_eq!(ok(&mut core, again)["generation"], 0);
 }
+
+/// Another member's group at the generation a device holds: the API kept nothing of A1's founding,
+/// and B1 founded the group the API holds. Its welcome opens with one of A1's key packages, but
+/// can't be taken over the group A1 holds there: it's `rejected` for `another_group`, not passed
+/// by, and its key package is spent, as any rejected welcome's. A1 forgets its group and joins the
+/// API's by external commit, held to the record. A welcome A1 can't open stays passed by.
+#[test]
+fn a_welcome_to_another_group_at_the_devices_generation_is_rejected() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut b1] = new_devices(&mut server, [a, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Dm, None, &[a, b], false);
+    let own = server.found_unkept(&mut a1, conversation);
+    let held = a1.group(conversation);
+
+    // B1 founds the group the API holds, with a welcome for A1, which refuses it.
+    start(&mut server, &mut b1, conversation);
+    let welcome = server.entries(conversation)[1].clone();
+    assert_eq!(welcome["kind"], "welcome");
+    let refused = server.deliver(&mut a1);
+    assert_eq!(
+        results(&refused),
+        [json!([2, "welcome", "rejected", "another_group"])]
+    );
+    let kept = a1.group(conversation);
+    assert_eq!(kept["authenticator"], held["authenticator"]);
+    assert_ne!(
+        kept["authenticator"],
+        b1.group(conversation)["authenticator"]
+    );
+
+    // A1 forgets its group. The welcome's key package is spent: the same welcome brings it in no
+    // more.
+    let record = ok(&mut a1.core, command("forget_group", conversation));
+    let again = ok(&mut a1.core, apply(conversation, &[welcome]));
+    assert_eq!(results(&[again]), [json!([2, "welcome", "ignored", null])]);
+    assert_eq!(a1.no_group(conversation)["what"], "group");
+
+    // A1 joins the API's group, held to the record.
+    let mut join = joining(&server, conversation);
+    join["expected"] = record["expected"].clone();
+    server.commit(&mut a1, conversation, join).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    same_group(&mut [&mut a1, &mut b1], conversation);
+
+    // A welcome A1 can't open, at the generation it holds, is passed by: its forgotten founding's,
+    // for B1.
+    let next = server.entries(conversation).len() as u64 + 1;
+    let forgotten = json!({"seq": next, "kind": "welcome", "data": own["welcome"]});
+    let passed = ok(&mut a1.core, apply(conversation, &[forgotten]));
+    assert_eq!(
+        results(&[passed]),
+        [json!([next, "welcome", "ignored", null])]
+    );
+    same_group(&mut [&mut a1, &mut b1], conversation);
+}
