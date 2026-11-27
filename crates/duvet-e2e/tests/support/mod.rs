@@ -679,6 +679,20 @@ impl FakeServer {
             .expect("the server takes it")
     }
 
+    /// The API loses `conversation`'s group and its queue, as a database restored to before the
+    /// group's founding: the conversation stays, with its members and owner, and no group.
+    pub fn lose_group(&mut self, conversation: Uuid) {
+        let chat = self.chats.get_mut(&conversation).unwrap();
+        chat.generation = None;
+        chat.epoch = 0;
+        chat.state = None;
+        chat.group_info = None;
+        chat.queue.clear();
+        chat.cursors.clear();
+        chat.leaves.clear();
+        chat.removals.clear();
+    }
+
     /// `device` founds `conversation`'s group, and the API answers it as taken at the queue's next
     /// number but keeps nothing of it, as a lying server does, or a database restored to before the
     /// founding: the device holds a group the API doesn't. The `create_group` reply.

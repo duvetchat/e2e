@@ -3333,3 +3333,77 @@ fn a_welcome_to_another_group_at_the_devices_generation_is_rejected() {
     );
     same_group(&mut [&mut a1, &mut b1], conversation);
 }
+
+/// The entries of `device`'s OpenMLS storage keyed by the group `id`: its tree, context, secrets,
+/// queued proposals and epoch key pairs, each stored under a key that holds the ID's JSON.
+fn mls_entries(device: &mut TestDevice, id: &openmls::prelude::GroupId) -> usize {
+    let needle = serde_json::to_vec(id).unwrap();
+    device.rolled_back(|tx| {
+        let mut statement = tx.conn().prepare("SELECT key FROM openmls_kv")?;
+        let keys = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut found = 0;
+        for key in keys {
+            found += usize::from(key?.windows(needle.len()).any(|part| part == needle));
+        }
+        Ok(found)
+    })
+}
+
+/// A group founded again at a generation has the forgotten one's ID, which OpenMLS keeps one group
+/// under: so `forget_group` leaves nothing of the group in OpenMLS's storage, whatever it went
+/// through (renewals, a message, a removal the server proposed and each device kept). Here the API
+/// lost a group its owner founded and its member entered, as a database restored to before the
+/// founding: both forget it, the owner founds it again with the record, and the member's welcome
+/// to it, held to the member's record, brings the member in.
+#[test]
+fn forget_group_leaves_nothing_of_the_group_in_mls_storage() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut b1, mut b2] = new_devices(&mut server, [a, b, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
+    server
+        .commit(&mut b1, conversation, command("refresh", conversation))
+        .unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
+    server
+        .commit(&mut a1, conversation, command("refresh", conversation))
+        .unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut b2]);
+    let nonce = new_id().to_string();
+    let said = ok(
+        &mut b1.core,
+        json!({"cmd": "encrypt", "conversation_id": conversation, "nonce": nonce, "envelope": {"text": "hi"}}),
+    );
+    server.post_message(&b1, conversation, &nonce, bytes(&said["ciphertext"]), &[]);
+    server.remove_device(conversation, b2.id);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    // The API loses the group: both devices forget theirs, and nothing of it stays.
+    server.lose_group(conversation);
+    let id = group_id(conversation, 0);
+    let mut records = Vec::new();
+    for device in [&mut a1, &mut b1] {
+        assert!(mls_entries(device, &id) > 0);
+        let record = ok(&mut device.core, command("forget_group", conversation));
+        assert_eq!(record["expected"], json!({"owner": a, "members": [a, b]}));
+        assert_eq!(mls_entries(device, &id), 0);
+        records.push(record["expected"].clone());
+    }
+
+    // The owner founds it again with its record; the member's welcome is held to its own.
+    b1.remember(conversation, Some(a), &[a, b]);
+    let mut create = server.create_group(conversation);
+    create["expected"] = records[0].clone();
+    server.commit(&mut a1, conversation, create).unwrap();
+    let joined = server.deliver(&mut b1);
+    assert_eq!(results(&joined), [json!([2, "welcome", "applied", null])]);
+    server.deliver(&mut a1);
+    let state = same_group(&mut [&mut a1, &mut b1], conversation);
+    assert_eq!(
+        (&state["generation"], &state["epoch"]),
+        (&json!(0), &json!(1))
+    );
+}
