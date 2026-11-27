@@ -11,10 +11,11 @@
 //! due, an approval under way, and its queues half applied; in B1's, a kept proposal and a share's
 //! key not yet imported. From schema 3 on, both hold a device their group took out, and an identity
 //! it no longer takes there; from schema 4 on, A1's holds a key package it marked spent; from
-//! schema 5 on, A1's holds a message waiting to send in a group it forgot, which stays stale. The
-//! test
-//! checks each survives the open and, where a command completes it, completes, and that every
-//! database opens at the newest schema.
+//! schema 5 on, A1's holds a message waiting to send in a group it forgot, which stays stale; from
+//! schema 6 on, A1's keeps the records of the groups it forgot, one of them a DM's whose external
+//! join the API refused, which a row without its group stands beside. The test checks each survives
+//! the open and, where a command completes it, completes, and that every database opens at the
+//! newest schema.
 //!
 //! Nothing here depends on the date it runs. The core's clock is set to a minute after the fixtures
 //! were made. OpenMLS checks lifetimes against the system's clock, but only a key package's (as a
@@ -393,6 +394,41 @@ fn opens(name: &str, newest: u32, fixture: &Value) {
         assert_eq!(refused["rule"], "stale_message", "{name}: {refused}");
         let group = json!({"cmd": "group", "conversation_id": forgotten["conversation"]});
         assert_eq!(error(&mut a1, group)["what"], "group", "{name}");
+    }
+    // And takes schema 6's records of forgotten groups: none from an earlier schema, whose forget
+    // answered its record without keeping it. From schema 6 on, A1's keeps the record of each group
+    // it forgot, as its forget answered it, by conversation: a DM's among them, beside a row
+    // without its group, as the API refused A1's external join there. A migration that dropped one
+    // would let a client that lost its copy take back nothing.
+    let kept: Vec<Value> = a1
+        .transaction(|tx| {
+            let mut statement = tx.conn().prepare(
+                "SELECT conversation_id, record FROM forgotten_groups ORDER BY conversation_id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut kept = Vec::new();
+            for row in rows {
+                let (conversation, record) = row?;
+                kept.push(json!({
+                    "conversation_id": Uuid::from_slice(&conversation).unwrap(),
+                    "expected": serde_json::from_str::<Value>(&record).unwrap(),
+                }));
+            }
+            Ok(kept)
+        })
+        .unwrap();
+    let records = if schema >= 6 {
+        fixture["records"].clone()
+    } else {
+        json!([])
+    };
+    assert_eq!(json!(kept), records, "{name}");
+    if schema >= 6 {
+        let refused = &fixture["refused_join"]["conversation"];
+        let row = error(&mut a1, json!({"cmd": "group", "conversation_id": refused}));
+        assert_eq!(row["what"], "membership", "{name}");
     }
     let conversations = fixture["conversations"].as_array().unwrap();
     for conversation in conversations {
@@ -808,6 +844,43 @@ fn write_db() {
         json!({"owner": a, "members": [a, b], "exact": true})
     );
 
+    // A DM A1 founds and the API never keeps, which A1 forgets too. B1 founds the API's group, and
+    // the API refuses A1's external join to it, which leaves A1 a row without its group. A1's store
+    // keeps both records, as its forgets answered them (schema 6).
+    let refused = new_id();
+    server.conversation(refused, Kind::Dm, None, &[a, b], false);
+    server.found_unkept(&mut a1, refused);
+    let dm_record = ok(
+        &mut a1.core,
+        json!({"cmd": "forget_group", "conversation_id": refused}),
+    );
+    assert_eq!(
+        dm_record["expected"],
+        json!({"members": [a, b], "exact": true})
+    );
+    let create = server.create_group(refused);
+    server.commit(&mut b1, refused, create).unwrap();
+    let join = json!({
+        "cmd": "join_external",
+        "conversation_id": refused,
+        "generation": 0,
+        "group_info": server.group_info(refused),
+        "expected": dm_record["expected"],
+    });
+    ok(&mut a1.core, join);
+    ok(
+        &mut a1.core,
+        json!({"cmd": "commit_result", "conversation_id": refused, "accepted": false}),
+    );
+    let mut records = [(forgot, &record), (refused, &dm_record)];
+    records.sort_by_key(|(conversation, _)| *conversation);
+    let records: Vec<Value> = records
+        .iter()
+        .map(|(conversation, forgotten)| {
+            json!({"conversation_id": conversation, "expected": forgotten["expected"]})
+        })
+        .collect();
+
     // No leaf keeps a key package's lifetime, on either device: each one a commit brought.
     for device in [&mut a1, &mut b1] {
         for conversation in [dm, group] {
@@ -860,6 +933,8 @@ fn write_db() {
         "approval": {"reveal": revealed["reveal"]},
         "spent": spent,
         "forgotten": {"conversation": forgot, "nonce": forgotten_nonce, "text": forgotten_text},
+        "records": records,
+        "refused_join": {"conversation": refused},
     });
     std::fs::create_dir_all(fixtures()).unwrap();
     let write = |name: String, bytes: &[u8]| {

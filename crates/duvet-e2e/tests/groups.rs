@@ -21,6 +21,7 @@ use openmls::prelude::{
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::{OpenMlsRustCrypto, RustCrypto};
+use rusqlite::OptionalExtension as _;
 use serde_json::{Value, json};
 use support::*;
 use uuid::Uuid;
@@ -3653,4 +3654,58 @@ fn a_welcome_to_a_blocked_group_is_passed_by_and_the_group_forgotten() {
     server.commit(&mut a1, conversation, join).unwrap();
     server.deliver_all(&mut [&mut a1, &mut b1]);
     same_group(&mut [&mut a1, &mut b1], conversation);
+}
+
+/// The record of `conversation`'s forgotten group that `device`'s store keeps, as JSON: none
+/// without one.
+fn kept_record(device: &mut TestDevice, conversation: Uuid) -> Option<Value> {
+    device.rolled_back(|tx| {
+        let record: Option<String> = tx
+            .conn()
+            .query_row(
+                "SELECT record FROM forgotten_groups WHERE conversation_id = ?1",
+                [conversation.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(record.map(|record| serde_json::from_str(&record).unwrap()))
+    })
+}
+
+/// A forgotten group's record is kept in the store, in `forget_group`'s own transaction (#60): a
+/// client that closes before it writes its own copy finds it there, as it was answered. A second
+/// forget of the conversation keeps the newer group's record in its place.
+#[test]
+fn forget_group_keeps_its_record_in_the_store() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1, _b1, _c1] = new_devices(&mut server, [a, b, c]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+    server.found_unkept(&mut a1, conversation);
+    let first = ok(&mut a1.core, command("forget_group", conversation));
+    assert_eq!(
+        first["expected"],
+        json!({"owner": a, "members": [a, b], "exact": true})
+    );
+    // The client closes before it keeps its own copy: the store has it.
+    let mut a1 = a1.reopened(server.clock.clone());
+    assert_eq!(
+        kept_record(&mut a1, conversation),
+        Some(first["expected"].clone())
+    );
+
+    // The person took C in, and the API keeps nothing of the group founded again either.
+    server.chats.get_mut(&conversation).unwrap().users = vec![a, b, c];
+    server.found_unkept(&mut a1, conversation);
+    let second = ok(&mut a1.core, command("forget_group", conversation));
+    assert_eq!(
+        second["expected"],
+        json!({"owner": a, "members": [a, b, c], "exact": true})
+    );
+    let mut a1 = a1.reopened(server.clock.clone());
+    assert_eq!(
+        kept_record(&mut a1, conversation),
+        Some(second["expected"].clone())
+    );
 }

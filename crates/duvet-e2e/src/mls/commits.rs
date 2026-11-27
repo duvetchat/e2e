@@ -10,6 +10,7 @@ use openmls::prelude::{
     CreationFromExternalError, ExternalCommitBuilderError, LeafNodeParameters, MlsGroup,
     MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, OpenMlsProvider,
 };
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -440,11 +441,12 @@ pub(crate) fn join_external(tx: &Tx<'_>, request: JoinExternal) -> Result<Commit
 /// as a group founded again at its generation has its ID. What waits to send there is stale
 /// (`messages::group_forgotten`), and the messages it holds stay. It answers the members the group
 /// had, without those whose leave statements it holds, with its owner in a group, for the client
-/// to hold what brings the group back to
-/// (`expected`: `create_group`, `apply`'s welcomes, `join_external`), so nobody the forgotten group
-/// didn't have comes in on the API's word alone. Not while a commit of this device's waits for the
-/// server's word, or for the queue after a refusal (`pending_commit`); and only a group this device
-/// is in (`not_found`, as [`load_group`] names it).
+/// to hold what brings the group back to (`expected`: `create_group`, `apply`'s welcomes,
+/// `join_external`), so nobody the forgotten group didn't have comes in on the API's word alone.
+/// It keeps that record too ([`keep_record`]): a client that closes before it keeps its own copy
+/// doesn't lose it. Not while a commit of this device's waits for the server's word, or for the
+/// queue after a refusal (`pending_commit`); and only a group this device is in (`not_found`, as
+/// [`load_group`] names it).
 pub(crate) fn forget_group(tx: &Tx<'_>, request: ConversationId) -> Result<Forgotten, Error> {
     let conversation = request.conversation_id;
     let (mut group, row) = load_group(tx, conversation)?;
@@ -472,9 +474,23 @@ pub(crate) fn forget_group(tx: &Tx<'_>, request: ConversationId) -> Result<Forgo
         .map_err(storage_error)?;
     GroupRow::delete(tx, conversation)?;
     crate::messages::group_forgotten(tx, conversation)?;
-    Ok(Forgotten {
-        expected: Expected::of(&list),
-    })
+    let expected = Expected::of(&list);
+    keep_record(tx, conversation, &expected)?;
+    Ok(Forgotten { expected })
+}
+
+/// Keeps `expected`, the record of the group this device forgets of `conversation`, as the forget
+/// answers it, in the forget's own transaction: a client that closes before it keeps its own copy
+/// loses nothing. A second forget of the conversation keeps the newer group's in its place.
+fn keep_record(tx: &Tx<'_>, conversation: Uuid, expected: &Expected) -> Result<(), Error> {
+    let record = serde_json::to_string(expected)
+        .map_err(|_| Error::Internal("a forgotten group's record couldn't be written".into()))?;
+    tx.conn().execute(
+        "INSERT INTO forgotten_groups (conversation_id, record) VALUES (?1, ?2) \
+         ON CONFLICT (conversation_id) DO UPDATE SET record = excluded.record",
+        params![conversation.as_bytes().as_slice(), record],
+    )?;
+    Ok(())
 }
 
 /// The group as this device has it.

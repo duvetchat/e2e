@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::Error;
 
 /// The schema this core writes. It opens every earlier one and refuses a later one.
-pub(crate) const VERSION: i64 = 5;
+pub(crate) const VERSION: i64 = 6;
 
 pub(crate) fn run(conn: &mut Connection) -> Result<(), Error> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -44,8 +44,25 @@ pub(crate) fn run(conn: &mut Connection) -> Result<(), Error> {
         txn.pragma_update(None, "user_version", 5)?;
         txn.commit()?;
     }
+    if version < 6 {
+        let txn = conn.transaction()?;
+        txn.execute_batch(V6)?;
+        txn.pragma_update(None, "user_version", 6)?;
+        txn.commit()?;
+    }
     Ok(())
 }
+
+/// Schema 6: the record of each group this device forgot (`forget_group`), in JSON, as the command
+/// answered it, written in the forget's own transaction: a client that closes before it keeps its
+/// own copy loses nothing. A second forget of the conversation keeps the newer group's. A database
+/// of schema 5 starts with none: its forgets only answered their records.
+const V6: &str = r#"
+CREATE TABLE forgotten_groups (
+    conversation_id BLOB PRIMARY KEY,
+    record TEXT NOT NULL
+);
+"#;
 
 /// Schema 5: the messages waiting to send in a group this device forgot (`outbox`'s `stale`,
 /// `forget_group`). Nobody reads the group they're encrypted in, so their retry is `stale_message`,
