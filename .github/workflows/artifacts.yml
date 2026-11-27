@@ -19,10 +19,9 @@ env:
 
 jobs:
   artifacts:
-    runs-on: [self-hosted, linux, x64, duvet]
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
-    # One run at a time, and every run waits its turn: they share the target directory, and a run
-    # publishes the files it built.
+    # One run at a time, and every run waits its turn: a run publishes the files it built.
     concurrency:
       group: artifacts
       queue: max
@@ -30,13 +29,9 @@ jobs:
       contents: write
     container:
       image: docker.io/library/rust:1.99.1-bookworm
-      volumes:
-        - /var/cache/duvet-e2e:/cache
-        # For its NDK. Read-only: the runner's other jobs build with it.
-        - /opt/android-sdk:/opt/android-sdk:ro
     env:
       CARGO_TARGET_DIR: /cache/target/artifacts
-      # The NDK of Flutter 3.47.7, which the runner's Android builds installed.
+      # The NDK of Flutter 3.47.7, which the job installs: GitHub's image lacks it.
       NDK_BIN: /opt/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin
     defaults:
       run:
@@ -46,6 +41,24 @@ jobs:
         with:
           # The builds run every dependency's build script: none of them finds the token that publishes.
           persist-credentials: false
+      # The registry and the target directory, kept between runs as ci.yml keeps them. A release runs
+      # on main, so it reads only what main's runs saved.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /cache/cargo/registry/index
+            /cache/cargo/registry/cache
+            /cache/target/artifacts
+          key: artifacts-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: artifacts-${{ hashFiles('rust-toolchain.toml') }}-
+      - name: Install NDK 28.2.13676358
+        run: |
+          curl -sSfL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r28c-linux.zip
+          echo "dfb20d396df28ca02a8c708314b814a4d961dc9074f9a161932746f815aa552f  /tmp/ndk.zip" | sha256sum -c -
+          mkdir -p /opt/android-sdk/ndk
+          unzip -q /tmp/ndk.zip -d /opt/android-sdk/ndk && rm /tmp/ndk.zip
+          mv /opt/android-sdk/ndk/android-ndk-r28c /opt/android-sdk/ndk/28.2.13676358
+          [ -x "$NDK_BIN/aarch64-linux-android21-clang" ] || { echo "No NDK at $NDK_BIN"; exit 1; }
       # SQLCipher's C is compiled for wasm32 with clang, and for Windows with mingw-w64.
       - name: Install clang, mingw-w64, gh, wasm-bindgen 0.2.130 and the Windows and Android targets
         run: |
@@ -54,7 +67,6 @@ jobs:
           echo "9687f3bb551b9f66f37ed32a40d7913a00f7962db653054e56857bc306c3227f  /tmp/wasm-bindgen.tar.gz" | sha256sum -c -
           tar -xzf /tmp/wasm-bindgen.tar.gz -C /tmp && install /tmp/wasm-bindgen-0.2.130-x86_64-unknown-linux-musl/wasm-bindgen /usr/local/bin/
           rustup target add x86_64-pc-windows-gnu aarch64-linux-android
-          [ -x "$NDK_BIN/aarch64-linux-android21-clang" ] || { echo "The runner has no NDK at $NDK_BIN"; exit 1; }
       # Each package on its own, as CI builds it: built together, they'd share their dependencies' features.
       - name: Linux x64, the C ABI
         run: cargo build --locked --release -p duvet-e2e-ffi
