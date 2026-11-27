@@ -24,23 +24,31 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # The runner keeps /var/cache/duvet-e2e between runs: the registry, and a target directory per job.
+  # Each job keeps the registry and its target directories between runs through actions/cache, keyed
+  # by the toolchain and the manifests and lock files; a key's entry is saved once. GitHub keeps what
+  # a pull request's runs save for that pull request: main's runs never read it.
   CARGO_HOME: /cache/cargo
 
-# Every job runs in the same image, whose toolchain matches rust-toolchain.toml, so the runner's
-# instances never install a toolchain into the home they share.
+# GitHub's runners run every job but flutter in the same image, whose toolchain matches
+# rust-toolchain.toml.
 jobs:
   rust:
     if: github.event_name != 'schedule' && !inputs.fuzz
-    runs-on: [self-hosted, linux, x64, duvet]
+    runs-on: ubuntu-24.04
     container:
       image: docker.io/library/rust:1.99.1-bookworm
-      volumes:
-        - /var/cache/duvet-e2e:/cache
     env:
       CARGO_TARGET_DIR: /cache/target/rust
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /cache/cargo/registry/index
+            /cache/cargo/registry/cache
+            /cache/target/rust
+          key: rust-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: rust-${{ hashFiles('rust-toolchain.toml') }}-
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -62,13 +70,18 @@ jobs:
 
   deny:
     if: github.event_name != 'schedule' && !inputs.fuzz
-    runs-on: [self-hosted, linux, x64, duvet]
+    runs-on: ubuntu-24.04
     container:
       image: docker.io/library/rust:1.99.1-bookworm
-      volumes:
-        - /var/cache/duvet-e2e:/cache
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /cache/cargo/registry/index
+            /cache/cargo/registry/cache
+          key: deny-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: deny-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Install cargo-deny 0.22.0
         run: |
           curl -sSfL -o /tmp/cargo-deny.tar.gz https://github.com/EmbarkStudios/cargo-deny/releases/download/0.22.0/cargo-deny-0.22.0-x86_64-unknown-linux-musl.tar.gz
@@ -91,15 +104,21 @@ jobs:
 
   wasm:
     if: github.event_name != 'schedule' && !inputs.fuzz
-    runs-on: [self-hosted, linux, x64, duvet]
+    runs-on: ubuntu-24.04
     container:
       image: docker.io/library/rust:1.99.1-bookworm
-      volumes:
-        - /var/cache/duvet-e2e:/cache
     env:
       CARGO_TARGET_DIR: /cache/target/wasm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /cache/cargo/registry/index
+            /cache/cargo/registry/cache
+            /cache/target/wasm
+          key: wasm-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: wasm-${{ hashFiles('rust-toolchain.toml') }}-
       # SQLCipher's C is compiled for wasm32, which takes clang: the image has gcc alone.
       - run: apt-get update && apt-get install -y --no-install-recommends clang lld llvm
       - run: cargo build --locked --target wasm32-unknown-unknown -p duvet-e2e-rules -p duvet-e2e -p duvet-e2e-wasm
@@ -107,15 +126,21 @@ jobs:
   # The C ABI the desktop loads: its header, the library under Bun, and its build for Windows.
   ffi:
     if: github.event_name != 'schedule' && !inputs.fuzz
-    runs-on: [self-hosted, linux, x64, duvet]
+    runs-on: ubuntu-24.04
     container:
       image: docker.io/library/rust:1.99.1-bookworm
-      volumes:
-        - /var/cache/duvet-e2e:/cache
     env:
       CARGO_TARGET_DIR: /cache/target/ffi
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /cache/cargo/registry/index
+            /cache/cargo/registry/cache
+            /cache/target/ffi
+          key: ffi-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: ffi-${{ hashFiles('rust-toolchain.toml') }}-
       # Bun 1.3.9 is the one Electrobun 1.15.1 ships; its baseline build runs on any x86-64.
       # SQLCipher's C and its OpenSSL are compiled for Windows with mingw-w64.
       - name: Install cbindgen 0.29.4, Bun 1.3.9, mingw-w64 and the Windows target
@@ -144,15 +169,21 @@ jobs:
   # The core in WebAssembly, under Node: SQLCipher encrypts there too.
   wasm-test:
     if: github.event_name != 'schedule' && !inputs.fuzz
-    runs-on: [self-hosted, linux, x64, duvet]
+    runs-on: ubuntu-24.04
     container:
       image: docker.io/library/rust:1.99.1-bookworm
-      volumes:
-        - /var/cache/duvet-e2e:/cache
     env:
       CARGO_TARGET_DIR: /cache/target/wasm-test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /cache/cargo/registry/index
+            /cache/cargo/registry/cache
+            /cache/target/wasm-test
+          key: wasm-test-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: wasm-test-${{ hashFiles('rust-toolchain.toml') }}-
       # wasm-bindgen's binaries match the version Cargo.lock holds, so wasm-pack downloads nothing.
       - name: Install clang, Node 24.22.3, wasm-pack 0.15.1 and wasm-bindgen 0.2.130
         run: |
@@ -172,19 +203,24 @@ jobs:
       - run: wasm-pack test --node crates/duvet-e2e-wasm --locked --features memory-vfs
 
   # The Flutter plugin: its tests on the core built for this host, then the example's APK, whose
-  # Android libraries cargokit builds. On the runner itself, for its Android SDK (and NDK 28).
+  # Android libraries cargokit builds. On the runner itself, for its Android SDK.
   flutter:
     if: github.event_name != 'schedule' && !inputs.fuzz
-    runs-on: [self-hosted, linux, x64, duvet]
-    timeout-minutes: 60
-    defaults:
-      run:
-        working-directory: host
+    runs-on: ubuntu-24.04
+    # A run with no cache, as a pull request's first is, builds the core for four Android ABIs.
+    timeout-minutes: 90
     steps:
-      # In a folder of its own: the jobs in containers leave the workspace's checkout to root.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The registry, the host's target directory and cargokit's, which holds the Android builds.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: host
+          path: |
+            ${{ runner.tool_cache }}/duvet-e2e/cargo/registry/index
+            ${{ runner.tool_cache }}/duvet-e2e/cargo/registry/cache
+            ${{ runner.tool_cache }}/duvet-e2e/target
+            flutter/duvet_e2e/example/build/duvet_e2e/build
+          key: flutter-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: flutter-${{ hashFiles('rust-toolchain.toml') }}-
       - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
@@ -193,8 +229,12 @@ jobs:
         with:
           flutter-version: 3.47.7
           channel: stable
-      # rustup and its toolchains in this runner instance's own tool cache: the four instances share
-      # one home, where two jobs installing at once would race.
+      # Flutter 3.47.7's NDK, which GitHub's image lacks: cargokit and Gradle build with it.
+      - name: Install NDK 28.2.13676358
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;28.2.13676358"
+      # Rust 1.99.1 in the tool cache, apart from the image's own: the workflow's CARGO_HOME is the
+      # containers'.
       - name: Install Rust 1.99.1
         env:
           RUSTUP_HOME: ${{ runner.tool_cache }}/duvet-e2e/rustup
@@ -214,7 +254,7 @@ jobs:
       # cargokit builds with rust-toolchain.toml's toolchain and --locked (its builder.dart, patched
       # for them), and adds the Android targets it needs. With CARGOKIT_VERBOSE it logs each command.
       - name: The example's APK
-        working-directory: host/flutter/duvet_e2e/example
+        working-directory: flutter/duvet_e2e/example
         env:
           RUSTUP_HOME: ${{ runner.tool_cache }}/duvet-e2e/rustup
           CARGO_HOME: ${{ runner.tool_cache }}/duvet-e2e/cargo
@@ -235,17 +275,23 @@ jobs:
 
   validator:
     if: github.event_name != 'schedule' && !inputs.fuzz
-    runs-on: [self-hosted, linux, x64, duvet]
+    runs-on: ubuntu-24.04
     container:
       image: docker.io/library/rust:1.99.1-bookworm
-      volumes:
-        - /var/cache/duvet-e2e:/cache
     env:
       CARGO_TARGET_DIR: /cache/target/validator
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The module goes at once to where the Go test reads it, in this run's checkout: other runs
-      # share the target directory.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /cache/cargo/registry/index
+            /cache/cargo/registry/cache
+            /cache/target/validator
+            /cache/go
+          key: validator-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'host-tests/go/go.sum') }}
+          restore-keys: validator-${{ hashFiles('rust-toolchain.toml') }}-
+      # The module goes to where the Go test reads it, in the checkout's own target directory.
       - run: |
           cargo build --locked --release --target wasm32-wasip1 -p duvet-e2e-rules -p duvet-e2e-validator
           mkdir -p target/wasm32-wasip1/release
@@ -269,20 +315,31 @@ jobs:
         run: /usr/local/go/bin/go test -count=1 ./...
 
   # Each format the core reads from the server or the disk, fuzzed 5 minutes a night with the pinned
-  # nightly. The corpus grows in the runner's cache from night to night. Nothing is uploaded: a crash
-  # prints its input, in base64, in the log.
+  # nightly. The corpus grows from night to night in GitHub's cache, a new entry each run, saved even
+  # when a target fails. Nothing is uploaded: a crash prints its input, in base64, in the log.
   fuzz:
     if: github.event_name == 'schedule' || inputs.fuzz
-    runs-on: [self-hosted, linux, x64, duvet]
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     container:
       image: docker.io/library/rust:1.99.1-bookworm
-      volumes:
-        - /var/cache/duvet-e2e:/cache
     env:
       CARGO_TARGET_DIR: /cache/target/fuzz
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /cache/cargo/registry/index
+            /cache/cargo/registry/cache
+            /cache/target/fuzz
+          key: fuzz-nightly-2026-11-20-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: fuzz-nightly-2026-11-20-${{ hashFiles('rust-toolchain.toml') }}-
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /cache/fuzz-corpus
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-
       - name: Install nightly-2026-11-20 and cargo-fuzz 0.13.2
         run: |
           rustup toolchain install nightly-2026-11-20 --profile minimal
@@ -303,3 +360,8 @@ jobs:
             if [ -f "$input" ]; then echo "$input: $(base64 -w0 "$input")"; fi
           done
           exit "$failed"
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: always()
+        with:
+          path: /cache/fuzz-corpus
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
