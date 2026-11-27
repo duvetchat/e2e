@@ -47,9 +47,10 @@ jobs:
       - name: The iOS simulator on arm64, the Flutter plugin
         run: cargo build --locked --release --target aarch64-apple-ios-sim -p duvet_e2e
       # flutter_rust_bridge opens the plugin on iOS as duvet_e2e.framework/duvet_e2e: each iOS library
-      # becomes that framework, named by @rpath as an app embeds it, and the two one XCFramework. A new
-      # name breaks the signature the linker gave it, so it's signed again, ad hoc, as the linker had:
-      # an app signs it with its own as it embeds it.
+      # becomes that framework, named by @rpath as an app embeds it, and the two one XCFramework. Then
+      # each framework is signed ad hoc as a whole, its Info.plist sealed with it, where it lies in the
+      # XCFramework: the device's library comes unsigned, and a new name breaks the signature the
+      # linker gave the simulator's. An app signs it with its own as it embeds it.
       - name: Gather the files, the iOS libraries as one XCFramework
         run: |
           rm -rf dist apple && mkdir dist
@@ -61,7 +62,6 @@ jobs:
             mkdir -p "$framework"
             cp "target/${slice%%:*}/release/libduvet_e2e.dylib" "$framework/duvet_e2e"
             install_name_tool -id @rpath/duvet_e2e.framework/duvet_e2e "$framework/duvet_e2e"
-            codesign --force --sign - "$framework/duvet_e2e"
             jq -n --arg platform "${slice#*:}" --arg version "$version" --arg minimum "$IPHONEOS_DEPLOYMENT_TARGET" '{
               CFBundleDevelopmentRegion: "en",
               CFBundleExecutable: "duvet_e2e",
@@ -79,6 +79,7 @@ jobs:
             -framework apple/aarch64-apple-ios/duvet_e2e.framework \
             -framework apple/aarch64-apple-ios-sim/duvet_e2e.framework \
             -output apple/duvet_e2e.xcframework
+          for framework in apple/duvet_e2e.xcframework/*/duvet_e2e.framework; do codesign --force --sign - "$framework"; done
           ditto -c -k --keepParent apple/duvet_e2e.xcframework dist/ios-duvet_e2e.xcframework.zip
       # Before the checks, so a run they fail still shows what it built. The Linux job's summary gives
       # every file's checksum.
@@ -114,8 +115,8 @@ jobs:
             [ -z "$others" ] || { echo "$binary needs more than the system's: $others"; exit 1; }
             [ "$(built_for "$binary")" = "$system" ] || { echo "$binary is built for $(built_for "$binary"), not $system"; exit 1; }
             [ "$(lipo -archs "$binary")" = arm64 ] || { echo "$binary is $(lipo -archs "$binary")"; exit 1; }
-            codesign --verify --strict "$binary"
           done
+          codesign --verify --strict --verbose dist/*.dylib "$slices"/*/duvet_e2e.framework
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: apple
