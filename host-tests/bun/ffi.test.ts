@@ -144,6 +144,34 @@ describe("the C ABI", () => {
     expect(destroy(config)).toEqual({ ok: {} });
   });
 
+  // A group command through the same JSON: a device founds a DM alone, with no key package of the
+  // other member's, types a message there and forgets it, which leaves the message stale (groups.rs'
+  // a_lone_device_forgets_the_group_it_founded).
+  test("forget_group answers the group's members, and the group is gone", () => {
+    const core = open({ path: database(), db_key: dbKey() }).ok.handle;
+    const [user, other, conversation] = [randomUUID(), randomUUID(), randomUUID()];
+    const run = (command: object) => handle(core, JSON.stringify(command));
+    expect(run({ cmd: "create_device", user_id: user, device_id: randomUUID() }).ok).toBeDefined();
+    expect(run({ cmd: "create_identity" }).ok).toBeDefined();
+    const external_sender = randomBytes(32).toString("base64");
+    const members = [user, other];
+    const create = { cmd: "create_group", conversation_id: conversation, kind: "dm", members, external_sender };
+    expect(run(create).ok.generation).toBe(0);
+    expect(run({ cmd: "commit_result", conversation_id: conversation, accepted: true, seq: 1 }).ok.epoch).toBe(1);
+    const typed = { cmd: "encrypt", conversation_id: conversation, nonce: "typed", envelope: { text: "hello" } };
+    expect(run(typed).ok.epoch).toBe(1);
+
+    const forget = { cmd: "forget_group", conversation_id: conversation };
+    expect(run(forget)).toEqual({ ok: { expected: { members, exact: true } } });
+    expect(run(typed).error).toMatchObject({ code: "rule_violation", rule: "stale_message" });
+    const none = { code: "not_found", what: "group" };
+    expect(run({ cmd: "group", conversation_id: conversation }).error).toMatchObject(none);
+    expect(run(forget).error).toMatchObject(none);
+    // Founded again at generation 0, the group ID the forgotten one had.
+    expect(run({ ...create, expected: { members } }).ok.generation).toBe(0);
+    close(core);
+  });
+
   // Windows' Credential Manager, the desktop's keyring: windows.yml runs these on a release's DLL.
   test.skipIf(!credentialManager)("the keyring keeps the key", () => {
     const path = database();

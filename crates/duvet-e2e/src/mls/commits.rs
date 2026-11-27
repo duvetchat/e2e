@@ -2,8 +2,8 @@
 //! removals, its leaf's renewal), joining by external commit, and what the group is.
 
 use duvet_e2e_rules::{
-    CommitAad, Kind, MemberList, check_joined_state, external_sender_is, group_id, join_config,
-    leaf_capabilities, leaves,
+    CommitAad, Entry, Kind, MemberList, check_joined_state, external_sender_is, group_id,
+    join_config, leaf_capabilities, leaves,
 };
 use openmls::prelude::tls_codec::DeserializeBytes as _;
 use openmls::prelude::{
@@ -66,6 +66,13 @@ pub(crate) struct JoinExternal {
 #[derive(Serialize)]
 pub(crate) struct Due {
     conversations: Vec<Uuid>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct Forgotten {
+    /// The members the forgotten group had, with its owner in a group: the record of what brings
+    /// the group back.
+    expected: Expected,
 }
 
 #[derive(Serialize)]
@@ -425,6 +432,49 @@ pub(crate) fn join_external(tx: &Tx<'_>, request: JoinExternal) -> Result<Commit
     }
     .write(tx)?;
     Ok(Committed { commit, group_info })
+}
+
+/// Leaves the group this device holds of the conversation, for a client whose API holds none, or
+/// holds another one at the device's generation (`apply`'s `another_group`): the conversation's row
+/// goes (its numbers, its epoch, its members, its statements), and so does the group's MLS state,
+/// as a group founded again at its generation has its ID. What waits to send there is stale
+/// (`messages::group_forgotten`), and the messages it holds stay. It answers the members the group
+/// had, without those whose leave statements it holds, with its owner in a group, for the client
+/// to hold what brings the group back to
+/// (`expected`: `create_group`, `apply`'s welcomes, `join_external`), so nobody the forgotten group
+/// didn't have comes in on the API's word alone. Not while a commit of this device's waits for the
+/// server's word, or for the queue after a refusal (`pending_commit`); and only a group this device
+/// is in (`not_found`, as [`load_group`] names it).
+pub(crate) fn forget_group(tx: &Tx<'_>, request: ConversationId) -> Result<Forgotten, Error> {
+    let conversation = request.conversation_id;
+    let (mut group, row) = load_group(tx, conversation)?;
+    if row.pending.is_some() || group.pending_commit().is_some() {
+        return Err(Error::PendingCommit);
+    }
+    let list = MemberList::from_group_context(group.public_group().group_context())
+        .map_err(|_| stored_state())?;
+    // Without the users whose leave statements this device holds, whom the API took off as they
+    // left: a leaving owner's place goes to the first of those who stay, as the API gives it.
+    let left = row.leavers();
+    let staying: Vec<Entry> = list
+        .users
+        .iter()
+        .filter(|entry| !left.contains(&entry.user))
+        .copied()
+        .collect();
+    let owner = match list.owner {
+        Some(owner) if left.contains(&owner) => staying.first().map(|entry| entry.user),
+        owner => owner,
+    };
+    let list = MemberList::new(list.kind, owner, staying);
+    group
+        .delete(tx.provider().storage())
+        .map_err(storage_error)?;
+    GroupRow::delete(tx, conversation)?;
+    crate::messages::group_forgotten(tx, conversation)?;
+    Ok(Forgotten {
+        expected: Expected::of(&list),
+    })
 }
 
 /// The group as this device has it.

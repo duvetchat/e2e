@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::Error;
 
 /// The schema this core writes. It opens every earlier one and refuses a later one.
-pub(crate) const VERSION: i64 = 4;
+pub(crate) const VERSION: i64 = 5;
 
 pub(crate) fn run(conn: &mut Connection) -> Result<(), Error> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -38,8 +38,20 @@ pub(crate) fn run(conn: &mut Connection) -> Result<(), Error> {
         txn.pragma_update(None, "user_version", 4)?;
         txn.commit()?;
     }
+    if version < 5 {
+        let txn = conn.transaction()?;
+        txn.execute_batch(V5)?;
+        txn.pragma_update(None, "user_version", 5)?;
+        txn.commit()?;
+    }
     Ok(())
 }
+
+/// Schema 5: the messages waiting to send in a group this device forgot (`outbox`'s `stale`,
+/// `forget_group`). Nobody reads the group they're encrypted in, so their retry is `stale_message`,
+/// whatever the numbers of a group founded again there, which start over as the forgotten one's
+/// did. The rows schema 4 left aren't stale (0).
+const V5: &str = "ALTER TABLE outbox ADD COLUMN stale INTEGER NOT NULL DEFAULT 0;";
 
 /// Schema 4: when the client marked each key package spent (`key_packages`' `spent`): a single-use
 /// one the API says it handed out. A spent one counts no more and isn't handed out again, and its

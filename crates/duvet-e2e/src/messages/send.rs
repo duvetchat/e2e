@@ -147,10 +147,11 @@ pub(crate) fn encrypt(tx: &Tx<'_>, request: Encrypt) -> Result<Encrypted, Error>
 /// for the same message in the same conversation. Once its copy came back, the nonce is spent.
 ///
 /// A ciphertext no member can open any more is `stale_message`, and the message stays as it is:
-/// the group's generation changed since (a reset), or its epoch moved more than `MAX_PAST_EPOCHS`
-/// past the ciphertext's. The client then drops it (`discard`) and encrypts its text again under a
-/// new nonce. Clients resend what's still pending in the order it was encrypted, before anything
-/// new: OpenMLS opens a message at most 5 generations behind its sender's latest.
+/// this device forgot the group it's encrypted in ([`group_forgotten`]), the group's generation
+/// changed since (a reset), or its epoch moved more than `MAX_PAST_EPOCHS` past the ciphertext's.
+/// The client then drops it (`discard`) and encrypts its text again under a new nonce. Clients
+/// resend what's still pending in the order it was encrypted, before anything new: OpenMLS opens a
+/// message at most 5 generations behind its sender's latest.
 fn retry(
     tx: &Tx<'_>,
     nonce: &str,
@@ -159,21 +160,26 @@ fn retry(
     plain: &[u8],
     own: &OwnDevice,
 ) -> Result<Encrypted, Error> {
-    let waiting: Option<(Vec<u8>, i64, i64)> = tx
+    let waiting: Option<(Vec<u8>, i64, i64, bool)> = tx
         .conn()
         .query_row(
-            "SELECT ciphertext, generation, epoch FROM outbox WHERE nonce = ?1",
+            "SELECT ciphertext, generation, epoch, stale FROM outbox WHERE nonce = ?1",
             [nonce],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    let Some((ciphertext, generation, epoch)) = waiting else {
+    let Some((ciphertext, generation, epoch, stale)) = waiting else {
         return Err(Error::Exists {
             what: "message".into(),
         });
     };
     if row.conversation != conversation || row.envelope.as_deref() != Some(plain) {
         return Err(invalid("nonce", "the nonce was used for another message"));
+    }
+    if stale {
+        return Err(Error::RuleViolation {
+            rule: STALE_MESSAGE.into(),
+        });
     }
     let stored = || Error::Internal("a message waiting to be sent is malformed".into());
     let generation = u32::try_from(generation).map_err(|_| stored())?;
@@ -191,6 +197,18 @@ fn retry(
         epoch,
         sender_device_id: own.device,
     })
+}
+
+/// Every message waiting to send in `conversation`'s group goes stale, as this device forgot that
+/// group (`forget_group`): its retry is `stale_message` ([`retry`]), even in a group founded again
+/// with the forgotten one's generation and epoch. Its row stays, for the client to encrypt its text
+/// again.
+pub(crate) fn group_forgotten(tx: &Tx<'_>, conversation: Uuid) -> Result<(), Error> {
+    tx.conn().execute(
+        "UPDATE outbox SET stale = 1 WHERE conversation_id = ?1",
+        [conversation.as_bytes().as_slice()],
+    )?;
+    Ok(())
 }
 
 /// Drops a message this device encrypted that has no ID yet, for a send that can't complete: the

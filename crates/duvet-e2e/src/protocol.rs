@@ -100,6 +100,7 @@ pub(crate) enum Command {
     Refresh(mls::ConversationId),
     JoinExternal(mls::JoinExternal),
     ResetGroup(mls::ResetGroup),
+    ForgetGroup(mls::ConversationId),
     Group(mls::ConversationId),
     Apply(mls::ApplyRequest),
 
@@ -209,6 +210,7 @@ pub(crate) fn dispatch(tx: &mut Tx<'_>, command: Command) -> Result<Value, Error
         Command::Refresh(request) => reply(mls::refresh(tx, request)?),
         Command::JoinExternal(request) => reply(mls::join_external(tx, request)?),
         Command::ResetGroup(request) => reply(mls::reset_group(tx, request)?),
+        Command::ForgetGroup(request) => reply(mls::forget_group(tx, request)?),
         Command::Group(request) => reply(mls::group(tx, request)?),
         Command::Apply(request) => reply(mls::apply(tx, request)?),
 

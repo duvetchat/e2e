@@ -89,16 +89,30 @@ pub(crate) enum EntryKind {
     Delete,
 }
 
-/// A conversation's members as a device knew them before the cutover.
-#[derive(Debug, Deserialize)]
+/// A conversation's members as a device knew them before the cutover, or as the group it forgot
+/// had them (`forget_group`).
+#[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct Expected {
     /// A group's owner; a DM has none.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     owner: Option<Uuid>,
     members: Vec<Uuid>,
+    /// A forgotten group's record: whatever brings the group back has exactly these users and
+    /// owner, as a founding does. A record from before the cutover goes without it.
+    #[serde(default)]
+    exact: bool,
 }
 
 impl Expected {
+    /// The exact record of `list`: its owner, and its users in its order.
+    pub(crate) fn of(list: &MemberList) -> Expected {
+        Expected {
+            owner: list.owner,
+            members: list.users.iter().map(|entry| entry.user).collect(),
+            exact: true,
+        }
+    }
+
     /// The record as a list at `generation`'s start: a group's when there's an owner, a DM's when
     /// there isn't.
     pub(crate) fn list(&self, generation: u32) -> MemberList {
@@ -111,12 +125,13 @@ impl Expected {
     }
 
     /// Holds a group this device joins at `generation` to this record, in `ctx`: the founding
-    /// welcome, the first commit's at generation 0, to the record's members (`is_record`); any
-    /// other join, at any generation, with a row for the conversation or without, to
-    /// `keeps_record`.
+    /// welcome, the first commit's at generation 0, and every join to a forgotten group's exact
+    /// record, to the record's members and owner (`is_record`); any other join, at any generation,
+    /// with a row for the conversation or without, to `keeps_record`. A forgotten group comes back
+    /// with no one left out and no other owner: a blocked group's block held as much.
     pub(crate) fn hold(&self, ctx: &mut RuleContext, generation: u32, founding: bool) {
         let list = self.list(generation);
-        ctx.record = Some(if founding {
+        ctx.record = Some(if founding || self.exact {
             Record::Founding(list)
         } else {
             Record::Joined(list)
@@ -143,9 +158,10 @@ pub(crate) enum Applied {
     Removed,
     /// Refused, for the rule it breaks (or `malformed`, `invalid_commit`, `invalid_welcome`,
     /// `invalid_proposal`, `wrong_group` for what isn't a valid message of this group,
-    /// `stale_welcome` for a welcome to an epoch this device held or saw pass, and
-    /// `external_sender_mismatch` for one whose group doesn't have the API's key the client gave as
-    /// its one external sender; `not_author` for an edit or a deletion of another user's message).
+    /// `stale_welcome` for a welcome to an epoch this device held or saw pass, `another_group` for
+    /// one to the generation of a group it holds, and `external_sender_mismatch` for one whose
+    /// group doesn't have the API's key the client gave as its one external sender; `not_author`
+    /// for an edit or a deletion of another user's message).
     /// Another device's commit refused for a rule, or one OpenMLS can't process, also blocks the
     /// group, and nothing goes on it but a reset; a malformed entry, a commit entry that holds no
     /// commit, and a refused welcome or proposal leave the group as it was.
@@ -409,6 +425,8 @@ impl EntryHandler for Commits {
 /// Welcomes: one for this device brings it into a group, after it holds that group to the rules,
 /// and to the API's key as its one external sender when the client gives it. One refused only for
 /// what this device knows of its leaves' users first asks to observe them anew, as a commit does.
+/// One to the generation of a group this device holds is another group (`another_group`), whose
+/// key package it spends all the same.
 struct Welcomes;
 
 impl EntryHandler for Welcomes {
@@ -451,7 +469,13 @@ impl EntryHandler for Welcomes {
                 }
                 None
             }
-            // An older generation's, or this device is in the group, or the group is blocked.
+            // A group at the generation this device holds one of, which it opened with a key
+            // package of its own: the API's group there isn't the one this device holds. That one
+            // stays until the client forgets it (`forget_group`).
+            Some(row) if generation == row.generation && at.group.is_some() && !row.blocked => {
+                return Ok(rejected("another_group"));
+            }
+            // An older generation's, or the group is blocked: only a reset takes it on.
             Some(_) => return Ok(Applied::Ignored),
         };
         let key_package = processed

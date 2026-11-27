@@ -5,7 +5,7 @@
 
 use duvet_e2e::{Core, OpenConfig};
 use duvet_e2e_wasm::{WasmCore, use_memory_vfs};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlite_wasm_rs::vfs::memvfs::MemVfsUtil;
 use sqlite_wasm_rs::vfs::transfer::DbTransfer;
 use wasm_bindgen::JsValue;
@@ -122,5 +122,56 @@ fn sqlcipher_encrypts_in_wasm() {
 
     let mut core = WasmCore::open(r#"{"path":"cipher.db"}"#, &[1; 32]).unwrap();
     assert_eq!(ok(&mut core, r#"{"cmd":"status"}"#)["protocol"], 1);
+    core.close();
+}
+
+/// A group command through the same JSON: a device founds a DM alone, with no key package of the
+/// other member's, types a message there and forgets it, which leaves the message stale
+/// (`groups.rs`' `a_lone_device_forgets_the_group_it_founded`).
+#[wasm_bindgen_test]
+fn forget_group_through_wasm() {
+    use base64::Engine as _;
+
+    use_memory_vfs();
+    let mut core = WasmCore::open(r#"{"path":"forget.db"}"#, &[1; 32]).unwrap();
+    let user = "01930000-0000-7000-8000-000000000551";
+    let other = "01930000-0000-7000-8000-000000000552";
+    let conversation = "01930000-0000-7000-8000-000000000553";
+    let device = "01930000-0000-7000-8000-000000000554";
+    let run = |core: &mut WasmCore, command: Value| reply(&core.handle(&command.to_string()));
+    let created = json!({"cmd": "create_device", "user_id": user, "device_id": device});
+    assert!(run(&mut core, created)["ok"].is_object());
+    assert!(run(&mut core, json!({"cmd": "create_identity"}))["ok"].is_object());
+    let external_sender = base64::engine::general_purpose::STANDARD.encode([9; 32]);
+    let create = json!({
+        "cmd": "create_group",
+        "conversation_id": conversation,
+        "kind": "dm",
+        "members": [user, other],
+        "external_sender": external_sender,
+    });
+    assert_eq!(run(&mut core, create.clone())["ok"]["generation"], 0);
+    let taken = json!({"cmd": "commit_result", "conversation_id": conversation, "accepted": true, "seq": 1});
+    assert_eq!(run(&mut core, taken)["ok"]["epoch"], 1);
+    let typed = json!({"cmd": "encrypt", "conversation_id": conversation, "nonce": "typed", "envelope": {"text": "hello"}});
+    assert_eq!(run(&mut core, typed.clone())["ok"]["epoch"], 1);
+
+    let forget = json!({"cmd": "forget_group", "conversation_id": conversation});
+    assert_eq!(
+        run(&mut core, forget.clone()),
+        json!({"ok": {"expected": {"members": [user, other], "exact": true}}})
+    );
+    let stale = run(&mut core, typed);
+    assert_eq!(stale["error"]["rule"], "stale_message", "{stale}");
+    let gone = run(
+        &mut core,
+        json!({"cmd": "group", "conversation_id": conversation}),
+    );
+    assert_eq!(gone["error"]["what"], "group", "{gone}");
+    assert_eq!(run(&mut core, forget)["error"]["code"], "not_found");
+    // Founded again at generation 0, the group ID the forgotten one had.
+    let mut again = create;
+    again["expected"] = json!({"members": [user, other]});
+    assert_eq!(run(&mut core, again)["ok"]["generation"], 0);
     core.close();
 }
