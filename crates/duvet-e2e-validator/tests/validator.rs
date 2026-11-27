@@ -1168,6 +1168,37 @@ fn a_member_takes_out_a_device_off_its_users_list() {
     assert_eq!(taken.change.unwrap().devices_removed, vec![second]);
 }
 
+/// A commit that adds a device already in the group is refused (#57). Another key package of that
+/// device's has the signature key its leaf has, which OpenMLS's own builder won't commit and every
+/// staging, the validator's too, refuses (`DuplicateSignatureKey`, ValSem101). Under the device's ID
+/// with another signature key, certified by its user's identity, as any holder of that identity can
+/// make, it's the rules that refuse it: a device has one leaf.
+#[test]
+fn a_commit_that_adds_a_device_already_in_the_group_is_refused() {
+    let mut chat = Chat::group();
+    let leaves_before = chat.groups[&(O, 0)].members().count();
+    let user = &chat.world.users[A];
+    let (id, signer) = (user.devices[0].id, signer());
+    let certificate = DeviceCertificate::new(user.id, id, public(&signer), [7; 32], 2)
+        .sign(&user.identity)
+        .unwrap();
+    let twin = Device {
+        user: user.id,
+        id,
+        signer,
+        provider: OpenMlsRustCrypto::default(),
+        certificate,
+    };
+    chat.world.users[A].devices.push(twin);
+    let again = Commit {
+        adds: vec![(A, 1)],
+        ..Commit::default()
+    };
+    let response = chat.submit((O, 0), again);
+    assert_eq!(code(&response), "duplicate_device");
+    assert_eq!(chat.groups[&(O, 0)].members().count(), leaves_before);
+}
+
 #[test]
 fn missing_identities_are_named() {
     let mut chat = Chat::group();

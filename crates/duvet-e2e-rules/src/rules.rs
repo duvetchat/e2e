@@ -47,6 +47,8 @@ pub enum RuleViolation {
         "a leaf goes without its user leaving or being removed, the server removing it, or its device leaving its user's list"
     )]
     LeafRemovedWithoutReason,
+    #[error("two leaves are one device's")]
+    DuplicateDevice,
     #[error("a signature doesn't verify")]
     InvalidSignature,
     #[error("malformed")]
@@ -70,6 +72,7 @@ impl RuleViolation {
             RuleViolation::PendingRemovalDropped => "pending_removal_dropped",
             RuleViolation::MemberListMismatch => "member_list_mismatch",
             RuleViolation::LeafRemovedWithoutReason => "leaf_removed_without_reason",
+            RuleViolation::DuplicateDevice => "duplicate_device",
             RuleViolation::InvalidSignature => "invalid_signature",
             RuleViolation::Malformed => "malformed",
         }
@@ -198,6 +201,19 @@ fn change_rules(
         if (certificate.user, certificate.device) != (old.user, old.device) {
             return Err(LeafNotSigned);
         }
+    }
+    // One leaf per device, among those that stay and those the commit brings: a holder of a user's
+    // identity could otherwise certify a second key under one of the user's device IDs (#57).
+    let removed: BTreeSet<u32> = change.removed.iter().map(|removal| removal.index).collect();
+    let staying = change
+        .leaves
+        .iter()
+        .filter(|(index, _)| !removed.contains(index))
+        .map(|(_, leaf)| (leaf.user, leaf.device));
+    let brought = added.iter().map(|leaf| (leaf.user, leaf.device));
+    let mut devices = BTreeSet::new();
+    if !staying.chain(brought).all(|device| devices.insert(device)) {
+        return Err(DuplicateDevice);
     }
 
     check_list(change)?;
@@ -423,6 +439,13 @@ fn state(
         if !list.contains(certificate.user) {
             return Err(UserNotMember);
         }
+    }
+    let mut devices = BTreeSet::new();
+    if !leaves
+        .values()
+        .all(|leaf| devices.insert((leaf.user, leaf.device)))
+    {
+        return Err(DuplicateDevice);
     }
     Ok(())
 }

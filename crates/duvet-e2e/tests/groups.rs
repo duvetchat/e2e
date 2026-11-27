@@ -3500,3 +3500,47 @@ fn a_forgotten_group_comes_back_with_exactly_its_users_and_owner() {
     let legacy = json!({"owner": a, "members": [a, b, c]});
     assert!(ok(&mut a1.core, join(&legacy))["commit"].is_string());
 }
+
+/// A second leaf under a device already in the group (#57): a holder of B's identity certifies a
+/// new signature key under B1's ID, and A1, the owner, commits its key package past its core's
+/// rules. The API's validator refuses the commit; a member that applies it from a server that skips
+/// the validator blocks on it; and a device joining the group it makes refuses that group.
+#[test]
+fn a_second_leaf_under_one_device_is_refused() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut b1] = new_devices(&mut server, [a, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+
+    server.virtual_under(b, b1.id);
+    let twin = json!(server.virtual_key_package(b1.id, 3600));
+    let (commit, _, group_info) = add_by_hand(&mut a1, conversation, None, &twin);
+    let checked = server.check(conversation, &commit, &group_info);
+    assert_eq!(
+        checked.error.map(|refusal| refusal.code).as_deref(),
+        Some("duplicate_device")
+    );
+    let seq = server.force(conversation, "commit", commit);
+    assert_eq!(
+        results(&server.deliver(&mut b1)),
+        [json!([seq, "commit", "rejected", "duplicate_device"])]
+    );
+    assert_eq!(b1.group(conversation)["blocked"], true);
+
+    let mut a2 = server.device(a);
+    server.introduce(&mut a2);
+    let join = json!({
+        "cmd": "join_external",
+        "conversation_id": conversation,
+        "generation": 0,
+        "group_info": b64(&group_info),
+    });
+    let refused = error(&mut a2.core, join);
+    assert_eq!(
+        (&refused["code"], &refused["rule"]),
+        (&json!("rule_violation"), &json!("duplicate_device"))
+    );
+}

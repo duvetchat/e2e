@@ -355,8 +355,18 @@ impl FakeServer {
     /// A device of `user` with no core, on their list, whose key packages the test makes.
     pub fn virtual_device(&mut self, user: Uuid) -> Uuid {
         let id = new_id();
-        let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        let certificate = self.virtual_under(user, id);
         let record = self.users.get_mut(&user).expect("a user with an identity");
+        add_to_list(record, id, certificate);
+        id
+    }
+
+    /// A virtual device of `user` under `id`, with a new signature key the user's identity
+    /// certifies, as any holder of that identity can make: its certificate. Under the ID of a
+    /// device already listed, its key packages bring a second leaf under that device.
+    pub fn virtual_under(&mut self, user: Uuid, id: Uuid) -> Vec<u8> {
+        let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        let record = &self.users[&user];
         let certificate = DeviceCertificate::new(
             user,
             id,
@@ -366,17 +376,16 @@ impl FakeServer {
         )
         .sign(&record.identity())
         .unwrap();
-        add_to_list(record, id, certificate.clone());
         self.virtuals.insert(
             id,
             Virtual {
                 user,
                 signer,
-                certificate,
+                certificate: certificate.clone(),
                 provider: OpenMlsRustCrypto::default(),
             },
         );
-        id
+        certificate
     }
 
     /// A key package of a virtual device that lasts `seconds` from now, in base64.
