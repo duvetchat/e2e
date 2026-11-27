@@ -54,9 +54,11 @@ pub(crate) fn run(conn: &mut Connection) -> Result<(), Error> {
 }
 
 /// Schema 6: the record of each group this device forgot (`forget_group`), in JSON, as the command
-/// answered it, written in the forget's own transaction: a client that closes before it keeps its
-/// own copy takes it back (`forgotten`). A second forget of the conversation keeps the newer
-/// group's. A database of schema 5 starts with none: its forgets only answered their records.
+/// answered it, written in the forget's own transaction and kept until the device holds the
+/// conversation's group again (a welcome it takes, or its founding or external join the server
+/// took): a client that closes before it keeps its own copy takes it back (`forgotten`). A second
+/// forget of the conversation keeps the newer group's. A database of schema 5 starts with none:
+/// its forgets only answered their records.
 const V6: &str = r#"
 CREATE TABLE forgotten_groups (
     conversation_id BLOB PRIMARY KEY,

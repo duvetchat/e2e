@@ -137,9 +137,16 @@ void main() {
     await core.close();
     core = await DuvetE2e.open(config, key);
     expect(await run({'cmd': 'forgotten'}), kept);
-    // Founded again at generation 0, the group ID the forgotten one had.
+    // Founded again at generation 0, the group ID the forgotten one had. The record stays while the
+    // founding waits for the server's word, and goes once the server took it.
     final again = await run({...create, 'expected': expected});
     expect(again['ok']['generation'], 0);
+    expect(await run({'cmd': 'forgotten'}), kept);
+    final founded = await run({'cmd': 'commit_result', 'conversation_id': conversation, 'accepted': true, 'seq': 1});
+    expect(founded['ok']['epoch'], 1);
+    expect(await run({'cmd': 'forgotten'}), {
+      'ok': {'records': []},
+    });
     await core.close();
   });
 

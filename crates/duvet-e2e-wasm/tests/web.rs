@@ -177,10 +177,15 @@ fn forget_group_through_wasm() {
     assert_eq!(run(&mut core, forgotten.clone()), kept);
     core.close();
     let mut core = WasmCore::open(r#"{"path":"forget.db"}"#, &[1; 32]).unwrap();
-    assert_eq!(run(&mut core, forgotten), kept);
-    // Founded again at generation 0, the group ID the forgotten one had.
+    assert_eq!(run(&mut core, forgotten.clone()), kept);
+    // Founded again at generation 0, the group ID the forgotten one had. The record stays while the
+    // founding waits for the server's word, and goes once the server took it.
     let mut again = create;
     again["expected"] = expected;
     assert_eq!(run(&mut core, again)["ok"]["generation"], 0);
+    assert_eq!(run(&mut core, forgotten.clone()), kept);
+    let taken = json!({"cmd": "commit_result", "conversation_id": conversation, "accepted": true, "seq": 1});
+    assert_eq!(run(&mut core, taken)["ok"]["epoch"], 1);
+    assert_eq!(run(&mut core, forgotten), json!({"ok": {"records": []}}));
     core.close();
 }

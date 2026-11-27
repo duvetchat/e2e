@@ -180,8 +180,12 @@ describe("the C ABI", () => {
     close(core);
     core = open(config).ok.handle;
     expect(run({ cmd: "forgotten" })).toEqual(kept);
-    // Founded again at generation 0, the group ID the forgotten one had.
+    // Founded again at generation 0, the group ID the forgotten one had. The record stays while the
+    // founding waits for the server's word, and goes once the server took it.
     expect(run({ ...create, expected }).ok.generation).toBe(0);
+    expect(run({ cmd: "forgotten" })).toEqual(kept);
+    expect(run({ cmd: "commit_result", conversation_id: conversation, accepted: true, seq: 1 }).ok.epoch).toBe(1);
+    expect(run({ cmd: "forgotten" })).toEqual({ ok: { records: [] } });
     close(core);
   });
 

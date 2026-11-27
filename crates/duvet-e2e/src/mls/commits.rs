@@ -119,15 +119,17 @@ struct Device {
 }
 
 /// The server's word on this device's waiting commit. Taken, it's merged (an external commit,
-/// merged as it was made, stays). Refused, epoch 0 goes whole with its group, for the winner's
-/// welcome to come through `apply`, and so does a refused external commit or reset. A member's
-/// commit the validator refused (`invalid`) is dropped. One refused otherwise stays staged: the
-/// server may have taken it after all (a lost answer, then a retry's 409), so `apply` settles
-/// it from the queue. It merges it when the queue brings it back, and drops it when another
-/// commit takes its epoch, or a server proposal at its epoch shows it can't have entered. Until
-/// then this device makes no other commit (`pending_commit`). A commit left so is dropped by a
-/// later word that the validator refused it (`invalid`), which a client that knows it never sent
-/// the commit gives too: its bytes are lost, and only another member's commit would settle it.
+/// merged as it was made, stays), and a founding or an external join holds the group again: the
+/// record of a group this device forgot there goes ([`held_again`]). Refused, epoch 0 goes whole
+/// with its group, for the winner's welcome to come through `apply`, and so does a refused
+/// external commit or reset. A member's commit the validator refused (`invalid`) is dropped. One
+/// refused otherwise stays staged: the server may have taken it after all (a lost answer, then a
+/// retry's 409), so `apply` settles it from the queue. It merges it when the queue brings it back,
+/// and drops it when another commit takes its epoch, or a server proposal at its epoch shows it
+/// can't have entered. Until then this device makes no other commit (`pending_commit`). A commit
+/// left so is dropped by a later word that the validator refused it (`invalid`), which a client
+/// that knows it never sent the commit gives too: its bytes are lost, and only another member's
+/// commit would settle it.
 pub(crate) fn commit_result(tx: &Tx<'_>, request: CommitResult) -> Result<Epoch, Error> {
     let conversation = request.conversation_id;
     match request.seq {
@@ -213,6 +215,7 @@ pub(crate) fn commit_result(tx: &Tx<'_>, request: CommitResult) -> Result<Epoch,
         // joiner's could, so its stay begins at the first time the API gives.
         let at = (pending == Pending::Create).then(|| tx.now());
         crate::backup::entered(tx, conversation, at)?;
+        held_again(tx, conversation)?;
     }
     row.write(tx)?;
     Ok(Epoch {
@@ -493,9 +496,9 @@ pub(crate) fn forget_group(tx: &Tx<'_>, request: ConversationId) -> Result<Forgo
 }
 
 /// Keeps `expected`, the record of the group this device forgets of `conversation`, as the forget
-/// answers it, in the forget's own transaction: a client that closes before it keeps its own copy
-/// takes it back ([`forgotten`]). A second forget of the conversation keeps the newer group's in
-/// its place.
+/// answers it, in the forget's own transaction, until the device holds the group again
+/// ([`held_again`]): a client that closes before it keeps its own copy takes it back
+/// ([`forgotten`]). A second forget of the conversation keeps the newer group's in its place.
 fn keep_record(tx: &Tx<'_>, conversation: Uuid, expected: &Expected) -> Result<(), Error> {
     let record = serde_json::to_string(expected)
         .map_err(|_| Error::Internal("a forgotten group's record couldn't be written".into()))?;
@@ -503,6 +506,19 @@ fn keep_record(tx: &Tx<'_>, conversation: Uuid, expected: &Expected) -> Result<(
         "INSERT INTO forgotten_groups (conversation_id, record) VALUES (?1, ?2) \
          ON CONFLICT (conversation_id) DO UPDATE SET record = excluded.record",
         params![conversation.as_bytes().as_slice(), record],
+    )?;
+    Ok(())
+}
+
+/// This device holds `conversation`'s group again, in this transaction: a welcome brought it in
+/// (`apply`), or the server took its founding or its external join (`commit_result`). The record
+/// of a group it forgot there goes with it. While the device holds no group of the conversation
+/// (a join the server refused, which leaves a row alone; a founding or a join still waiting for
+/// the server's word), the record stays.
+pub(super) fn held_again(tx: &Tx<'_>, conversation: Uuid) -> Result<(), Error> {
+    tx.conn().execute(
+        "DELETE FROM forgotten_groups WHERE conversation_id = ?1",
+        [conversation.as_bytes().as_slice()],
     )?;
     Ok(())
 }
