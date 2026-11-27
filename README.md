@@ -27,7 +27,7 @@ podman run --rm -v "$PWD:/w" -w /w docker.io/library/rust:1.99.1-bookworm cargo 
 
 ## Artifacts
 
-The clients never compile Rust: they take the core as files CI builds. `.github/workflows/artifacts.yml`, started by hand on `main`, builds them with `--release --locked` in `rust:1.99.1-bookworm`, on the organisation's runner. It publishes them as the release `artifacts-<the commit's first 7 characters>`, with their `SHA256SUMS`, once per commit. On a pull request that changes the workflow, it builds and checks them without publishing.
+The clients never compile Rust: they take the core as files CI builds. `.github/workflows/artifacts.yml`, started by hand on `main`, builds them with `--release --locked`: Apple's on GitHub's macOS runner, in a job that can't write to the repository, and the rest in `rust:1.99.1-bookworm` on GitHub's Linux runner, whose job then publishes them all as the release `artifacts-<the commit's first 7 characters>`, with one `SHA256SUMS`, once per commit. On a pull request that changes the workflow, it builds and checks them without publishing.
 
 | File | What it is | Who takes it |
 |---|---|---|
@@ -36,7 +36,10 @@ The clients never compile Rust: they take the core as files CI builds. `.github/
 | `duvet_e2e_wasm.js`, `duvet_e2e_wasm_bg.wasm` | The core in WebAssembly, through `wasm-bindgen --target web` | The web's worker |
 | `libduvet_e2e.so` | The Flutter plugin for Linux x64 | The mobile app's Dart tests |
 | `android-arm64-v8a-libduvet_e2e.so` | The Flutter plugin for Android arm64-v8a, linked with the runner's NDK for 16 KiB pages | The mobile app, as `jniLibs/arm64-v8a/libduvet_e2e.so` |
+| `macos-arm64-libduvet_e2e_ffi.dylib` | The C ABI for macOS 14 and later on arm64 | The desktop app on macOS, and its tests on a Mac |
+| `macos-arm64-libduvet_e2e.dylib` | The Flutter plugin for macOS 14 and later on arm64 | The mobile app's Dart tests on a Mac |
+| `ios-duvet_e2e.xcframework.zip` | The Flutter plugin for iOS: an XCFramework of one dynamic `duvet_e2e.framework` (named `@rpath/duvet_e2e.framework/duvet_e2e`, as flutter_rust_bridge opens it) for `ios-arm64`, iOS 13 and later, and one for `ios-arm64-simulator`, iOS 14 and later (the first with arm64 simulators) | The mobile app on iOS |
 
-The run fails if the DLL imports anything but Windows' own DLLs (a user's PC has none of mingw-w64's runtime), or if the Android library needs anything but `libc`, `libm`, `libdl` and `liblog` or has a segment that isn't aligned to 16 KiB. Its summary gives each file's size, the checksums and the glibc the Linux libraries need.
+The run fails if the DLL imports anything but Windows' own DLLs (a user's PC has none of mingw-w64's runtime), if the Android library needs anything but `libc`, `libm`, `libdl` and `liblog` or has a segment that isn't aligned to 16 KiB, or if an Apple library needs anything but the system's own (`/usr/lib/`, `/System/Library/`), isn't built for the system and minimum above, isn't arm64 alone or has no valid signature (an ad hoc one at least). Its summary gives each file's size, the checksums, the glibc the Linux libraries need and the system each Apple library is built for.
 
 `.github/workflows/windows.yml`, started by hand with a release's tag, runs `host-tests/bun` against that release's DLL on GitHub's Windows runner, under Bun 1.3.9 (the one Electrobun 1.15.1 ships), with only Windows' own folders on the `PATH`. GitHub's Windows minutes count against the account's.

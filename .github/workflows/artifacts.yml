@@ -1,9 +1,10 @@
 name: Artifacts
 
-# The core as each client takes it, which never compiles Rust: the C ABI for Linux and Windows, the
-# web's WebAssembly, and the Flutter plugin for Linux and Android. Started by hand on main, it
-# publishes them as the release artifacts-<commit>. A new workflow can only be started by hand from
-# main, so a pull request that changes this one builds and checks them without publishing.
+# The core as each client takes it, which never compiles Rust: the C ABI for Linux, Windows and
+# macOS, the web's WebAssembly, and the Flutter plugin for Linux, Android, macOS and iOS. Started by
+# hand on main, it publishes them as the release artifacts-<commit>. A new workflow can only be
+# started by hand from main, so a pull request that changes this one builds and checks them without
+# publishing.
 on:
   pull_request:
     branches: [main]
@@ -15,12 +16,119 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_HOME: /cache/cargo
 
 jobs:
+  # Apple's systems build only on a Mac. This job gets no token that writes: the Linux job takes its
+  # files, puts them in SHA256SUMS with its own, and publishes them all.
+  apple:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      # The floor of the desktop's own macOS libraries (its scripts/build-native.ts), and the iOS
+      # Runner's. arm64 simulators start at iOS 14, so rustc builds the simulator's slice for 14.0.
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+      IPHONEOS_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Beside the image's own Rust: rust-toolchain.toml names 1.99.1.
+      - name: Install Rust 1.99.1 and the iOS targets
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup target add --toolchain 1.99.1 aarch64-apple-ios aarch64-apple-ios-sim
+      # Each package on its own, as the Linux job builds them.
+      - name: macOS arm64, the C ABI
+        run: cargo build --locked --release -p duvet-e2e-ffi
+      - name: macOS arm64, the Flutter plugin
+        run: cargo build --locked --release -p duvet_e2e
+      - name: iOS arm64, the Flutter plugin
+        run: cargo build --locked --release --target aarch64-apple-ios -p duvet_e2e
+      - name: The iOS simulator on arm64, the Flutter plugin
+        run: cargo build --locked --release --target aarch64-apple-ios-sim -p duvet_e2e
+      # flutter_rust_bridge opens the plugin on iOS as duvet_e2e.framework/duvet_e2e: each iOS library
+      # becomes that framework, named by @rpath as an app embeds it, and the two one XCFramework. Then
+      # each framework is signed ad hoc as a whole, its Info.plist sealed with it, where it lies in the
+      # XCFramework: the device's library comes unsigned, and a new name breaks the signature the
+      # linker gave the simulator's. An app signs it with its own as it embeds it.
+      - name: Gather the files, the iOS libraries as one XCFramework
+        run: |
+          rm -rf dist apple && mkdir dist
+          cp target/release/libduvet_e2e_ffi.dylib dist/macos-arm64-libduvet_e2e_ffi.dylib
+          cp target/release/libduvet_e2e.dylib dist/macos-arm64-libduvet_e2e.dylib
+          version=$(cargo pkgid -p duvet_e2e | sed 's/.*[#@]//')
+          for slice in aarch64-apple-ios:iPhoneOS aarch64-apple-ios-sim:iPhoneSimulator; do
+            framework="apple/${slice%%:*}/duvet_e2e.framework"
+            mkdir -p "$framework"
+            cp "target/${slice%%:*}/release/libduvet_e2e.dylib" "$framework/duvet_e2e"
+            install_name_tool -id @rpath/duvet_e2e.framework/duvet_e2e "$framework/duvet_e2e"
+            jq -n --arg platform "${slice#*:}" --arg version "$version" --arg minimum "$IPHONEOS_DEPLOYMENT_TARGET" '{
+              CFBundleDevelopmentRegion: "en",
+              CFBundleExecutable: "duvet_e2e",
+              CFBundleIdentifier: "chat.duvet.duvet-e2e",
+              CFBundleInfoDictionaryVersion: "6.0",
+              CFBundleName: "duvet_e2e",
+              CFBundlePackageType: "FMWK",
+              CFBundleShortVersionString: $version,
+              CFBundleSupportedPlatforms: [$platform],
+              CFBundleVersion: $version,
+              MinimumOSVersion: $minimum
+            }' | plutil -convert xml1 -o "$framework/Info.plist" -
+          done
+          xcodebuild -create-xcframework \
+            -framework apple/aarch64-apple-ios/duvet_e2e.framework \
+            -framework apple/aarch64-apple-ios-sim/duvet_e2e.framework \
+            -output apple/duvet_e2e.xcframework
+          for framework in apple/duvet_e2e.xcframework/*/duvet_e2e.framework; do codesign --force --sign - "$framework"; done
+          ditto -c -k --keepParent apple/duvet_e2e.xcframework dist/ios-duvet_e2e.xcframework.zip
+      # Before the checks, so a run they fail still shows what it built. The Linux job's summary gives
+      # every file's checksum.
+      - name: Each file's size and the system each library is built for, in the summary
+        run: |
+          built_for() { vtool -show-build "$1" | awk '$1 == "platform" { platform = $2 } $1 == "minos" { print platform, $2 }'; }
+          slices=apple/duvet_e2e.xcframework
+          {
+            echo "| File | Bytes | Built for |"
+            echo "|---|---:|---|"
+            for file in dist/*.dylib; do echo "| \`${file#dist/}\` | $(stat -f %z "$file") | $(built_for "$file") |"; done
+            echo "| \`ios-duvet_e2e.xcframework.zip\` | $(stat -f %z dist/ios-duvet_e2e.xcframework.zip) | $(built_for "$slices/ios-arm64/duvet_e2e.framework/duvet_e2e"); $(built_for "$slices/ios-arm64-simulator/duvet_e2e.framework/duvet_e2e") |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      # A Mac or an iPhone has only the system's own libraries; each library is built for its floor,
+      # arm64 alone, with a valid signature: arm64 code without one doesn't run, not even ad hoc.
+      - name: Each library needs only the system's own, for its floor, on arm64, signed
+        run: |
+          built_for() { vtool -show-build "$1" | awk '$1 == "platform" { platform = $2 } $1 == "minos" { print platform, $2 }'; }
+          slices=apple/duvet_e2e.xcframework
+          held=$(plutil -convert json -o - "$slices/Info.plist" | jq -r '[.AvailableLibraries[].LibraryIdentifier] | sort | join(" ")')
+          [ "$held" = "ios-arm64 ios-arm64-simulator" ] || { echo "The XCFramework holds: $held"; exit 1; }
+          for expected in \
+            "dist/macos-arm64-libduvet_e2e_ffi.dylib MACOS 14.0" \
+            "dist/macos-arm64-libduvet_e2e.dylib MACOS 14.0" \
+            "$slices/ios-arm64/duvet_e2e.framework/duvet_e2e IOS 13.0" \
+            "$slices/ios-arm64-simulator/duvet_e2e.framework/duvet_e2e IOSSIMULATOR 14.0"; do
+            read -r binary system <<< "$expected"
+            # otool -L names a library's own ID first.
+            own=$(otool -D "$binary" | tail -n +2)
+            needed=$(otool -L "$binary" | tail -n +2 | awk '{ print $1 }' | grep -Fvx -- "$own")
+            echo "$binary:"; echo "$needed"
+            others=$(grep -Ev '^(/usr/lib/|/System/Library/)' <<< "$needed" || true)
+            [ -z "$others" ] || { echo "$binary needs more than the system's: $others"; exit 1; }
+            [ "$(built_for "$binary")" = "$system" ] || { echo "$binary is built for $(built_for "$binary"), not $system"; exit 1; }
+            [ "$(lipo -archs "$binary")" = arm64 ] || { echo "$binary is $(lipo -archs "$binary")"; exit 1; }
+          done
+          codesign --verify --strict --verbose dist/*.dylib "$slices"/*/duvet_e2e.framework
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: apple
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
   artifacts:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    # Apple's files come from the apple job.
+    needs: apple
     # One run at a time, and every run waits its turn: a run publishes the files it built.
     concurrency:
       group: artifacts
@@ -30,6 +138,7 @@ jobs:
     container:
       image: docker.io/library/rust:1.99.1-bookworm
     env:
+      CARGO_HOME: /cache/cargo
       CARGO_TARGET_DIR: /cache/target/artifacts
       # The NDK of Flutter 3.47.7, which the job installs: GitHub's image lacks it.
       NDK_BIN: /opt/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin
@@ -85,6 +194,11 @@ jobs:
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ env.NDK_BIN }}/aarch64-linux-android21-clang
           CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: -C link-arg=-Wl,--hash-style=both -C link-arg=-Wl,-z,max-page-size=16384
         run: cargo build --locked --release --target aarch64-linux-android -p duvet_e2e
+      # Apple's files as the apple job uploaded them: download-artifact checks their digest.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: apple
+          path: apple
       # A release's files sit side by side, so the Android library takes its folder in its name.
       - name: Gather the files and their SHA256SUMS
         run: |
@@ -94,9 +208,10 @@ jobs:
           cp "$CARGO_TARGET_DIR/aarch64-linux-android/release/libduvet_e2e.so" dist/android-arm64-v8a-libduvet_e2e.so
           wasm-bindgen --target web --out-name duvet_e2e_wasm --out-dir /tmp/web "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/duvet_e2e_wasm.wasm"
           cp /tmp/web/duvet_e2e_wasm.js /tmp/web/duvet_e2e_wasm_bg.wasm dist/
+          cp apple/* dist/
           cd dist && sha256sum -- * > SHA256SUMS
-      # Before the checks, so a run they fail still shows what it built. The desktop's and mobile's
-      # Linux tests load the Linux libraries on other machines, whose glibc may be older.
+      # Before the checks, so a run they fail still shows what it built; in the log too. The desktop's
+      # and mobile's Linux tests load the Linux libraries on other machines, whose glibc may be older.
       - name: Each file's size, the checksums and the glibc the Linux libraries need, in the summary
         run: |
           glibc=$(objdump -T dist/libduvet_e2e_ffi.so dist/libduvet_e2e.so | grep -o 'GLIBC_[0-9][0-9.]*' | sort -uV | tail -n1)
@@ -110,7 +225,7 @@ jobs:
             echo '```'
             cat dist/SHA256SUMS
             echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
       # A user's PC has none of mingw-w64's runtime (libgcc_s, libwinpthread): the DLL may import
       # nothing but Windows' own DLLs, or it must link that runtime statically.
       - name: The DLL imports only Windows' own DLLs
