@@ -226,21 +226,16 @@ describe("the C ABI", () => {
     const { symbols: keychain } = dlopen("/System/Library/Frameworks/Security.framework/Security", {
       SecKeychainSetUserInteractionAllowed: { args: [FFIType.u8], returns: FFIType.i32 },
     });
-    const refusal = (reply: { error?: { code: string; message: string } }) => {
-      expect(reply.error?.code).toBe("storage");
-      expect([
-        "storage: the system keyring failed",
-        "storage: the system keyring refused access: it's locked, or has no default keyring",
-      ]).toContain(reply.error?.message);
-    };
+    // The keyring's macOS store counts this refusal as a failure, not as a keyring that refused access.
+    const refused = { error: { code: "storage", message: "storage: the system keyring failed" } };
     try {
       expect(keychain.SecKeychainSetUserInteractionAllowed(0)).toBe(0);
-      // A database still to be made gets no key of its own over the entry.
-      refusal(open(config));
+      // A database still to be made: no key of its own takes the entry's place.
+      expect(open(config)).toEqual(refused);
       expect(existsSync(path)).toBe(false);
       // One that exists isn't lost: its key may be the entry's.
       close(open({ path, db_key: dbKey() }).ok.handle);
-      refusal(open(config));
+      expect(open(config)).toEqual(refused);
       expect(existsSync(path)).toBe(true);
     } finally {
       keychain.SecKeychainSetUserInteractionAllowed(1);
