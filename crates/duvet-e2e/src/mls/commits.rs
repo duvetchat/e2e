@@ -77,6 +77,19 @@ pub(crate) struct Forgotten {
 }
 
 #[derive(Serialize)]
+pub(crate) struct ForgottenGroups {
+    /// The record of each group this device forgot, by conversation.
+    records: Vec<ForgottenGroup>,
+}
+
+#[derive(Serialize)]
+struct ForgottenGroup {
+    conversation_id: Uuid,
+    /// As `forget_group` answered it.
+    expected: Expected,
+}
+
+#[derive(Serialize)]
 pub(crate) struct GroupState {
     generation: u32,
     epoch: u64,
@@ -444,9 +457,9 @@ pub(crate) fn join_external(tx: &Tx<'_>, request: JoinExternal) -> Result<Commit
 /// to hold what brings the group back to (`expected`: `create_group`, `apply`'s welcomes,
 /// `join_external`), so nobody the forgotten group didn't have comes in on the API's word alone.
 /// It keeps that record too ([`keep_record`]): a client that closes before it keeps its own copy
-/// doesn't lose it. Not while a commit of this device's waits for the server's word, or for the
-/// queue after a refusal (`pending_commit`); and only a group this device is in (`not_found`, as
-/// [`load_group`] names it).
+/// takes it back ([`forgotten`]). Not while a commit of this device's waits for the server's word,
+/// or for the queue after a refusal (`pending_commit`); and only a group this device is in
+/// (`not_found`, as [`load_group`] names it).
 pub(crate) fn forget_group(tx: &Tx<'_>, request: ConversationId) -> Result<Forgotten, Error> {
     let conversation = request.conversation_id;
     let (mut group, row) = load_group(tx, conversation)?;
@@ -481,7 +494,8 @@ pub(crate) fn forget_group(tx: &Tx<'_>, request: ConversationId) -> Result<Forgo
 
 /// Keeps `expected`, the record of the group this device forgets of `conversation`, as the forget
 /// answers it, in the forget's own transaction: a client that closes before it keeps its own copy
-/// loses nothing. A second forget of the conversation keeps the newer group's in its place.
+/// takes it back ([`forgotten`]). A second forget of the conversation keeps the newer group's in
+/// its place.
 fn keep_record(tx: &Tx<'_>, conversation: Uuid, expected: &Expected) -> Result<(), Error> {
     let record = serde_json::to_string(expected)
         .map_err(|_| Error::Internal("a forgotten group's record couldn't be written".into()))?;
@@ -491,6 +505,28 @@ fn keep_record(tx: &Tx<'_>, conversation: Uuid, expected: &Expected) -> Result<(
         params![conversation.as_bytes().as_slice(), record],
     )?;
     Ok(())
+}
+
+/// The record of each group this device forgot (`forget_group`), by conversation, each as the
+/// forget answered it: a client that lost its own copy, by a close before it wrote it or a store
+/// that refused it, takes it again as it starts. It changes nothing.
+pub(crate) fn forgotten(tx: &Tx<'_>) -> Result<ForgottenGroups, Error> {
+    let mut statement = tx
+        .conn()
+        .prepare("SELECT conversation_id, record FROM forgotten_groups ORDER BY conversation_id")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut records = Vec::new();
+    for row in rows {
+        let (conversation, record) = row?;
+        records.push(ForgottenGroup {
+            conversation_id: stored_uuid(&conversation)?,
+            expected: serde_json::from_str(&record)
+                .map_err(|_| Error::Internal("a forgotten group's record is malformed".into()))?,
+        });
+    }
+    Ok(ForgottenGroups { records })
 }
 
 /// The group as this device has it.

@@ -84,7 +84,8 @@ void main() {
   // other member's, types a message there and forgets it, which leaves the message stale (groups.rs'
   // a_lone_device_forgets_the_group_it_founded).
   test("forget_group answers the group's members, and the group is gone", () async {
-    final core = await DuvetE2e.open(jsonEncode({'path': database()}), key);
+    final config = jsonEncode({'path': database()});
+    var core = await DuvetE2e.open(config, key);
     Future<Map<String, dynamic>> run(Map<String, Object?> command) async =>
         jsonDecode(await core.handle(jsonEncode(command))) as Map<String, dynamic>;
     const user = '01930000-0000-7000-8000-000000000551';
@@ -112,26 +113,32 @@ void main() {
     expect((await run(typed))['ok']['epoch'], 1);
 
     final forget = {'cmd': 'forget_group', 'conversation_id': conversation};
+    final expected = {
+      'members': [user, other],
+      'exact': true,
+    };
     expect(await run(forget), {
-      'ok': {
-        'expected': {
-          'members': [user, other],
-          'exact': true,
-        },
-      },
+      'ok': {'expected': expected},
     });
     final stale = await run(typed);
     expect(stale['error'], containsPair('rule', 'stale_message'));
     final gone = await run({'cmd': 'group', 'conversation_id': conversation});
     expect(gone['error'], containsPair('what', 'group'));
     expect((await run(forget))['error'], containsPair('code', 'not_found'));
-    // Founded again at generation 0, the group ID the forgotten one had.
-    final again = await run({
-      ...create,
-      'expected': {
-        'members': [user, other],
+    // The core keeps the record: closed before its client kept it, it gives it back as it opens.
+    final kept = {
+      'ok': {
+        'records': [
+          {'conversation_id': conversation, 'expected': expected},
+        ],
       },
-    });
+    };
+    expect(await run({'cmd': 'forgotten'}), kept);
+    await core.close();
+    core = await DuvetE2e.open(config, key);
+    expect(await run({'cmd': 'forgotten'}), kept);
+    // Founded again at generation 0, the group ID the forgotten one had.
+    final again = await run({...create, 'expected': expected});
     expect(again['ok']['generation'], 0);
     await core.close();
   });

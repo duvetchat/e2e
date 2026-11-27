@@ -157,9 +157,10 @@ fn forget_group_through_wasm() {
     assert_eq!(run(&mut core, typed.clone())["ok"]["epoch"], 1);
 
     let forget = json!({"cmd": "forget_group", "conversation_id": conversation});
+    let expected = json!({"members": [user, other], "exact": true});
     assert_eq!(
         run(&mut core, forget.clone()),
-        json!({"ok": {"expected": {"members": [user, other], "exact": true}}})
+        json!({"ok": {"expected": expected}})
     );
     let stale = run(&mut core, typed);
     assert_eq!(stale["error"]["rule"], "stale_message", "{stale}");
@@ -169,9 +170,17 @@ fn forget_group_through_wasm() {
     );
     assert_eq!(gone["error"]["what"], "group", "{gone}");
     assert_eq!(run(&mut core, forget)["error"]["code"], "not_found");
+    // The core keeps the record: closed before its client kept it, it gives it back as it opens.
+    let forgotten = json!({"cmd": "forgotten"});
+    let kept =
+        json!({"ok": {"records": [{"conversation_id": conversation, "expected": expected}]}});
+    assert_eq!(run(&mut core, forgotten.clone()), kept);
+    core.close();
+    let mut core = WasmCore::open(r#"{"path":"forget.db"}"#, &[1; 32]).unwrap();
+    assert_eq!(run(&mut core, forgotten), kept);
     // Founded again at generation 0, the group ID the forgotten one had.
     let mut again = create;
-    again["expected"] = json!({"members": [user, other]});
+    again["expected"] = expected;
     assert_eq!(run(&mut core, again)["ok"]["generation"], 0);
     core.close();
 }

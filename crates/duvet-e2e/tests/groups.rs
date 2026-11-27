@@ -3709,3 +3709,45 @@ fn forget_group_keeps_its_record_in_the_store() {
         Some(second["expected"].clone())
     );
 }
+
+/// What `forgotten` gives back of `device`'s forgotten groups.
+fn forgotten_records(device: &mut TestDevice) -> Value {
+    ok(&mut device.core, json!({"cmd": "forgotten"}))
+}
+
+/// `forgotten` gives back the record of each group this device forgot, by conversation, as
+/// `forget_group` answered it, `exact` included (#60): a client that lost its own copy, by a close
+/// before it wrote it, takes it again as it starts. It only reads, so it answers the same again.
+#[test]
+fn forgotten_gives_back_what_forget_group_answered() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, _b1] = new_devices(&mut server, [a, b]);
+    assert_eq!(forgotten_records(&mut a1), json!({"records": []}));
+
+    let (dm, group) = (new_id(), new_id());
+    server.conversation(dm, Kind::Dm, None, &[a, b], false);
+    server.conversation(group, Kind::Group, Some(a), &[a, b], false);
+    let mut answered = Vec::new();
+    for conversation in [dm, group] {
+        server.found_unkept(&mut a1, conversation);
+        let record = ok(&mut a1.core, command("forget_group", conversation));
+        answered.push(json!({"conversation_id": conversation, "expected": record["expected"]}));
+    }
+    assert_eq!(
+        answered,
+        [
+            json!({"conversation_id": dm, "expected": {"members": [a, b], "exact": true}}),
+            json!({
+                "conversation_id": group,
+                "expected": {"owner": a, "members": [a, b], "exact": true},
+            }),
+        ]
+    );
+
+    // The client closes before it keeps its copies, and takes them back as it starts.
+    let mut a1 = a1.reopened(server.clock.clone());
+    let given = forgotten_records(&mut a1);
+    assert_eq!(given, json!({"records": answered}));
+    assert_eq!(forgotten_records(&mut a1), given);
+}
