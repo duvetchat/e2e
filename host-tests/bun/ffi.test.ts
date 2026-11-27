@@ -145,7 +145,8 @@ describe("the C ABI", () => {
   });
 
   // A group command through the same JSON: a device founds a DM alone, with no key package of the
-  // other member's, and forgets it (groups.rs' a_lone_device_forgets_the_group_it_founded).
+  // other member's, types a message there and forgets it, which leaves the message stale (groups.rs'
+  // a_lone_device_forgets_the_group_it_founded).
   test("forget_group answers the group's members, and the group is gone", () => {
     const core = open({ path: database(), db_key: dbKey() }).ok.handle;
     const [user, other, conversation] = [randomUUID(), randomUUID(), randomUUID()];
@@ -157,9 +158,12 @@ describe("the C ABI", () => {
     const create = { cmd: "create_group", conversation_id: conversation, kind: "dm", members, external_sender };
     expect(run(create).ok.generation).toBe(0);
     expect(run({ cmd: "commit_result", conversation_id: conversation, accepted: true, seq: 1 }).ok.epoch).toBe(1);
+    const typed = { cmd: "encrypt", conversation_id: conversation, nonce: "typed", envelope: { text: "hello" } };
+    expect(run(typed).ok.epoch).toBe(1);
 
     const forget = { cmd: "forget_group", conversation_id: conversation };
     expect(run(forget)).toEqual({ ok: { expected: { members } } });
+    expect(run(typed).error).toMatchObject({ code: "rule_violation", rule: "stale_message" });
     const none = { code: "not_found", what: "group" };
     expect(run({ cmd: "group", conversation_id: conversation }).error).toMatchObject(none);
     expect(run(forget).error).toMatchObject(none);

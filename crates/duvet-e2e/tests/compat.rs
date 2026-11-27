@@ -10,7 +10,9 @@
 //! `commit_result`, a waiting message, a member noted as without devices, backup days uploaded and
 //! due, an approval under way, and its queues half applied; in B1's, a kept proposal and a share's
 //! key not yet imported. From schema 3 on, both hold a device their group took out, and an identity
-//! it no longer takes there; from schema 4 on, A1's holds a key package it marked spent. The test
+//! it no longer takes there; from schema 4 on, A1's holds a key package it marked spent; from
+//! schema 5 on, A1's holds a message waiting to send in a group it forgot, which stays stale. The
+//! test
 //! checks each survives the open and, where a command completes it, completes, and that every
 //! database opens at the newest schema.
 //!
@@ -365,6 +367,32 @@ fn opens(name: &str, newest: u32, fixture: &Value) {
             matches!(at, Some(Some(when)) if when <= *by),
             "{name}: {id}: {at:?}"
         );
+    }
+    // And takes schema 5's stale messages: none of what an earlier schema left waits stale. From
+    // schema 5 on, A1's database holds one waiting to send in a group it forgot, which stays stale:
+    // a migration that dropped its mark would hand the forgotten group's ciphertext out again.
+    let stale: i64 = a1
+        .transaction(|tx| {
+            Ok(tx
+                .conn()
+                .query_row("SELECT count(*) FROM outbox WHERE stale = 1", [], |row| {
+                    row.get(0)
+                })?)
+        })
+        .unwrap();
+    assert_eq!(stale, i64::from(schema >= 5), "{name}");
+    if schema >= 5 {
+        let forgotten = &fixture["forgotten"];
+        let retry = json!({
+            "cmd": "encrypt",
+            "conversation_id": forgotten["conversation"],
+            "nonce": forgotten["nonce"],
+            "envelope": {"text": forgotten["text"]},
+        });
+        let refused = error(&mut a1, retry);
+        assert_eq!(refused["rule"], "stale_message", "{name}: {refused}");
+        let group = json!({"cmd": "group", "conversation_id": forgotten["conversation"]});
+        assert_eq!(error(&mut a1, group)["what"], "group", "{name}");
     }
     let conversations = fixture["conversations"].as_array().unwrap();
     for conversation in conversations {
@@ -760,6 +788,23 @@ fn write_db() {
         json!({"cmd": "key_packages", "spent": [spent]}),
     );
 
+    // A group A1 founds, which the API answers for and never keeps: A1 types a message there, whose
+    // send doesn't go through, and forgets the group, which leaves the message stale (schema 5).
+    let forgot = new_id();
+    server.conversation(forgot, Kind::Group, Some(a), &[a, b], false);
+    server.found_unkept(&mut a1, forgot);
+    let forgotten_nonce = new_id().to_string();
+    let forgotten_text = "typed in a group it forgot";
+    ok(
+        &mut a1.core,
+        json!({"cmd": "encrypt", "conversation_id": forgot, "nonce": forgotten_nonce, "envelope": {"text": forgotten_text}}),
+    );
+    let record = ok(
+        &mut a1.core,
+        json!({"cmd": "forget_group", "conversation_id": forgot}),
+    );
+    assert_eq!(record["expected"], json!({"owner": a, "members": [a, b]}));
+
     // No leaf keeps a key package's lifetime, on either device: each one a commit brought.
     for device in [&mut a1, &mut b1] {
         for conversation in [dm, group] {
@@ -811,6 +856,7 @@ fn write_db() {
         "share": {"share_id": shared["share_id"], "parts": shared["parts"]},
         "approval": {"reveal": revealed["reveal"]},
         "spent": spent,
+        "forgotten": {"conversation": forgot, "nonce": forgotten_nonce, "text": forgotten_text},
     });
     std::fs::create_dir_all(fixtures()).unwrap();
     let write = |name: String, bytes: &[u8]| {

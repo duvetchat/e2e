@@ -893,6 +893,70 @@ fn a_retry_no_one_could_open_is_stale() {
     assert_eq!(stale["rule"], "stale_message");
 }
 
+/// What a device typed in a group it then forgets (`forget_group`) waits to send, encrypted in that
+/// group, which nobody reads: its retry is `stale_message`, then and once the group is founded
+/// again, though that group has the forgotten one's generation and epoch. Its row stays as it was,
+/// and the client encrypts its text again in the group it ends in, where the other member reads it.
+#[test]
+fn a_forgotten_group_s_messages_waiting_to_send_are_stale() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut b1] = new_devices(&mut server, [a, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Dm, None, &[a, b], false);
+    server.found_unkept(&mut a1, conversation);
+    let envelope = json!({"text": "typed before the forget"});
+    let first = ok(
+        &mut a1.core,
+        encrypt(conversation, "typed", envelope.clone()),
+    );
+    assert_eq!(
+        (&first["generation"], &first["epoch"]),
+        (&json!(0), &json!(1))
+    );
+
+    let record = ok(&mut a1.core, command("forget_group", conversation));
+    let stale = error(
+        &mut a1.core,
+        encrypt(conversation, "typed", envelope.clone()),
+    );
+    assert_eq!(
+        (&stale["code"], &stale["rule"]),
+        (&json!("rule_violation"), &json!("stale_message"))
+    );
+
+    // The group founded again has the same generation and epoch, and the retry is still stale.
+    let mut create = server.create_group(conversation);
+    create["expected"] = record["expected"].clone();
+    server.commit(&mut a1, conversation, create).unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    let state = a1.group(conversation);
+    assert_eq!(
+        (&state["generation"], &state["epoch"]),
+        (&json!(0), &json!(1))
+    );
+    let stale = error(
+        &mut a1.core,
+        encrypt(conversation, "typed", envelope.clone()),
+    );
+    assert_eq!(stale["rule"], "stale_message");
+    let kept = messages_of(&mut a1, conversation);
+    let kept: Vec<_> = kept.iter().map(|m| (&m["status"], &m["text"])).collect();
+    assert_eq!(
+        kept,
+        [(&json!("pending"), &json!("typed before the forget"))]
+    );
+
+    // The client drops it and encrypts its text again: B1 reads it.
+    ok(&mut a1.core, discard("typed"));
+    let id = send(&mut server, &mut a1, conversation, envelope, &[]);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    assert_eq!(
+        message(&mut b1, conversation, id).unwrap()["text"],
+        "typed before the forget"
+    );
+}
+
 #[test]
 fn edit_and_delete_from_the_author_only() {
     let (mut server, conversation, _, [mut a1, mut a2, mut b1, mut b2]) = group_of_four();

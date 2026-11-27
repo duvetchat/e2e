@@ -81,7 +81,8 @@ void main() {
   });
 
   // A group command through the same JSON: a device founds a DM alone, with no key package of the
-  // other member's, and forgets it (groups.rs' a_lone_device_forgets_the_group_it_founded).
+  // other member's, types a message there and forgets it, which leaves the message stale (groups.rs'
+  // a_lone_device_forgets_the_group_it_founded).
   test("forget_group answers the group's members, and the group is gone", () async {
     final core = await DuvetE2e.open(jsonEncode({'path': database()}), key);
     Future<Map<String, dynamic>> run(Map<String, Object?> command) async =>
@@ -102,6 +103,13 @@ void main() {
     expect((await run(create))['ok']['generation'], 0);
     final taken = await run({'cmd': 'commit_result', 'conversation_id': conversation, 'accepted': true, 'seq': 1});
     expect(taken['ok']['epoch'], 1);
+    final typed = {
+      'cmd': 'encrypt',
+      'conversation_id': conversation,
+      'nonce': 'typed',
+      'envelope': {'text': 'hello'},
+    };
+    expect((await run(typed))['ok']['epoch'], 1);
 
     final forget = {'cmd': 'forget_group', 'conversation_id': conversation};
     expect(await run(forget), {
@@ -111,6 +119,8 @@ void main() {
         },
       },
     });
+    final stale = await run(typed);
+    expect(stale['error'], containsPair('rule', 'stale_message'));
     final gone = await run({'cmd': 'group', 'conversation_id': conversation});
     expect(gone['error'], containsPair('what', 'group'));
     expect((await run(forget))['error'], containsPair('code', 'not_found'));

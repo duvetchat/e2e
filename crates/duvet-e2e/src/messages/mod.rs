@@ -29,7 +29,9 @@ pub use deviceless::noted_records;
 pub(crate) use deviceless::{WithoutDevices, catch_up_due, entered, without_devices};
 pub(crate) use receive::{Messages, erase_deleted};
 pub(crate) use search::{Search, search};
-pub(crate) use send::{Delete, Discard, Edit, Encrypt, Sent, delete, discard, edit, encrypt, sent};
+pub(crate) use send::{
+    Delete, Discard, Edit, Encrypt, Sent, delete, discard, edit, encrypt, group_forgotten, sent,
+};
 pub(crate) use store::{ListMessages, Scope, each_record, messages};
 pub use store::{import, import_shared, records_for};
 

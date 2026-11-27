@@ -437,12 +437,13 @@ pub(crate) fn join_external(tx: &Tx<'_>, request: JoinExternal) -> Result<Commit
 /// Leaves the group this device holds of the conversation, for a client whose API holds none, or
 /// holds another one at the device's generation (`apply`'s `another_group`): the conversation's row
 /// goes (its numbers, its epoch, its members, its statements), and so does the group's MLS state,
-/// as a group founded again at its generation has its ID. The messages it holds stay. It answers
-/// the members the group had, with its owner in a group, for the client to hold what brings the
-/// group back to (`expected`: `create_group`, `apply`'s welcomes, `join_external`), so nobody the
-/// forgotten group didn't have comes in on the API's word alone. Not while a commit of this
-/// device's waits for the server's word, or for the queue after a refusal (`pending_commit`); and
-/// only a group this device is in (`not_found`, as [`load_group`] names it).
+/// as a group founded again at its generation has its ID. What waits to send there is stale
+/// (`messages::group_forgotten`), and the messages it holds stay. It answers the members the group
+/// had, with its owner in a group, for the client to hold what brings the group back to
+/// (`expected`: `create_group`, `apply`'s welcomes, `join_external`), so nobody the forgotten group
+/// didn't have comes in on the API's word alone. Not while a commit of this device's waits for the
+/// server's word, or for the queue after a refusal (`pending_commit`); and only a group this device
+/// is in (`not_found`, as [`load_group`] names it).
 pub(crate) fn forget_group(tx: &Tx<'_>, request: ConversationId) -> Result<Forgotten, Error> {
     let conversation = request.conversation_id;
     let (mut group, row) = load_group(tx, conversation)?;
@@ -455,6 +456,7 @@ pub(crate) fn forget_group(tx: &Tx<'_>, request: ConversationId) -> Result<Forgo
         .delete(tx.provider().storage())
         .map_err(storage_error)?;
     GroupRow::delete(tx, conversation)?;
+    crate::messages::group_forgotten(tx, conversation)?;
     Ok(Forgotten {
         expected: Expected::of(&list),
     })

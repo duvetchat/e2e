@@ -3223,7 +3223,8 @@ fn forget_group_lets_a_device_take_the_apis_group_past_its_own_epoch() {
     );
 }
 
-/// A device founds a DM alone, with no key package of the other member's, and forgets it: the JSON
+/// A device founds a DM alone, with no key package of the other member's, types a message there and
+/// forgets it, which leaves the message stale: the JSON
 /// each binding sends in its own test (`host-tests/bun`, `duvet-e2e-wasm`'s `web.rs`, the Flutter
 /// plugin's `core_test.dart`), with a key the API never signs with as the external sender.
 #[test]
@@ -3251,11 +3252,18 @@ fn a_lone_device_forgets_the_group_it_founded() {
     assert_eq!(ok(&mut core, create.clone())["generation"], 0);
     let taken = json!({"cmd": "commit_result", "conversation_id": conversation, "accepted": true, "seq": 1});
     assert_eq!(ok(&mut core, taken)["epoch"], 1);
+    let typed = json!({"cmd": "encrypt", "conversation_id": conversation, "nonce": "typed", "envelope": {"text": "hello"}});
+    assert_eq!(ok(&mut core, typed.clone())["epoch"], 1);
 
     let forget = command("forget_group", conversation);
     assert_eq!(
         ok(&mut core, forget.clone()),
         json!({"expected": {"members": [user, other]}})
+    );
+    let stale = error(&mut core, typed);
+    assert_eq!(
+        (&stale["code"], &stale["rule"]),
+        (&json!("rule_violation"), &json!("stale_message"))
     );
     let gone = error(&mut core, command("group", conversation));
     assert_eq!(

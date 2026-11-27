@@ -126,7 +126,8 @@ fn sqlcipher_encrypts_in_wasm() {
 }
 
 /// A group command through the same JSON: a device founds a DM alone, with no key package of the
-/// other member's, and forgets it (`groups.rs`' `a_lone_device_forgets_the_group_it_founded`).
+/// other member's, types a message there and forgets it, which leaves the message stale
+/// (`groups.rs`' `a_lone_device_forgets_the_group_it_founded`).
 #[wasm_bindgen_test]
 fn forget_group_through_wasm() {
     use base64::Engine as _;
@@ -152,12 +153,16 @@ fn forget_group_through_wasm() {
     assert_eq!(run(&mut core, create.clone())["ok"]["generation"], 0);
     let taken = json!({"cmd": "commit_result", "conversation_id": conversation, "accepted": true, "seq": 1});
     assert_eq!(run(&mut core, taken)["ok"]["epoch"], 1);
+    let typed = json!({"cmd": "encrypt", "conversation_id": conversation, "nonce": "typed", "envelope": {"text": "hello"}});
+    assert_eq!(run(&mut core, typed.clone())["ok"]["epoch"], 1);
 
     let forget = json!({"cmd": "forget_group", "conversation_id": conversation});
     assert_eq!(
         run(&mut core, forget.clone()),
         json!({"ok": {"expected": {"members": [user, other]}}})
     );
+    let stale = run(&mut core, typed);
+    assert_eq!(stale["error"]["rule"], "stale_message", "{stale}");
     let gone = run(
         &mut core,
         json!({"cmd": "group", "conversation_id": conversation}),
