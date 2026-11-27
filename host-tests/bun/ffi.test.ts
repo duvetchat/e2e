@@ -47,11 +47,16 @@ const createDevice = (device: string) =>
 const keyring = () => ({ service: "duvet-e2e-test", account: `core-${randomBytes(8).toString("hex")}` });
 
 // Where a keyring config's key lands somewhere a test may write: a file, on Linux with no session
-// bus (CI's container); Windows' Credential Manager, on windows.yml's runner. zbus finds the bus
-// at $XDG_RUNTIME_DIR/bus too, where it would be a developer's own keyring.
+// bus (CI's container); the system's own keyring on Windows (windows.yml's runner) and macOS
+// (macos.yml's), and on Linux where DUVET_E2E_SECRET_SERVICE says the session bus has a Secret
+// Service of the run's own (CI's run under dbus-run-session). zbus finds the bus at
+// $XDG_RUNTIME_DIR/bus too, where it would be a developer's own keyring.
 const busSocket = join(process.env.XDG_RUNTIME_DIR ?? `/run/user/${process.getuid?.()}`, "bus");
 const keyFile = process.platform === "linux" && !process.env.DBUS_SESSION_BUS_ADDRESS && !existsSync(busSocket);
-const credentialManager = process.platform === "win32";
+const systemKeyring =
+  process.platform === "win32" ||
+  process.platform === "darwin" ||
+  (process.platform === "linux" && process.env.DUVET_E2E_SECRET_SERVICE === "1");
 
 describe("the C ABI", () => {
   test("status replies protocol 1", () => {
@@ -116,7 +121,7 @@ describe("the C ABI", () => {
     },
   );
 
-  test.skipIf(!keyFile && !credentialManager)("destroy leaves nothing to open", () => {
+  test.skipIf(!keyFile && !systemKeyring)("destroy leaves nothing to open", () => {
     const path = database();
     const config = { path, keyring: keyring() };
     const device = randomUUID();
@@ -172,8 +177,9 @@ describe("the C ABI", () => {
     close(core);
   });
 
-  // Windows' Credential Manager, the desktop's keyring: windows.yml runs these on a release's DLL.
-  test.skipIf(!credentialManager)("the keyring keeps the key", () => {
+  // The system's keyring, the desktop's: Windows' Credential Manager (windows.yml, on a release's
+  // DLL), macOS's Keychain (macos.yml) and a Secret Service (ci.yml's ffi job).
+  test.skipIf(!systemKeyring)("the keyring keeps the key", () => {
     const path = database();
     const config = { path, keyring: keyring() };
     const device = randomUUID();
@@ -190,7 +196,7 @@ describe("the C ABI", () => {
     expect(destroy(config)).toEqual({ ok: {} });
   });
 
-  test.skipIf(!credentialManager)("destroy removes the credential", () => {
+  test.skipIf(!systemKeyring)("destroy removes the credential", () => {
     const path = database();
     const config = { path, keyring: keyring() };
     close(open(config).ok.handle);
@@ -203,5 +209,42 @@ describe("the C ABI", () => {
     // The credential went with its database: nothing opens the copy now.
     expect(open(copy).error.code).toBe("bad_key");
     expect(destroy(copy)).toEqual({ ok: {} });
+  });
+
+  // macOS's Keychain hands a program an entry another program made only once its user agrees. With
+  // nobody to ask (this process turns the Keychain's prompts off, as where no one could answer one),
+  // it refuses: a keyring that didn't open, `storage` with a fixed text, never `bad_key`, which
+  // would have the database taken for lost. Nothing is made in the entry's place.
+  test.skipIf(process.platform !== "darwin")("a Keychain entry another program made, refused, is storage", () => {
+    const path = database();
+    const config = { path, keyring: keyring() };
+    const { service, account } = config.keyring;
+    const made = Bun.spawnSync([
+      "/usr/bin/security", "add-generic-password", "-s", service, "-a", account, "-X", randomBytes(32).toString("hex"),
+    ]);
+    expect(made.exitCode).toBe(0);
+    const { symbols: keychain } = dlopen("/System/Library/Frameworks/Security.framework/Security", {
+      SecKeychainSetUserInteractionAllowed: { args: [FFIType.u8], returns: FFIType.i32 },
+    });
+    const refusal = (reply: { error?: { code: string; message: string } }) => {
+      expect(reply.error?.code).toBe("storage");
+      expect([
+        "storage: the system keyring failed",
+        "storage: the system keyring refused access: it's locked, or has no default keyring",
+      ]).toContain(reply.error?.message);
+    };
+    try {
+      expect(keychain.SecKeychainSetUserInteractionAllowed(0)).toBe(0);
+      // A database still to be made gets no key of its own over the entry.
+      refusal(open(config));
+      expect(existsSync(path)).toBe(false);
+      // One that exists isn't lost: its key may be the entry's.
+      close(open({ path, db_key: dbKey() }).ok.handle);
+      refusal(open(config));
+      expect(existsSync(path)).toBe(true);
+    } finally {
+      keychain.SecKeychainSetUserInteractionAllowed(1);
+      Bun.spawnSync(["/usr/bin/security", "delete-generic-password", "-s", service, "-a", account]);
+    }
   });
 });
