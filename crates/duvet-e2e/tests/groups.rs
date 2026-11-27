@@ -3795,7 +3795,8 @@ fn a_forgotten_group_s_record_goes_once_its_founding_is_taken() {
 
 /// A forgotten group's record goes once a welcome brings the device back (#60). The API lost the
 /// group, both devices forgot it, and the member closed before the owner founded it again: the
-/// founding's welcome to the member takes its record with it.
+/// founding's welcome to the member, held to the record the member's forget answered, as a client
+/// passes it, takes that record with it.
 #[test]
 fn a_forgotten_group_s_record_goes_once_a_welcome_brings_the_device_back() {
     let mut server = FakeServer::new();
@@ -3817,7 +3818,7 @@ fn a_forgotten_group_s_record_goes_once_a_welcome_brings_the_device_back() {
     let mut create = server.create_group(conversation);
     create["expected"] = owner["expected"].clone();
     server.commit(&mut a1, conversation, create).unwrap();
-    b1.remember(conversation, Some(a), &[a, b]);
+    b1.remember_forgotten(conversation, &member["expected"]);
     let joined = server.deliver(&mut b1);
     assert_eq!(results(&joined), [json!([2, "welcome", "applied", null])]);
     assert_eq!(forgotten_records(&mut b1), json!({"records": []}));
@@ -3939,4 +3940,135 @@ fn drop_forgotten_lets_a_forgotten_group_s_record_go() {
     server.deliver_all(&mut [&mut a1, &mut b1, &mut c1]);
     let state = same_group(&mut [&mut a1, &mut b1, &mut c1], conversation);
     assert_eq!(members(&state), [a, b, c]);
+}
+
+/// A welcome the forgotten group's record refuses keeps the record (#60), as the device holds no
+/// group of the conversation still: the founding's welcome to B1, held to the record B1's forget
+/// answered, is refused for C, whom the forgotten group didn't have.
+#[test]
+fn a_welcome_the_record_refuses_keeps_it() {
+    let mut server = FakeServer::new();
+    let (conversation, _, [_a1, mut b1, _c1], record) = founded_again_with_c(&mut server);
+    b1.remember_forgotten(conversation, &record["expected"]);
+    let refused = server.deliver(&mut b1);
+    assert_eq!(
+        results(&refused),
+        [json!([2, "welcome", "rejected", "member_list_mismatch"])]
+    );
+    assert_eq!(b1.no_group(conversation)["what"], "group");
+    assert_eq!(
+        forgotten_records(&mut b1),
+        json!({"records": [{"conversation_id": conversation, "expected": record["expected"]}]})
+    );
+}
+
+/// A forgotten group's record is written and taken in its command's transaction (#60): a forget
+/// whose command fails before it commits keeps no record, and the device still holds the group; a
+/// welcome that brings the device back, in a command that fails, leaves the device out of the group
+/// and the record kept, until the same welcome is taken.
+#[test]
+fn a_failed_command_leaves_the_record_as_it_was() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, mut b1] = new_devices(&mut server, [a, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    server.lose_group(conversation);
+
+    b1.core.fail_next_commit();
+    let failed = error(&mut b1.core, command("forget_group", conversation));
+    assert_eq!(failed["code"], "internal");
+    assert_eq!(forgotten_records(&mut b1), json!({"records": []}));
+    assert_eq!(b1.group(conversation)["epoch"], 1);
+    let record = ok(&mut b1.core, command("forget_group", conversation));
+    let kept =
+        json!({"records": [{"conversation_id": conversation, "expected": record["expected"]}]});
+
+    // The owner forgets its group too and founds it again: the welcome would bring B1 back.
+    let owner = ok(&mut a1.core, command("forget_group", conversation));
+    let mut create = server.create_group(conversation);
+    create["expected"] = owner["expected"].clone();
+    server.commit(&mut a1, conversation, create).unwrap();
+    let mut welcome = server.entries(conversation)[1].clone();
+    welcome["expected"] = record["expected"].clone();
+    b1.core.fail_next_commit();
+    let failed = error(
+        &mut b1.core,
+        apply(conversation, std::slice::from_ref(&welcome)),
+    );
+    assert_eq!(failed["code"], "internal");
+    assert_eq!(b1.no_group(conversation)["what"], "group");
+    assert_eq!(forgotten_records(&mut b1), kept);
+    let joined = ok(&mut b1.core, apply(conversation, &[welcome]));
+    assert_eq!(results(&[joined]), [json!([2, "welcome", "applied", null])]);
+    assert_eq!(forgotten_records(&mut b1), json!({"records": []}));
+}
+
+/// `forgotten` gives its records in the order of their conversations' IDs (#60), whatever order
+/// the device forgot them in: here the later ID first.
+#[test]
+fn forgotten_gives_its_records_by_conversation_id() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, _b1] = new_devices(&mut server, [a, b]);
+    let (first, second) = (new_id(), new_id());
+    for conversation in [second, first] {
+        server.conversation(conversation, Kind::Dm, None, &[a, b], false);
+        server.found_unkept(&mut a1, conversation);
+        ok(&mut a1.core, command("forget_group", conversation));
+    }
+    let expected = json!({"members": [a, b], "exact": true});
+    assert_eq!(
+        forgotten_records(&mut a1),
+        json!({"records": [
+            {"conversation_id": first, "expected": expected},
+            {"conversation_id": second, "expected": expected},
+        ]})
+    );
+}
+
+/// Writes `sql` with `values` into `device`'s store, past its commands, as a database edited by
+/// hand.
+fn edit_store(device: &mut TestDevice, sql: &str, values: &[&dyn rusqlite::ToSql]) {
+    device
+        .core
+        .transaction(|tx| {
+            tx.conn().execute(sql, values)?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// A forgotten group's record that doesn't read, which only a database edited by hand holds, has
+/// `forgotten` answer `internal` (#60), whether its record or its conversation's ID is malformed.
+/// Letting the row go (`drop_forgotten`) gives the listing back.
+#[test]
+fn forgotten_answers_internal_for_a_record_that_doesnt_read() {
+    let mut server = FakeServer::new();
+    let (a, b) = (new_id(), new_id());
+    let [mut a1, _b1] = new_devices(&mut server, [a, b]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Dm, None, &[a, b], false);
+    server.found_unkept(&mut a1, conversation);
+    ok(&mut a1.core, command("forget_group", conversation));
+    let listing = json!({"cmd": "forgotten"});
+
+    edit_store(
+        &mut a1,
+        "UPDATE forgotten_groups SET record = '{' WHERE conversation_id = ?1",
+        &[&conversation.as_bytes().as_slice()],
+    );
+    assert_eq!(error(&mut a1.core, listing.clone())["code"], "internal");
+    let drop = command("drop_forgotten", conversation);
+    assert_eq!(ok(&mut a1.core, drop), json!({}));
+    assert_eq!(forgotten_records(&mut a1), json!({"records": []}));
+
+    edit_store(
+        &mut a1,
+        "INSERT INTO forgotten_groups (conversation_id, record) VALUES (x'01', ?1)",
+        &[&r#"{"members": [], "exact": true}"#],
+    );
+    assert_eq!(error(&mut a1.core, listing)["code"], "internal");
 }
