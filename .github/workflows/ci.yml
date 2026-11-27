@@ -142,10 +142,11 @@ jobs:
           key: ffi-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
           restore-keys: ffi-${{ hashFiles('rust-toolchain.toml') }}-
       # Bun 1.3.9 is the one Electrobun 1.15.1 ships; its baseline build runs on any x86-64.
-      # SQLCipher's C and its OpenSSL are compiled for Windows with mingw-w64.
-      - name: Install cbindgen 0.29.4, Bun 1.3.9, mingw-w64 and the Windows target
+      # SQLCipher's C and its OpenSSL are compiled for Windows with mingw-w64. D-Bus and gnome-keyring
+      # give the tests' second run a Secret Service.
+      - name: Install cbindgen 0.29.4, Bun 1.3.9, mingw-w64, D-Bus, gnome-keyring and the Windows target
         run: |
-          apt-get update && apt-get install -y --no-install-recommends unzip gcc-mingw-w64-x86-64
+          apt-get update && apt-get install -y --no-install-recommends unzip gcc-mingw-w64-x86-64 dbus gnome-keyring
           rustup target add x86_64-pc-windows-gnu
           curl -sSfL -o /tmp/cbindgen https://github.com/mozilla/cbindgen/releases/download/0.29.4/cbindgen-ubuntu22.04
           echo "27ac237e2ad3ffaffc8ecce0c03e3caa1d1b09e691906c3cb0967367ff6d783d  /tmp/cbindgen" | sha256sum -c -
@@ -162,6 +163,14 @@ jobs:
         working-directory: host-tests/bun
         env:
           DUVET_E2E_FFI: /cache/target/ffi/release/libduvet_e2e_ffi.so
+      # Again with a Secret Service on a session bus of the run's own: gnome-keyring, its login
+      # keyring made and unlocked with a test password. The keyring's cases keep the key there.
+      - name: bun test, with a Secret Service
+        run: dbus-run-session -- sh -c 'printf test | gnome-keyring-daemon --unlock --components=secrets && bun test'
+        working-directory: host-tests/bun
+        env:
+          DUVET_E2E_FFI: /cache/target/ffi/release/libduvet_e2e_ffi.so
+          DUVET_E2E_SECRET_SERVICE: "1"
       # Windows, the desktop's first system: the binding and its tests compile for it with no
       # warning, the keyring's Credential Manager store and the code only Windows builds included.
       - run: cargo clippy --locked --target x86_64-pc-windows-gnu -p duvet-e2e-ffi --all-targets -- -D warnings
