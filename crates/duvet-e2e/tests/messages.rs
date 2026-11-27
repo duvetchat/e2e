@@ -897,6 +897,7 @@ fn a_retry_no_one_could_open_is_stale() {
 /// group, which nobody reads: its retry is `stale_message`, then and once the group is founded
 /// again, though that group has the forgotten one's generation and epoch. Its row stays as it was,
 /// and the client encrypts its text again in the group it ends in, where the other member reads it.
+/// What waits to send in another conversation keeps its ciphertext.
 #[test]
 fn a_forgotten_group_s_messages_waiting_to_send_are_stale() {
     let mut server = FakeServer::new();
@@ -915,7 +916,16 @@ fn a_forgotten_group_s_messages_waiting_to_send_are_stale() {
         (&json!(0), &json!(1))
     );
 
+    let other = new_id();
+    server.conversation(other, Kind::Dm, None, &[a, b], false);
+    start(&mut server, &mut a1, other);
+    let elsewhere = ok(&mut a1.core, encrypt(other, "kept", envelope.clone()));
+
     let record = ok(&mut a1.core, command("forget_group", conversation));
+    assert_eq!(
+        ok(&mut a1.core, encrypt(other, "kept", envelope.clone())),
+        elsewhere
+    );
     let stale = error(
         &mut a1.core,
         encrypt(conversation, "typed", envelope.clone()),
