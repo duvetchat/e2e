@@ -3544,3 +3544,26 @@ fn a_second_leaf_under_one_device_is_refused() {
         (&json!("rule_violation"), &json!("duplicate_device"))
     );
 }
+
+/// A forgotten group's record leaves out the users whose leave statements the device holds: the
+/// API took them off as they left, before any commit took their leaves out. Here the owner leaves,
+/// and the record names the first of those who stay as the owner, as the API does.
+#[test]
+fn a_forgotten_group_s_record_leaves_out_who_left() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1, mut b1, mut c1] = new_devices(&mut server, [a, b, c]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b, c], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1]);
+    server.leave(&mut a1, conversation);
+    server.deliver(&mut b1);
+    assert_eq!(members(&b1.group(conversation)), [a, b, c]);
+
+    let record = ok(&mut b1.core, command("forget_group", conversation));
+    assert_eq!(
+        record["expected"],
+        json!({"owner": b, "members": [b, c], "exact": true})
+    );
+}
