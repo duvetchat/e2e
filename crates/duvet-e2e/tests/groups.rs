@@ -3674,7 +3674,8 @@ fn kept_record(device: &mut TestDevice, conversation: Uuid) -> Option<Value> {
 
 /// A forgotten group's record is kept in the store, in `forget_group`'s own transaction (#60): a
 /// client that closes before it writes its own copy finds it there, as it was answered. A second
-/// forget of the conversation keeps the newer group's record in its place.
+/// forget of the conversation writes the newer group's record, after its founding again took the
+/// first one: a forget always finds the conversation without a record.
 #[test]
 fn forget_group_keeps_its_record_in_the_store() {
     let mut server = FakeServer::new();
@@ -3695,9 +3696,11 @@ fn forget_group_keeps_its_record_in_the_store() {
         Some(first["expected"].clone())
     );
 
-    // The person took C in, and the API keeps nothing of the group founded again either.
+    // The person took C in, and the API keeps nothing of the group founded again either. Its
+    // founding, taken, took the first record: the second forget writes its own where none is.
     server.chats.get_mut(&conversation).unwrap().users = vec![a, b, c];
     server.found_unkept(&mut a1, conversation);
+    assert_eq!(kept_record(&mut a1, conversation), None);
     let second = ok(&mut a1.core, command("forget_group", conversation));
     assert_eq!(
         second["expected"],

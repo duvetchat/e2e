@@ -499,11 +499,14 @@ pub(crate) fn forget_group(tx: &Tx<'_>, request: ConversationId) -> Result<Forgo
 /// Keeps `expected`, the record of the group this device forgets of `conversation`, as the forget
 /// answers it, in the forget's own transaction, until the device holds the group again or its
 /// client lets the record go ([`drop_record`]): a client that closes before it keeps its own copy
-/// takes it back ([`forgotten`]). A second forget of the conversation keeps the newer group's in
-/// its place.
+/// takes it back ([`forgotten`]). A forget needs the group held, and the device holds it again only
+/// once the conversation's last record went, so a second forget writes the newer group's where
+/// there's none left.
 fn keep_record(tx: &Tx<'_>, conversation: Uuid, expected: &Expected) -> Result<(), Error> {
     let record = serde_json::to_string(expected)
         .map_err(|_| Error::Internal("a forgotten group's record couldn't be written".into()))?;
+    // The upsert is a defense: no command leaves a record here, as above. A row anything else left
+    // gives way to the record this forget answers.
     tx.conn().execute(
         "INSERT INTO forgotten_groups (conversation_id, record) VALUES (?1, ?2) \
          ON CONFLICT (conversation_id) DO UPDATE SET record = excluded.record",
