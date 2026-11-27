@@ -18,7 +18,7 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::commits::held_again;
+use super::commits::drop_record;
 use super::create::founds_reset;
 use super::{
     EXTERNAL_SENDER_MISMATCH, Extra, GroupRow, api_key, brings_back_removed, can_commit,
@@ -428,7 +428,7 @@ impl EntryHandler for Commits {
 /// what this device knows of its leaves' users first asks to observe them anew, as a commit does.
 /// One to the generation of a group this device holds is another group (`another_group`), whose
 /// key package it spends all the same. One that brings it in takes the record of a group it forgot
-/// there with it ([`held_again`]).
+/// there with it ([`drop_record`]).
 struct Welcomes;
 
 impl EntryHandler for Welcomes {
@@ -591,7 +591,7 @@ impl EntryHandler for Welcomes {
             statements: Vec::new(),
         });
         at.group = Some(group);
-        held_again(tx, at.id)?;
+        drop_record(tx, at.id)?;
         Ok(Applied::Done { epoch })
     }
 }

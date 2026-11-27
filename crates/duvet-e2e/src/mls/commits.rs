@@ -23,6 +23,7 @@ use super::{
     stored_state, tls, violation,
 };
 use crate::identity::{invalid, not_found, stored_uuid};
+use crate::messages::Empty;
 use crate::protocol::b64;
 use crate::{Error, Tx};
 
@@ -120,7 +121,7 @@ struct Device {
 
 /// The server's word on this device's waiting commit. Taken, it's merged (an external commit,
 /// merged as it was made, stays), and a founding or an external join holds the group again: the
-/// record of a group this device forgot there goes ([`held_again`]). Refused, epoch 0 goes whole
+/// record of a group this device forgot there goes ([`drop_record`]). Refused, epoch 0 goes whole
 /// with its group, for the winner's welcome to come through `apply`, and so does a refused
 /// external commit or reset. A member's commit the validator refused (`invalid`) is dropped. One
 /// refused otherwise stays staged: the server may have taken it after all (a lost answer, then a
@@ -215,7 +216,7 @@ pub(crate) fn commit_result(tx: &Tx<'_>, request: CommitResult) -> Result<Epoch,
         // joiner's could, so its stay begins at the first time the API gives.
         let at = (pending == Pending::Create).then(|| tx.now());
         crate::backup::entered(tx, conversation, at)?;
-        held_again(tx, conversation)?;
+        drop_record(tx, conversation)?;
     }
     row.write(tx)?;
     Ok(Epoch {
@@ -496,9 +497,10 @@ pub(crate) fn forget_group(tx: &Tx<'_>, request: ConversationId) -> Result<Forgo
 }
 
 /// Keeps `expected`, the record of the group this device forgets of `conversation`, as the forget
-/// answers it, in the forget's own transaction, until the device holds the group again
-/// ([`held_again`]): a client that closes before it keeps its own copy takes it back
-/// ([`forgotten`]). A second forget of the conversation keeps the newer group's in its place.
+/// answers it, in the forget's own transaction, until the device holds the group again or its
+/// client lets the record go ([`drop_record`]): a client that closes before it keeps its own copy
+/// takes it back ([`forgotten`]). A second forget of the conversation keeps the newer group's in
+/// its place.
 fn keep_record(tx: &Tx<'_>, conversation: Uuid, expected: &Expected) -> Result<(), Error> {
     let record = serde_json::to_string(expected)
         .map_err(|_| Error::Internal("a forgotten group's record couldn't be written".into()))?;
@@ -510,17 +512,26 @@ fn keep_record(tx: &Tx<'_>, conversation: Uuid, expected: &Expected) -> Result<(
     Ok(())
 }
 
-/// This device holds `conversation`'s group again, in this transaction: a welcome brought it in
-/// (`apply`), or the server took its founding or its external join (`commit_result`). The record
-/// of a group it forgot there goes with it. While the device holds no group of the conversation
-/// (a join the server refused, which leaves a row alone; a founding or a join still waiting for
-/// the server's word), the record stays.
-pub(super) fn held_again(tx: &Tx<'_>, conversation: Uuid) -> Result<(), Error> {
+/// The record of `conversation`'s forgotten group goes, in this transaction: this device holds the
+/// group again (a welcome brought it in, `apply`; or the server took its founding or its external
+/// join, `commit_result`), or its client lets the record go ([`drop_forgotten`]). While the device
+/// holds no group of the conversation (a join the server refused, which leaves a row alone; a
+/// founding or a join still waiting for the server's word), the record stays.
+pub(super) fn drop_record(tx: &Tx<'_>, conversation: Uuid) -> Result<(), Error> {
     tx.conn().execute(
         "DELETE FROM forgotten_groups WHERE conversation_id = ?1",
         [conversation.as_bytes().as_slice()],
     )?;
     Ok(())
+}
+
+/// Lets go of the record of `conversation`'s forgotten group, which [`forgotten`] then no longer
+/// gives; with nothing kept, it changes nothing. A client calls it on its person's yes
+/// (`members_accept`), before the comeback without `expected` goes, so every record `forgotten`
+/// gives is newer than any yes; and once the API no longer lists the conversation for its user.
+pub(crate) fn drop_forgotten(tx: &Tx<'_>, request: ConversationId) -> Result<Empty, Error> {
+    drop_record(tx, request.conversation_id)?;
+    Ok(Empty {})
 }
 
 /// The record of each group this device forgot (`forget_group`), by conversation, each as the

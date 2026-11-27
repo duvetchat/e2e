@@ -3881,3 +3881,59 @@ fn a_forgotten_group_s_record_stays_while_the_device_holds_no_group() {
     server.deliver_all(&mut [&mut a1, &mut b1]);
     same_group(&mut [&mut a1, &mut b1], conversation);
 }
+
+/// A group of A, its owner, and B whose group the API lost, as a database restored to before the
+/// group's founding: A1 and B1 forget theirs, then A takes C in and A1 founds the group again. The
+/// conversation, the users, their devices, and B1's record of the forgotten group as `forget_group`
+/// answered it.
+fn founded_again_with_c(server: &mut FakeServer) -> (Uuid, [Uuid; 3], [TestDevice; 3], Value) {
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1, mut b1, c1] = new_devices(server, [a, b, c]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b], false);
+    start(server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1]);
+    server.lose_group(conversation);
+    ok(&mut a1.core, command("forget_group", conversation));
+    let record = ok(&mut b1.core, command("forget_group", conversation));
+    server.chats.get_mut(&conversation).unwrap().users = vec![a, b, c];
+    start(server, &mut a1, conversation);
+    (conversation, [a, b, c], [a1, b1, c1], record)
+}
+
+/// `drop_forgotten` lets a forgotten group's record go (#60), as its client asks on its person's
+/// yes, before the comeback without `expected` goes, or once the API no longer lists the
+/// conversation for its user: `forgotten` gives it no more, after a reopen too, and the same again,
+/// with nothing kept, answers `{}` as well. Here B1's join, held to B1's record, is refused for C,
+/// whom the forgotten group didn't have; B1's person says yes, and B1 joins without the record.
+#[test]
+fn drop_forgotten_lets_a_forgotten_group_s_record_go() {
+    let mut server = FakeServer::new();
+    let (conversation, [a, b, c], [mut a1, mut b1, mut c1], record) =
+        founded_again_with_c(&mut server);
+    let mut join = joining(&server, conversation);
+    join["expected"] = record["expected"].clone();
+    let refused = error(&mut b1.core, join);
+    assert_eq!(
+        (&refused["code"], &refused["rule"]),
+        (&json!("rule_violation"), &json!("member_list_mismatch"))
+    );
+    assert_eq!(
+        forgotten_records(&mut b1),
+        json!({"records": [{"conversation_id": conversation, "expected": record["expected"]}]})
+    );
+
+    let drop = command("drop_forgotten", conversation);
+    assert_eq!(ok(&mut b1.core, drop.clone()), json!({}));
+    let mut b1 = b1.reopened(server.clock.clone());
+    assert_eq!(forgotten_records(&mut b1), json!({"records": []}));
+    assert_eq!(ok(&mut b1.core, drop), json!({}));
+
+    // The comeback without the record: the server takes B1's join, and B1 holds the group with C.
+    server
+        .commit(&mut b1, conversation, joining(&server, conversation))
+        .unwrap();
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1]);
+    let state = same_group(&mut [&mut a1, &mut b1, &mut c1], conversation);
+    assert_eq!(members(&state), [a, b, c]);
+}
