@@ -159,7 +159,7 @@ fn forget_group_through_wasm() {
     let forget = json!({"cmd": "forget_group", "conversation_id": conversation});
     assert_eq!(
         run(&mut core, forget.clone()),
-        json!({"ok": {"expected": {"members": [user, other]}}})
+        json!({"ok": {"expected": {"members": [user, other], "exact": true}}})
     );
     let stale = run(&mut core, typed);
     assert_eq!(stale["error"]["rule"], "stale_message", "{stale}");

@@ -162,7 +162,7 @@ describe("the C ABI", () => {
     expect(run(typed).ok.epoch).toBe(1);
 
     const forget = { cmd: "forget_group", conversation_id: conversation };
-    expect(run(forget)).toEqual({ ok: { expected: { members } } });
+    expect(run(forget)).toEqual({ ok: { expected: { members, exact: true } } });
     expect(run(typed).error).toMatchObject({ code: "rule_violation", rule: "stale_message" });
     const none = { code: "not_found", what: "group" };
     expect(run({ cmd: "group", conversation_id: conversation }).error).toMatchObject(none);

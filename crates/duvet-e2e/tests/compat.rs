@@ -803,7 +803,10 @@ fn write_db() {
         &mut a1.core,
         json!({"cmd": "forget_group", "conversation_id": forgot}),
     );
-    assert_eq!(record["expected"], json!({"owner": a, "members": [a, b]}));
+    assert_eq!(
+        record["expected"],
+        json!({"owner": a, "members": [a, b], "exact": true})
+    );
 
     // No leaf keeps a key package's lifetime, on either device: each one a commit brought.
     for device in [&mut a1, &mut b1] {

@@ -3131,7 +3131,10 @@ fn forget_group_leaves_a_group_the_api_doesnt_hold() {
 
     // A1 forgets it: the group goes, with what it held, and its record is the members it had.
     let record = ok(&mut a1.core, forget.clone());
-    assert_eq!(record, json!({"expected": {"members": [a, b]}}));
+    assert_eq!(
+        record,
+        json!({"expected": {"members": [a, b], "exact": true}})
+    );
     assert_eq!(a1.no_group(conversation)["what"], "group");
     let again = error(&mut a1.core, forget);
     assert_eq!(
@@ -3258,7 +3261,7 @@ fn a_lone_device_forgets_the_group_it_founded() {
     let forget = command("forget_group", conversation);
     assert_eq!(
         ok(&mut core, forget.clone()),
-        json!({"expected": {"members": [user, other]}})
+        json!({"expected": {"members": [user, other], "exact": true}})
     );
     let stale = error(&mut core, typed);
     assert_eq!(
@@ -3388,7 +3391,10 @@ fn forget_group_leaves_nothing_of_the_group_in_mls_storage() {
     for device in [&mut a1, &mut b1] {
         assert!(mls_entries(device, &id) > 0);
         let record = ok(&mut device.core, command("forget_group", conversation));
-        assert_eq!(record["expected"], json!({"owner": a, "members": [a, b]}));
+        assert_eq!(
+            record["expected"],
+            json!({"owner": a, "members": [a, b], "exact": true})
+        );
         assert_eq!(mls_entries(device, &id), 0);
         records.push(record["expected"].clone());
     }
@@ -3406,4 +3412,91 @@ fn forget_group_leaves_nothing_of_the_group_in_mls_storage() {
         (&state["generation"], &state["epoch"]),
         (&json!(0), &json!(1))
     );
+}
+
+/// `device` takes `user` out of `conversation`'s group by a commit made past its core's rules,
+/// with no statement of the user's leaving: the commit, and the group info of the epoch it makes.
+fn remove_by_hand(device: &mut TestDevice, conversation: Uuid, user: Uuid) -> (Vec<u8>, Vec<u8>) {
+    device.rolled_back(|tx| {
+        let (mut group, _) = mls::load_group(tx, conversation)?;
+        let own = tx.own_device()?;
+        let context = group.public_group().group_context().clone();
+        let theirs: Vec<openmls::prelude::LeafNodeIndex> = duvet_e2e_rules::leaves(group.members())
+            .unwrap()
+            .into_iter()
+            .filter(|(_, leaf)| leaf.user == user)
+            .map(|(index, _)| openmls::prelude::LeafNodeIndex::new(index))
+            .collect();
+        let mut list = MemberList::from_group_context(&context).unwrap();
+        list.users.retain(|entry| entry.user != user);
+        let mut extensions = context.extensions().clone();
+        extensions.add_or_replace(list.to_extension()).unwrap();
+        group.set_aad(CommitAad::new(Vec::new()).encode());
+        let provider = tx.provider();
+        let bundle = group
+            .commit_builder()
+            .propose_removals(theirs)
+            .propose_group_context_extensions(extensions)
+            .unwrap()
+            .force_self_update(true)
+            .load_psks(provider.storage())
+            .unwrap()
+            .build(provider.rand(), provider.crypto(), &own.signer, |_| true)
+            .unwrap()
+            .stage_commit(provider)
+            .unwrap();
+        let group_info = MlsMessageOut::from(bundle.group_info().unwrap().clone());
+        Ok((tls(bundle.commit()), tls(&group_info)))
+    })
+}
+
+/// A forgotten group comes back with exactly its users and owner. B1, a member, takes C out
+/// without C's statement, past its core's rules, and a server that skips its validator queues it:
+/// A1's group blocks on it. That server then lists the conversation with no group, so A1 forgets
+/// the blocked group, and it serves the group the commit made, which only lacks a user: a record
+/// from before the cutover would take it, the forgotten group's record doesn't.
+#[test]
+fn a_forgotten_group_comes_back_with_exactly_its_users_and_owner() {
+    let mut server = FakeServer::new();
+    let (a, b, c) = (new_id(), new_id(), new_id());
+    let [mut a1, mut b1, mut c1] = new_devices(&mut server, [a, b, c]);
+    let conversation = new_id();
+    server.conversation(conversation, Kind::Group, Some(a), &[a, b, c], false);
+    start(&mut server, &mut a1, conversation);
+    server.deliver_all(&mut [&mut a1, &mut b1, &mut c1]);
+    let (commit, group_info) = remove_by_hand(&mut b1, conversation, c);
+    let seq = server.force(conversation, "commit", commit);
+    let entry = server.entries(conversation)[seq as usize - 1].clone();
+    let asked = run(
+        &mut a1.core,
+        &apply(conversation, std::slice::from_ref(&entry)),
+    );
+    assert_eq!(asked["error"]["code"], "needs_identities");
+    server.introduce(&mut a1);
+    let blocked = ok(&mut a1.core, apply(conversation, &[entry]));
+    assert_eq!(results(&[blocked])[0][2], "rejected");
+    assert_eq!(a1.group(conversation)["blocked"], true);
+
+    let record = ok(&mut a1.core, command("forget_group", conversation));
+    let join = |expected: &Value| {
+        json!({
+            "cmd": "join_external",
+            "conversation_id": conversation,
+            "generation": 0,
+            "group_info": b64(&group_info),
+            "expected": expected,
+        })
+    };
+    let refused = error(&mut a1.core, join(&record["expected"]));
+    assert_eq!(
+        (&refused["code"], &refused["rule"]),
+        (&json!("rule_violation"), &json!("member_list_mismatch"))
+    );
+    assert_eq!(
+        record["expected"],
+        json!({"owner": a, "members": [a, b, c], "exact": true})
+    );
+    // A record from before the cutover holds no one the conversation didn't have: it takes it.
+    let legacy = json!({"owner": a, "members": [a, b, c]});
+    assert!(ok(&mut a1.core, join(&legacy))["commit"].is_string());
 }

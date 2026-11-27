@@ -116,6 +116,7 @@ void main() {
       'ok': {
         'expected': {
           'members': [user, other],
+          'exact': true,
         },
       },
     });

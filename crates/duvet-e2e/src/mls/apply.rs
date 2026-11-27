@@ -97,14 +97,19 @@ pub(crate) struct Expected {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     owner: Option<Uuid>,
     members: Vec<Uuid>,
+    /// A forgotten group's record: whatever brings the group back has exactly these users and
+    /// owner, as a founding does. A record from before the cutover goes without it.
+    #[serde(default)]
+    exact: bool,
 }
 
 impl Expected {
-    /// The record of `list`: its owner, and its users in its order.
+    /// The exact record of `list`: its owner, and its users in its order.
     pub(crate) fn of(list: &MemberList) -> Expected {
         Expected {
             owner: list.owner,
             members: list.users.iter().map(|entry| entry.user).collect(),
+            exact: true,
         }
     }
 
@@ -120,12 +125,13 @@ impl Expected {
     }
 
     /// Holds a group this device joins at `generation` to this record, in `ctx`: the founding
-    /// welcome, the first commit's at generation 0, to the record's members (`is_record`); any
-    /// other join, at any generation, with a row for the conversation or without, to
-    /// `keeps_record`.
+    /// welcome, the first commit's at generation 0, and every join to a forgotten group's exact
+    /// record, to the record's members and owner (`is_record`); any other join, at any generation,
+    /// with a row for the conversation or without, to `keeps_record`. A forgotten group comes back
+    /// with no one left out and no other owner: a blocked group's block held as much.
     pub(crate) fn hold(&self, ctx: &mut RuleContext, generation: u32, founding: bool) {
         let list = self.list(generation);
-        ctx.record = Some(if founding {
+        ctx.record = Some(if founding || self.exact {
             Record::Founding(list)
         } else {
             Record::Joined(list)

@@ -102,7 +102,8 @@ pub struct RuleContext {
 /// A device's record of a conversation from before the cutover, as a group it joins is held to it.
 #[derive(Clone, Debug)]
 pub enum Record {
-    /// The group's founding welcome, which must have the record's members ([`is_record`]).
+    /// The group's founding welcome, or any join back to a group the device forgot, which must have
+    /// the record's members and owner ([`is_record`]).
     Founding(MemberList),
     /// Any other join, which must keep to the record ([`keeps_record`]).
     Joined(MemberList),
