@@ -168,14 +168,23 @@ jobs:
           unzip -q /tmp/ndk.zip -d /opt/android-sdk/ndk && rm /tmp/ndk.zip
           mv /opt/android-sdk/ndk/android-ndk-r28c /opt/android-sdk/ndk/28.2.13676358
           [ -x "$NDK_BIN/aarch64-linux-android21-clang" ] || { echo "No NDK at $NDK_BIN"; exit 1; }
-      # SQLCipher's C is compiled for wasm32 with clang, and for Windows with mingw-w64.
-      - name: Install clang, mingw-w64, gh, wasm-bindgen 0.2.130 and the Windows and Android targets
+      # SQLCipher's C is compiled for wasm32 with clang, and for Windows with mingw-w64. jq is for the
+      # third-party notices.
+      - name: Install clang, mingw-w64, gh, jq, wasm-bindgen 0.2.130 and the Windows and Android targets
         run: |
-          apt-get update && apt-get install -y --no-install-recommends clang lld llvm gcc-mingw-w64-x86-64 gh
+          apt-get update && apt-get install -y --no-install-recommends clang lld llvm gcc-mingw-w64-x86-64 gh jq
           curl -sSfL -o /tmp/wasm-bindgen.tar.gz https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.130/wasm-bindgen-0.2.130-x86_64-unknown-linux-musl.tar.gz
           echo "9687f3bb551b9f66f37ed32a40d7913a00f7962db653054e56857bc306c3227f  /tmp/wasm-bindgen.tar.gz" | sha256sum -c -
           tar -xzf /tmp/wasm-bindgen.tar.gz -C /tmp && install /tmp/wasm-bindgen-0.2.130-x86_64-unknown-linux-musl/wasm-bindgen /usr/local/bin/
           rustup target add x86_64-pc-windows-gnu aarch64-linux-android
+      # The licences of what the files below are compiled from, which the gather step adds to them. Before
+      # the builds, so a licence about.toml doesn't accept stops the run at once.
+      - name: The third-party notices, with cargo-about 0.9.3
+        run: |
+          curl -sSfL -o /tmp/cargo-about.tar.gz https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.3/cargo-about-0.9.3-x86_64-unknown-linux-musl.tar.gz
+          echo "3ad1e94ea1e63d69d1961f4fb15ccbbe9575d906111f96d2cb4dce6df48f71b4  /tmp/cargo-about.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/cargo-about.tar.gz -C /tmp && install /tmp/cargo-about-0.9.3-x86_64-unknown-linux-musl/cargo-about /usr/local/bin/
+          notices/generate.sh "$GITHUB_SHA" > /tmp/THIRD-PARTY-NOTICES.txt
       # Each package on its own, as CI builds it: built together, they'd share their dependencies' features.
       - name: Linux x64, the C ABI
         run: cargo build --locked --release -p duvet-e2e-ffi
@@ -208,7 +217,7 @@ jobs:
           cp "$CARGO_TARGET_DIR/aarch64-linux-android/release/libduvet_e2e.so" dist/android-arm64-v8a-libduvet_e2e.so
           wasm-bindgen --target web --out-name duvet_e2e_wasm --out-dir /tmp/web "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/duvet_e2e_wasm.wasm"
           cp /tmp/web/duvet_e2e_wasm.js /tmp/web/duvet_e2e_wasm_bg.wasm dist/
-          cp apple/* dist/
+          cp apple/* /tmp/THIRD-PARTY-NOTICES.txt dist/
           cd dist && sha256sum -- * > SHA256SUMS
       # Before the checks, so a run they fail still shows what it built; in the log too. The desktop's
       # and mobile's Linux tests load the Linux libraries on other machines, whose glibc may be older.
